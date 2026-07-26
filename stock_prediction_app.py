@@ -298,6 +298,16 @@ def _sign_fmt(v, fmt=",.2f", suffix=""):
         return str(v)
 
 
+def _win_rate_fmt(v):
+    if v is None:
+        return "---"
+    try:
+        rate = float(v or 0)
+        return f"{rate * 100:.1f}%" if rate <= 1 else f"{rate:.1f}%"
+    except Exception:
+        return str(v)
+
+
 def _decision_badge(d: str) -> str:
     c = {"BUY": "#00875A", "SELL": "#DF1B41", "HOLD": "#D97706"}.get(
         str(d).upper(), "#6B7280"
@@ -646,6 +656,18 @@ def _render_options_form():
         "Stock + dates + capital + tastytrade-style options parameters",
     )
 
+    # ── Strike Selection OUTSIDE form so changing it re-renders immediately ──
+    # Inside st.form(), widget changes do not trigger reruns — conditional blocks freeze.
+    # Strike Selection must be outside to correctly show/hide Strike vs Delta fields.
+    _ss_row = st.columns([1, 1, 1, 1])
+    with _ss_row[3]:
+        strike_selection = st.selectbox(
+            "Strike Selection",
+            options=["Delta", "Strike"],
+            key="opt_strike_sel",
+            help="Delta: select strike by delta value (e.g. 30). Strike: exact price (e.g. 7259, 7570) — no upper cap.",
+        )
+
     with st.form("options_form", clear_on_submit=False):
         # ── Base inputs (same as stock mode) ─────────────────────────────────
         col1, col2, col3 = st.columns(3)
@@ -707,7 +729,7 @@ def _render_options_form():
             unsafe_allow_html=True,
         )
 
-        oc1, oc2, oc3, oc4 = st.columns(4)
+        oc1, oc2, oc3 = st.columns(3)
         with oc1:
             direction = st.selectbox(
                 "Direction",
@@ -726,26 +748,59 @@ def _render_options_form():
                 value=1, min_value=1, max_value=100, step=1,
                 help="Number of option contracts.",
             )
-        with oc4:
-            strike_selection = st.selectbox(
-                "Strike Selection",
-                options=["Delta", "Strike"],
-                help="Delta: select strike by delta value. Strike: use fixed strike price.",
-            )
+        # strike_selection is defined OUTSIDE this form (above) so it triggers re-render on change
 
-        od1, od2, od3, od4 = st.columns(4)
-        with od1:
-            delta_val = st.number_input(
-                "Delta (1-99)",
-                value=30, min_value=1, max_value=99,
-                help="Target delta for strike selection (e.g. 30 = 0.30 delta).",
-            )
-        with od2:
-            dte_val = st.number_input(
-                "Expiration (DTE)",
-                value=50, min_value=1, max_value=365,
-                help="Days to expiration at entry.",
-            )
+        # ── Conditional inputs: Exact Strike vs Delta ─────────────────────
+        if strike_selection == "Strike":
+            es1, es2 = st.columns(2)
+            with es1:
+                strike_price = st.number_input(
+                    "Strike Price",
+                    value=0.0, min_value=0.0, max_value=99999.0, step=0.5,
+                    help="Exact option strike price. No upper cap — SPY 620, SPX 7570, AAPL 240 all accepted.",
+                )
+            with es2:
+                expiry_date_str = st.text_input(
+                    "Expiry Date (YYYY-MM-DD)",
+                    value="",
+                    placeholder="e.g. 2026-08-15",
+                    help="Option expiry date. Required for exact strike validation.",
+                )
+            es3, _es_pad = st.columns(2)
+            with es3:
+                dte_val = st.number_input(
+                    "DTE (used if Expiry Date is blank)",
+                    value=45, min_value=0, max_value=365,
+                    help="Days to expiration — only used when Expiry Date field is empty.",
+                )
+            # proxy delta is ATM (50) by default — not shown to user to avoid confusion
+            delta_val = 50
+            if strike_price > 0:
+                _expiry_show = expiry_date_str if expiry_date_str else f"DTE {dte_val}"
+                st.info(
+                    f"Strike Mode: **{opt_type} @ {strike_price:g}** | "
+                    f"Expiry/DTE: **{_expiry_show}** | "
+                    "Large strikes (SPX 7570, SPY 620) are fully supported — no upper cap."
+                )
+        else:
+            # Delta Selection mode (original)
+            od1, od2 = st.columns(2)
+            with od1:
+                delta_val = st.number_input(
+                    "Delta (1-99)",
+                    value=30, min_value=1, max_value=99,
+                    help="Target delta for strike selection (e.g. 30 = 0.30 delta).",
+                )
+            with od2:
+                dte_val = st.number_input(
+                    "Expiration (DTE)",
+                    value=50, min_value=1, max_value=365,
+                    help="Days to expiration at entry.",
+                )
+            strike_price    = 0.0
+            expiry_date_str = ""
+
+        od3, od4 = st.columns(2)
         with od3:
             entry_schedule = st.selectbox(
                 "Entry Schedule",
@@ -761,13 +816,23 @@ def _render_options_form():
                 help="When to exit. Default: exit at target date (end of prediction window).",
             )
 
+        # Build summary line — shows actual selected values, never stale defaults
+        if strike_selection == "Strike":
+            _expiry_label = expiry_date_str if expiry_date_str else f"DTE {dte_val}"
+            _strike_display = int(strike_price) if strike_price and strike_price == int(strike_price) else strike_price
+            _params_summary = (
+                f"{direction} {opt_type}, Strike {_strike_display}, {_expiry_label}, Qty {quantity}"
+            )
+        else:
+            _params_summary = f"{direction} {opt_type}, Delta {delta_val}, DTE {dte_val}, Qty {quantity}"
+
         st.markdown(
             f'<div style="background:#F0FFF4;border:1px solid #6EE7B7;border-radius:6px;'
             f'padding:.5rem 1rem;font-size:.74rem;color:#065F46;margin:.3rem 0">'
             f'<b>Options Backtest Window:</b>&emsp;'
             f'<code>{origin_dt}</code> to <code>{tgt_str}</code>&emsp;'
             f'<b>({horizon} days)</b>&emsp;&mdash;&emsp;'
-            f'{direction} {opt_type}, Delta {delta_val}, DTE {dte_val}, Qty {quantity}<br>'
+            f'{_params_summary}<br>'
             f'<span style="color:#059669">'
             f'Historical context ({ctx_start} to {origin_dt}) is AI study only -- '
             f'backtest NEVER includes historical context window.'
@@ -785,29 +850,91 @@ def _render_options_form():
         run_id = str(uuid.uuid4())[:8].upper()
         st.session_state["run_id"] = run_id
         st.session_state["active_mode"] = "options"
+
+        _is_strike_mode = strike_selection == "Strike"
+        _is_delta_mode_snap = not _is_strike_mode
+        # Capture exact user-entered options inputs immediately after submit
+        st.session_state["user_input_snapshot"] = {
+            "symbol":                        symbol.strip().upper(),
+            "benchmark":                     benchmark.strip().upper(),
+            "initial_capital":               float(capital),
+            "historical_context_start_date": ctx_start.strip(),
+            "prediction_origin_date":        origin_dt.strip(),
+            "decision_horizon_days":         int(horizon),
+            "target_date":                   tgt_str,
+            "validation_mode":               val_mode,
+            "price_basis":                   price_basis,
+            "strike_selection":              strike_selection,
+            "direction":                     direction,
+            "opt_type":                      opt_type,
+            "quantity":                      int(quantity),
+            "delta_ui":                      int(delta_val) if _is_delta_mode_snap else None,
+            "strike_price":                  float(strike_price) if _is_strike_mode else None,
+            "expiry_date":                   expiry_date_str.strip() if _is_strike_mode else None,
+            "dte":                           int(dte_val),
+            "run_id":                        run_id,
+            "submitted_at_utc":              datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+        _is_delta_mode  = not _is_strike_mode
+        _req_strike     = float(strike_price) if (_is_strike_mode and strike_price and float(strike_price) > 0) else None
+        _expiry_clean   = expiry_date_str.strip() if expiry_date_str else None
+
+        # ── Single source of truth for all options inputs ─────────────────────
         options_params = {
             "direction":        direction,
             "opt_type":         opt_type,
             "quantity":         int(quantity),
-            "delta":            int(delta_val),
-            "dte":              int(dte_val),
             "strike_selection": strike_selection.lower(),
+            "contract_selection_method": "EXACT_STRIKE" if _is_strike_mode else "DELTA_SELECTION",
+            # Delta mode fields (null in Strike mode)
+            "delta_ui":         int(delta_val) if _is_delta_mode else None,
+            "delta_decimal":    round(int(delta_val) / 100.0, 4) if _is_delta_mode else None,
+            "delta":            int(delta_val) if _is_delta_mode else None,
+            # Strike mode fields (null in Delta mode)
+            "requested_strike": _req_strike,
+            "strike_price":     _req_strike,
+            "expiry_date":      _expiry_clean if _is_strike_mode else None,
+            # DTE valid in both modes
+            "dte":              int(dte_val),
             "entry_schedule":   entry_schedule,
             "exit_rule":        exit_rule,
         }
-        _run_options_all(
-            symbol=symbol.strip().upper(),
-            ctx_start=ctx_start.strip(),
-            origin_date=origin_dt.strip(),
-            horizon=int(horizon),
-            capital=float(capital),
-            benchmark=benchmark.strip().upper(),
-            val_mode=val_mode,
-            target_date=tgt_str,
-            run_id=run_id,
-            price_basis=price_basis,
-            options_params=options_params,
-        )
+
+        # ── Pre-run validation gate — block invalid inputs before any API call ─
+        _pre_errors = []
+        if _is_strike_mode and not _req_strike:
+            _pre_errors.append(
+                f"Strike Mode requires Strike Price > 0. "
+                f"You entered: {strike_price!r}. "
+                "Examples: SPY=620, SPX=7570, AAPL=240. No upper cap — enter the exact strike."
+            )
+        if _pre_errors:
+            st.session_state["error_msg"] = _pre_errors[0]
+            st.session_state["opts_params"] = options_params
+            st.session_state["opts_result"] = {
+                "status":                "REVIEW_REQUIRED",
+                "reason":                _pre_errors[0],
+                "backtest_status":       "NOT_RUN",
+                "exact_validation_status": "INVALID_INPUT",
+                "accuracy_saved":        False,
+                "accuracy_skip_reason":  "MISSING_STRIKE_PRICE",
+            }
+            st.session_state["saved"]    = False
+            st.session_state["save_msg"] = "NOT SAVED — strike price missing or zero"
+        else:
+            _run_options_all(
+                symbol=symbol.strip().upper(),
+                ctx_start=ctx_start.strip(),
+                origin_date=origin_dt.strip(),
+                horizon=int(horizon),
+                capital=float(capital),
+                benchmark=benchmark.strip().upper(),
+                val_mode=val_mode,
+                target_date=tgt_str,
+                run_id=run_id,
+                price_basis=price_basis,
+                options_params=options_params,
+            )
 
 
 def _window_preview(ctx_start, origin_dt, tgt_str, horizon):
@@ -1002,6 +1129,23 @@ def _run_options_all(
     options_params = options_params or {}
     today = date.today()
 
+    # Server-side exact-strike guard: blocks malformed calls before provider/API work starts.
+    _srv_is_exact = options_params.get("contract_selection_method") == "EXACT_STRIKE" or options_params.get("strike_selection") == "strike"
+    _srv_strike = options_params.get("requested_strike") or options_params.get("strike_price")
+    if _srv_is_exact and not _srv_strike:
+        st.session_state["opts_params"] = options_params
+        st.session_state["opts_result"] = {
+            "status": "REVIEW_REQUIRED",
+            "reason": "EXACT_STRIKE mode requires a valid strike price. Run blocked before provider call.",
+            "backtest_status": "NOT_RUN",
+            "exact_validation_status": "INVALID_INPUT",
+            "accuracy_saved": False,
+            "accuracy_skip_reason": "MISSING_STRIKE_SERVER_GUARD",
+        }
+        st.session_state["saved"] = False
+        st.session_state["save_msg"] = "NOT SAVED - exact strike missing"
+        return
+
     # Detect run type
     try:
         _target_dt = datetime.strptime(target_date, "%Y-%m-%d").date()
@@ -1128,10 +1272,23 @@ def _run_options_all(
         st.session_state["save_msg"] = save_msg
         return
 
+    _is_exact_mode = options_params.get("contract_selection_method") == "EXACT_STRIKE" or options_params.get("strike_selection") == "strike"
+    _confirmed_strike = options_params.get("requested_strike") or options_params.get("strike_price")
+    _confirmed_expiry = options_params.get("expiry_date")
     opts_result: Dict[str, Any] = {
         "status":          "SKIPPED",
         "backtest_range":  f"{origin_date} to {target_date}",
         "note":            "Options backtest window = prediction window only",
+        "strike_selection": options_params.get("strike_selection", "delta"),
+        "contract_method": "EXACT_STRIKE" if _is_exact_mode else "DELTA_SELECTION",
+        "requested_strike": _confirmed_strike,
+        "expiry_date": _confirmed_expiry,
+        "delta_ui": options_params.get("delta_ui"),
+        "dte": options_params.get("dte", 45),
+        "quantity": options_params.get("quantity", 1),
+        "direction": options_params.get("direction", ""),
+        "opt_type": options_params.get("opt_type", ""),
+        "exact_validation_status": "NOT_RUN" if _is_exact_mode else None,
     }
 
     if _TT_AVAILABLE:
@@ -1142,15 +1299,19 @@ def _run_options_all(
                 direction_map = {"Buy": "long", "Sell": "short"}
                 type_map      = {"Call": "call", "Put": "put"}
 
+                strike_mode = options_params.get("strike_selection") == "strike"
                 leg = {
                     "type":              "equity-option",
                     "direction":         direction_map.get(options_params.get("direction", "Sell"), "short"),
                     "quantity":          options_params.get("quantity", 1),
                     "side":              type_map.get(options_params.get("opt_type", "Put"), "put"),
                     "daysUntilExpiration": options_params.get("dte", 45),
-                    "strikeSelection":   options_params.get("strike_selection", "delta"),
-                    "delta":             options_params.get("delta", 30),
+                    "strikeSelection":   "strike" if strike_mode else "delta",
                 }
+                if strike_mode and options_params.get("strike_price"):
+                    leg["strikePrice"] = float(options_params["strike_price"])
+                else:
+                    leg["delta"] = int(options_params.get("delta") or 30)
                 payload = _tt_build_legs(
                     symbol=symbol,
                     start_date=origin_date,   # PREDICTION ORIGIN DATE -- not ctx_start
@@ -1195,6 +1356,10 @@ def _run_options_all(
                             "opt_type":       options_params.get("opt_type", ""),
                             "quantity":       options_params.get("quantity", 1),
                             "delta":          options_params.get("delta", 30),
+                            "strike_selection": options_params.get("strike_selection", "delta"),
+                            "strike_price":   options_params.get("strike_price"),
+                            "expiry_date":    options_params.get("expiry_date"),
+                            "contract_method": "EXACT_STRIKE" if strike_mode else "DELTA_SELECTION",
                             "dte":            options_params.get("dte", 45),
                             "win_rate":       _win_pct,
                             "profit_loss":    float(_total_pl or 0),
@@ -1953,22 +2118,32 @@ def _render_options_results():
             unsafe_allow_html=True,
         )
     with i2:
+        _p_sel = opts_p.get("strike_selection", "delta")
+        _p_is_strike = _p_sel == "strike"
+        _p_contract_row = (
+            ("Strike Price", _fmt(opts_p.get("strike_price"), "$") if opts_p.get("strike_price") else "---")
+            if _p_is_strike else
+            ("Delta", str(opts_p.get("delta", "---")))
+        )
+        _p_expiry_rows = [("Expiry Date", opts_p.get("expiry_date") or "---")] if _p_is_strike else []
         st.markdown(
             _table([
                 ("Direction",          opts_p.get("direction", "---")),
                 ("Type",               opts_p.get("opt_type", "---")),
                 ("Quantity",           f"{opts_p.get('quantity', '---')} contract(s)"),
-                ("Strike Selection",   opts_p.get("strike_selection", "delta").title()),
-                ("Delta",              str(opts_p.get("delta", "---"))),
+                ("Strike Selection",   _p_sel.title()),
+                _p_contract_row,
                 ("DTE",                f"{opts_p.get('dte', '---')} days"),
+            ] + _p_expiry_rows + [
                 ("Entry Schedule",     opts_p.get("entry_schedule", "---")),
                 ("Exit Rule",          opts_p.get("exit_rule", "---")),
-                ("Backtest Window",    f"{origin}  →  {target}"),
+                ("Backtest Window",    f"{origin}  ->  {target}"),
             ]),
             unsafe_allow_html=True,
         )
 
-    # ── Paid API Usage Proof (options mode) ──────────────────────────────────
+    # Paid API Usage Proof (options mode)
+
     _rapi_hc_o = st.session_state.get("rapidapi_health") or {}
     _tt_hc_o   = st.session_state.get("tastytrade_health") or {}
     _ro_called   = _rapi_hc_o.get("called", False)
@@ -2023,7 +2198,7 @@ def _render_options_results():
         + (
             f'Options P&L: <b style="color:{"#10B981" if float(opts.get("profit_loss",0) or 0)>=0 else "#EF4444"}">'
             f'${float(opts.get("profit_loss",0) or 0):+,.2f}</b><br>'
-            f'Win Rate: <b>{f"{float(opts.get("win_rate",0) or 0)*100:.1f}%" if (opts.get("win_rate") is not None and float(opts.get("win_rate",0) or 0) <= 1) else f"{float(opts.get("win_rate",0) or 0):.1f}%"}</b><br>'
+            f'Win Rate: <b>{_win_rate_fmt(opts.get("win_rate"))}</b><br>'
             f'Trials / Trades: <b>{opts.get("total_trades","---")}</b><br>'
             if opts_status == "SUCCESS" else ""
         )
@@ -2128,14 +2303,23 @@ def _render_options_results():
             unsafe_allow_html=True,
         )
     with oc2:
+        _3b_sel = opts_p.get("strike_selection", "delta")
+        _3b_is_strike = _3b_sel == "strike"
+        _3b_contract_row = (
+            ("Strike Price", _fmt(opts_p.get("strike_price"), "$") if opts_p.get("strike_price") else "---")
+            if _3b_is_strike else
+            ("Delta", str(opts_p.get("delta", "---")))
+        )
+        _3b_expiry_rows = [("Expiry Date", opts_p.get("expiry_date") or "---")] if _3b_is_strike else []
         st.markdown(
             _table([
-                ("Strike Selection", opts_p.get("strike_selection", "delta").title()),
-                ("Delta",            str(opts_p.get("delta", "---"))),
+                ("Strike Selection", _3b_sel.title()),
+                _3b_contract_row,
                 ("DTE",              f"{opts_p.get('dte', '---')} days"),
-            ]),
+            ] + _3b_expiry_rows),
             unsafe_allow_html=True,
         )
+
     with oc3:
         st.markdown(
             _table([

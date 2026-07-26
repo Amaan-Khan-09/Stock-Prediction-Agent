@@ -89,6 +89,10 @@ def build_custom_legs_payload(
     """Build a payload from user-supplied leg definitions."""
     parsed_legs = []
     for leg_dict in legs:
+        strike_value = leg_dict.get("strikePrice", leg_dict.get("strike"))
+        delta_value = leg_dict.get("delta", 30)
+        if delta_value in (None, ""):
+            delta_value = 30
         parsed_legs.append(BacktestLeg(
             type=leg_dict.get("type", "equity-option"),
             direction=leg_dict.get("direction", "short"),
@@ -96,7 +100,12 @@ def build_custom_legs_payload(
             side=leg_dict.get("side", "put"),
             days_until_expiration=int(leg_dict.get("daysUntilExpiration", 45)),
             strike_selection=leg_dict.get("strikeSelection", "delta"),
-            delta=int(leg_dict.get("delta", 30)),
+            delta=int(delta_value),
+            strike_price=(
+                float(strike_value)
+                if strike_value not in (None, "")
+                else None
+            ),
         ))
     return BacktestPayload(
         symbol=symbol.upper(),
@@ -227,11 +236,22 @@ def parse_backtest_result(backtest_id: str, data: Dict[str, Any]) -> BacktestRes
     results_obj: Dict[str, Any] = data.get("results") or {}
 
     # Trials — API returns {profitLoss, openDateTime, closeDateTime}
-    raw_trials = results_obj.get("trials") or results_obj.get("snapshots") or []
+    raw_trials = (
+        results_obj.get("trials")
+        or results_obj.get("snapshots")
+        or data.get("trials")
+        or data.get("snapshots")
+        or []
+    )
     trials = [BacktestTrial.from_dict(t) for t in raw_trials]
 
     # Statistics — API returns human-readable keys like "Win percentage", "Total profit/loss"
-    raw_stats = results_obj.get("statistics") or results_obj.get("stats")
+    raw_stats = (
+        results_obj.get("statistics")
+        or results_obj.get("stats")
+        or data.get("statistics")
+        or data.get("stats")
+    )
     statistics = BacktestStatistics.from_dict(raw_stats) if raw_stats else _compute_statistics(trials)
 
     symbol = data.get("symbol") or ""

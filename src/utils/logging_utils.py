@@ -28,7 +28,7 @@ def get_logger(name: str) -> logging.Logger:
 
 
 def log_api_call(logger: logging.Logger, service: str, endpoint: str, status: Any) -> None:
-    logger.info(f"[{service}] {endpoint} → {status}")
+    logger.info(f"[{service}] {endpoint} -> {status}")
 
 
 def log_error(logger: logging.Logger, service: str, error: Exception) -> None:

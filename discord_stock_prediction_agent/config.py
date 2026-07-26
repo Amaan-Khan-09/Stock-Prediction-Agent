@@ -1,0 +1,188 @@
+"""Configuration for the Discord stock prediction agent."""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+AGENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = AGENT_DIR.parent
+
+# Load project .env first, then optional agent-local overrides.
+load_dotenv(PROJECT_ROOT / ".env", override=False)
+load_dotenv(AGENT_DIR / ".env", override=True)
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _first_int_env(names: tuple[str, ...], default: int) -> int:
+    for name in names:
+        value = _int_env(name, 0)
+        if value:
+            return value
+    return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    discord_bot_token: str = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    discord_signal_channel_id: int = _int_env("DISCORD_SIGNAL_CHANNEL_ID", 0)
+    discord_review_channel_id: int = _first_int_env(
+        (
+            "AGENT_REVIEW_CHANNEL_ID",
+            "DISCORD_AGENT_REVIEW_CHANNEL_ID",
+            "SIGNAL_REVIEW_CHANNEL_ID",
+            "DISCORD_SIGNAL_REVIEW_CHANNEL_ID",
+            "DISCORD_REVIEW_CHANNEL_ID",
+        ),
+        0,
+    )
+    discord_paper_log_channel_id: int = _int_env("DISCORD_PAPER_LOG_CHANNEL_ID", 0)
+
+    alpaca_api_key: str = os.getenv("ALPACA_API_KEY", "").strip()
+    alpaca_secret_key: str = os.getenv("ALPACA_SECRET_KEY", "").strip()
+    alpaca_base_url: str = os.getenv(
+        "ALPACA_BASE_URL", "https://paper-api.alpaca.markets"
+    ).rstrip("/")
+    alpaca_data_base_url: str = os.getenv(
+        "ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"
+    ).rstrip("/")
+    alpaca_request_timeout_seconds: int = _int_env("ALPACA_REQUEST_TIMEOUT_SECONDS", 20)
+    alpaca_max_concurrent_requests: int = _int_env("ALPACA_MAX_CONCURRENT_REQUESTS", 8)
+    alpaca_max_request_attempts: int = _int_env("ALPACA_MAX_REQUEST_ATTEMPTS", 3)
+    polygon_api_key: str = os.getenv("POLYGON_API_KEY", "").strip()
+    polygon_base_url: str = os.getenv("POLYGON_BASE_URL", "https://api.polygon.io").rstrip("/")
+    polygon_timeout_seconds: int = _int_env("POLYGON_TIMEOUT_SECONDS", 20)
+
+    paper_trading_enabled: bool = _bool_env("PAPER_TRADING_ENABLED", True)
+    stop_loss_pct: float = _float_env("AGENT_STOP_LOSS_PCT", 0.5)
+    stop_monitor_seconds: int = _int_env("STOP_MONITOR_SECONDS", 60)
+    conditional_trigger_band_pct: float = _float_env("CONDITIONAL_TRIGGER_BAND_PCT", 5.0)
+    conditional_trigger_upper_band_pct: float = _float_env("CONDITIONAL_TRIGGER_UPPER_BAND_PCT", 10.0)
+    max_equity_qty: float = _float_env("MAX_EQUITY_QTY", 1_000_000.0)
+    max_option_qty: float = _float_env("MAX_OPTION_QTY", 1_000.0)
+    max_daily_paper_trades: int = _int_env("MAX_DAILY_PAPER_TRADES", 20)
+    allow_duplicate_paper_orders: bool = _bool_env("ALLOW_DUPLICATE_PAPER_ORDERS", True)
+    per_symbol_cooldown_minutes: int = _int_env("PER_SYMBOL_COOLDOWN_MINUTES", 10)
+    duplicate_signal_ttl_minutes: int = _int_env("DUPLICATE_SIGNAL_TTL_MINUTES", 15)
+    debug_output_enabled: bool = _bool_env("DEBUG_OUTPUT_ENABLED", False)
+    signal_worker_concurrency: int = _int_env("SIGNAL_WORKER_CONCURRENCY", 4)
+    signal_queue_limit: int = _int_env("SIGNAL_QUEUE_LIMIT", 20_000)
+    signal_queue_poll_seconds: float = _float_env("SIGNAL_QUEUE_POLL_SECONDS", 0.5)
+    signal_max_attempts: int = _int_env("SIGNAL_MAX_ATTEMPTS", 3)
+    signal_retry_base_seconds: int = _int_env("SIGNAL_RETRY_BASE_SECONDS", 5)
+    signal_claim_timeout_seconds: int = _int_env("SIGNAL_CLAIM_TIMEOUT_SECONDS", 600)
+    pending_order_batch_size: int = _int_env("PENDING_ORDER_BATCH_SIZE", 100)
+    runtime_log_level: str = os.getenv("RUNTIME_LOG_LEVEL", "INFO").strip().upper()
+    runtime_log_max_bytes: int = _int_env("RUNTIME_LOG_MAX_BYTES", 5_000_000)
+    runtime_log_backup_count: int = _int_env("RUNTIME_LOG_BACKUP_COUNT", 5)
+
+    default_horizon_days: int = _int_env("DEFAULT_PREDICTION_HORIZON_DAYS", 1)
+    historical_context_days: int = _int_env("HISTORICAL_CONTEXT_DAYS", 365)
+    initial_capital: float = _float_env("DEFAULT_INITIAL_CAPITAL", 50000.0)
+    benchmark: str = os.getenv("DEFAULT_BENCHMARK", "SPY").strip().upper()
+    price_basis: str = os.getenv("DEFAULT_PRICE_BASIS", "close").strip().lower()
+
+    buy_min_return_pct: float = _float_env("BUY_MIN_RETURN_PCT", 0.01)
+    buy_strong_return_pct: float = _float_env("BUY_STRONG_RETURN_PCT", 1.0)
+    buy_excellent_confidence: float = _float_env("BUY_EXCELLENT_CONFIDENCE", 80.0)
+    buy_low_risk: float = _float_env("BUY_LOW_RISK", 40.0)
+    buy_decision_score: float = _float_env("BUY_DECISION_SCORE", 45.0)
+
+    sell_min_return_pct: float = _float_env("SELL_MIN_RETURN_PCT", -0.01)
+    sell_strong_return_pct: float = _float_env("SELL_STRONG_RETURN_PCT", -1.0)
+    sell_low_confidence: float = _float_env("SELL_LOW_CONFIDENCE", 50.0)
+    sell_high_risk: float = _float_env("SELL_HIGH_RISK", 60.0)
+    sell_decision_score: float = _float_env("SELL_DECISION_SCORE", 45.0)
+
+    agent_name: str = os.getenv("AGENT_NAME", "AI Stock Prediction Agent").strip()
+
+    default_option_qty: float = _float_env("DEFAULT_OPTION_QTY", 1.0)
+    default_option_order_type: str = os.getenv("DEFAULT_OPTION_ORDER_TYPE", "auto").strip().lower()
+    options_trading_enabled_override: bool = _bool_env("OPTIONS_TRADING_ENABLED", True)
+    default_option_strategy_horizon_days: int = _int_env("DEFAULT_OPTION_STRATEGY_HORIZON_DAYS", 1)
+    option_backtest_lookback_days: int = _int_env("OPTION_BACKTEST_LOOKBACK_DAYS", 365)
+    option_exact_strike_recent_retry_days: int = _int_env("OPTION_EXACT_STRIKE_RECENT_RETRY_DAYS", 45)
+    default_option_strategy_delta: int = _int_env("DEFAULT_OPTION_STRATEGY_DELTA", 30)
+    default_option_strategy_dte: int = _int_env("DEFAULT_OPTION_STRATEGY_DTE", 1)
+    default_option_entry_frequency: str = os.getenv("DEFAULT_OPTION_ENTRY_FREQUENCY", "every day").strip()
+    default_option_exit_rule: str = os.getenv("DEFAULT_OPTION_EXIT_RULE", "Exit at target date").strip()
+    option_allow_unvalidated_fallback: bool = _bool_env("OPTION_ALLOW_UNVALIDATED_FALLBACK", False)
+    option_exact_strike_backtest_mode: str = os.getenv(
+        "OPTION_EXACT_STRIKE_BACKTEST_MODE", "exact_first"
+    ).strip().lower()
+    option_strike_validation_provider: str = os.getenv(
+        "OPTION_STRIKE_VALIDATION_PROVIDER", "polygon_first"
+    ).strip().lower()
+    option_validation_cache_ttl_hours: int = _int_env("OPTION_VALIDATION_CACHE_TTL_HOURS", 12)
+    option_validation_timeout_seconds: int = _int_env("OPTION_VALIDATION_TIMEOUT_SECONDS", 35)
+    suppress_discord_reconnect_tracebacks: bool = _bool_env("SUPPRESS_DISCORD_RECONNECT_TRACEBACKS", True)
+    learning_enabled: bool = _bool_env("LEARNING_ENABLED", True)
+    learning_min_samples: int = _int_env("LEARNING_MIN_SAMPLES", 5)
+    learning_max_score_adjustment: float = _float_env("LEARNING_MAX_SCORE_ADJUSTMENT", 8.0)
+    min_option_signal_quality: float = _float_env("MIN_OPTION_SIGNAL_QUALITY", 60.0)
+    min_option_risk_reward: float = _float_env("MIN_OPTION_RISK_REWARD", 1.2)
+    max_option_dte: int = _int_env("MAX_OPTION_DTE", 120)
+
+    @property
+    def has_alpaca(self) -> bool:
+        return bool(self.alpaca_api_key and self.alpaca_secret_key)
+
+    @property
+    def has_discord(self) -> bool:
+        return bool(self.discord_bot_token)
+
+    @property
+    def uses_paper_alpaca_endpoint(self) -> bool:
+        return "paper-api.alpaca.markets" in self.alpaca_base_url.lower()
+
+
+config = AgentConfig()
+
+
+def production_config_errors() -> list[str]:
+    errors: list[str] = []
+    if not config.has_discord:
+        errors.append("DISCORD_BOT_TOKEN is missing")
+    if config.discord_signal_channel_id <= 0:
+        errors.append("DISCORD_SIGNAL_CHANNEL_ID is missing or invalid")
+    if config.discord_review_channel_id <= 0:
+        errors.append("AGENT_REVIEW_CHANNEL_ID is missing or invalid")
+    if config.paper_trading_enabled:
+        if not config.has_alpaca:
+            errors.append("Alpaca paper API key/secret are missing")
+        if not config.uses_paper_alpaca_endpoint:
+            errors.append(
+                "ALPACA_BASE_URL must use https://paper-api.alpaca.markets"
+            )
+    if not 1 <= config.signal_worker_concurrency <= 16:
+        errors.append("SIGNAL_WORKER_CONCURRENCY must be between 1 and 16")
+    if config.signal_queue_limit < 100:
+        errors.append("SIGNAL_QUEUE_LIMIT must be at least 100")
+    if config.stop_monitor_seconds < 15:
+        errors.append("STOP_MONITOR_SECONDS must be at least 15")
+    if not 1 <= config.pending_order_batch_size <= 1_000:
+        errors.append("PENDING_ORDER_BATCH_SIZE must be between 1 and 1000")
+    return errors

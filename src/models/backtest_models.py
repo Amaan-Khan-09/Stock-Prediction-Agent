@@ -24,17 +24,23 @@ class BacktestLeg:
     days_until_expiration: int = 45
     strike_selection: str = "delta"
     delta: int = 30
+    strike_price: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        strike_selection = (self.strike_selection or "delta").lower()
+        data = {
             "type": self.type,
             "direction": self.direction,
             "quantity": self.quantity,
             "side": self.side,
             "daysUntilExpiration": self.days_until_expiration,
-            "strikeSelection": self.strike_selection,
-            "delta": self.delta,
+            "strikeSelection": strike_selection,
         }
+        if strike_selection == "strike" and self.strike_price is not None:
+            data["strikePrice"] = self.strike_price
+        else:
+            data["delta"] = self.delta
+        return data
 
 
 @dataclass

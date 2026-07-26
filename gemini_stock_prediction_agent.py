@@ -788,23 +788,36 @@ def _call_gemini(
     prompt_hash    = hashlib.sha256(prompt_content.encode()).hexdigest()[:16]
 
     try:
-        from google import genai
-        from google.genai import types as genai_types
+        try:
+            from google import genai
+            from google.genai import types as genai_types
 
-        client = genai.Client(api_key=_GEMINI_KEY)
+            client = genai.Client(api_key=_GEMINI_KEY)
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt_content,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=2048,
+                    thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+            raw_text = (response.text or "").strip()
+        except ImportError:
+            import google.generativeai as legacy_genai
 
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt_content,
-            config=genai_types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=2048,
-                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-            ),
-        )
+            legacy_genai.configure(api_key=_GEMINI_KEY)
+            model = legacy_genai.GenerativeModel(GEMINI_MODEL)
+            response = model.generate_content(
+                prompt_content,
+                generation_config={
+                    "temperature": 0.1,
+                    "max_output_tokens": 2048,
+                },
+            )
+            raw_text = (getattr(response, "text", "") or "").strip()
 
         gemini_latency_ms = round((time.time() - t0) * 1000, 0)
-        raw_text = (response.text or "").strip()
 
         # Extract JSON from response (handles thinking tags, markdown fences, plain JSON)
         json_text = _extract_json(raw_text)

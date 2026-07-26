@@ -140,7 +140,9 @@ def run_options_strategy_validation(input_dict: dict) -> dict:
       opt_type         : "Call" | "Put"
       quantity         : int (contracts)
       delta            : int (0-99, e.g. 30)
+      strike_price     : float | None, required when strike_selection="strike"
       dte              : int (days to expiration, e.g. 45)
+      strike_selection : "delta" | "strike"
       entry_schedule   : "Once at prediction origin date" | "Daily" | "Weekly" | "Monthly"
       exit_rule        : "At expiration" | "Target profit 50%" | ...
 
@@ -185,6 +187,7 @@ def run_options_strategy_validation(input_dict: dict) -> dict:
         opt_type  = input_dict.get("opt_type", "Put"),
         quantity  = int(input_dict.get("quantity", 1)),
         delta     = int(input_dict.get("delta", 30)),
+        strike_price = input_dict.get("strike_price"),
         dte       = int(input_dict.get("dte", 45)),
         strike_selection = input_dict.get("strike_selection", "delta"),
     )
@@ -211,6 +214,7 @@ def _run_options_backtest(
     direction: str = "Sell", opt_type: str = "Put",
     quantity: int = 1, delta: int = 30, dte: int = 45,
     strike_selection: str = "delta",
+    strike_price: float | None = None,
 ) -> dict:
     """
     Run tastytrade options backtest for the given window.
@@ -228,15 +232,19 @@ def _run_options_backtest(
     direction_map = {"Buy": "long", "Sell": "short"}
     type_map      = {"Call": "call", "Put": "put"}
 
+    strike_mode = str(strike_selection).lower() == "strike"
     leg = {
         "type":              "equity-option",
         "direction":         direction_map.get(direction, "short"),
         "quantity":          quantity,
         "side":              type_map.get(opt_type, "put"),
         "daysUntilExpiration": dte,
-        "strikeSelection":   strike_selection,
-        "delta":             delta,
+        "strikeSelection":   "strike" if strike_mode else "delta",
     }
+    if strike_mode and strike_price not in (None, ""):
+        leg["strikePrice"] = float(strike_price)
+    else:
+        leg["delta"] = int(delta or 30)
     try:
         payload    = _tt_legs(symbol=symbol, start_date=start_date, end_date=end_date, legs=[leg])
         bt_id, err = _tt_create(payload)
@@ -475,7 +483,7 @@ def _build_spi(input_dict: dict) -> dict:
 
     # Remove options-specific keys
     for key in ("direction", "opt_type", "quantity", "delta", "dte",
-                "strike_selection", "entry_schedule", "exit_rule"):
+                "strike_selection", "strike_price", "entry_schedule", "exit_rule"):
         spi.pop(key, None)
 
     # Derive target_date if not provided
