@@ -557,6 +557,42 @@ The AI predicts independently. The backtester verifies independently. The compar
 
 ---
 
+## Discord Paper-Trading Agent
+
+The repository also contains a production-oriented Discord layer in
+`discord_stock_prediction_agent/`. It receives raw equity and options signals, routes
+normal trades through **Stock Price Validation**, routes options through **Options
+Strategy Validation**, and submits approved orders only to Alpaca's paper endpoint.
+
+Run it from the repository root:
+
+```powershell
+python -m discord_stock_prediction_agent.discord_agent
+```
+
+The bot uses two primary Discord channel IDs in the local `.env`:
+
+```env
+DISCORD_SIGNAL_CHANNEL_ID=your_stock_signals_channel_id
+AGENT_REVIEW_CHANNEL_ID=your_agent_review_channel_id
+```
+
+Runtime decision controls:
+
+```text
+!agent_on    # project validation and decision gates enabled
+!agent_off   # valid BUY/SELL signals go directly to paper-order handling
+!agent_mode  # display current mode
+```
+
+Agent OFF does not disable parsing, position, contract, price, market-hours, paper
+endpoint, or broker safeguards. Full installation, Discord setup, environment variables,
+signal formats, queue/state locations, monitoring behavior, tests, and production notes
+are documented in
+[`discord_stock_prediction_agent/README.md`](discord_stock_prediction_agent/README.md).
+
+---
+
 ## Roadmap
 
 - [ ] Multi-leg strategy support — iron condors, calendars, strangles, butterflies

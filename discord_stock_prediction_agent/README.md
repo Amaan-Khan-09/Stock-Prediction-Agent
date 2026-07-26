@@ -1,95 +1,223 @@
 # Discord Stock Prediction Agent
 
-This agent connects Discord signals to the existing Stock-Prediction-Agent project.
+Production-oriented Discord signal ingestion and Alpaca paper-trading layer for the
+Stock-Prediction-Agent project. The bot accepts equity, single-leg option, and
+supported multi-leg option signals; validates them with the correct project engine;
+queues work durably; and reports every result in a separate Discord review channel.
 
-Core workflow:
+> Paper trading only. The checked configuration refuses a non-paper Alpaca trading
+> endpoint. This project is an experimental decision-support system, not a promise of
+> profit or financial advice.
 
-1. A user posts a signal in the configured Discord signal channel.
-2. The agent parses the message as either an equity signal or an options signal.
-3. Equity signals run through the project's Stock Price Validation flow.
-4. Options signals run through the project's Options Strategy Validation flow.
-5. Paper trades are placed only after the matching validation mode approves the signal and Alpaca paper checks pass.
-7. Positions bought by this agent are tracked locally.
-8. If a tracked position drops 0.5% from the recorded entry price, the agent sends a paper market sell.
-
-Example signals:
+## System Overview
 
 ```text
-buy TSLA qty 2
-sell AAPL qty 1
-hold MSFT
-buy google qty 3
-buy dell
-buy ford
-buy intel
-BTO AAPL 240C 08/21 @3.45
-Buy SPY 600 CE qty 1
-Buy 30 delta AAPL call
+Discord #stock-signals
+        |
+        v
+Durable SQLite signal queue
+        |
+        v
+Parser and symbol resolver
+        |
+        +-- Equity ------> Stock Price Validation
+        |
+        +-- Options -----> Options Strategy Validation
+        |                    + exact strike / Polygon
+        |                    + delta / Tastytrade
+        |                    + Alpaca contract verification
+        |
+        v
+Agent decision gate (ON) or direct signal routing (OFF)
+        |
+        v
+Alpaca paper-order checks and submission
+        |
+        v
+Position, pending-order, SL/TP, and 0.5% equity-stop monitors
+        |
+        v
+Discord #agent-review
 ```
 
-The parser supports common company-name aliases such as `apple -> AAPL`, `google -> GOOGL`,
-`dell -> DELL`, `ford -> F`, and `intel -> INTC`. It also accepts explicit ticker-style
-symbols, so users can type direct tickers even when a company-name alias is not listed.
+## What The Agent Handles
 
-Setup:
+- Equity signals: BUY, SELL, HOLD, quantity, market, limit, and conditional price rules.
+- Company names and ticker symbols, such as `apple`/`AAPL` and `microsoft`/`MSFT`.
+- Single-leg options: BTO, STC, STO, BTC, CALL, PUT, CE, PE, strike, expiry, quantity,
+  market/limit premium, stop loss, targets, risk/reward, and trailing stops.
+- Multi-leg strategies: spreads, straddles, strangles, butterflies, iron condors,
+  calendars, diagonals, ratios, collars, covered calls, protective puts, and rolls when
+  the parsed legs and Alpaca multi-leg requirements are complete.
+- Market-closed orders, unavailable contracts, unmet price conditions, and missing
+  positions through persistent monitoring queues.
+- Bulk traffic through concurrent workers, retry/backoff, stale-claim recovery, and a
+  dead-letter state for signals that exhaust all attempts.
+- Learning records for parser reliability, decision patterns, option-validation paths,
+  and closed paper-trade outcomes.
 
-```powershell
-cd C:\Users\mdama\Stock-Prediction-Agent
-venv\Scripts\activate
-pip install -r discord_stock_prediction_agent\requirements.txt
-notepad discord_stock_prediction_agent\.env
-```
+## Validation Routing
 
-For the core setup, create only one Discord text channel:
+The Discord agent always uses the Stock-Prediction-Agent project:
+
+| Signal | Project mode | Main result |
+|---|---|---|
+| Normal stock/equity | Stock Price Validation | BUY, SELL, or HOLD |
+| Options | Options Strategy Validation | Approved BUY/SELL or review/reject |
+
+Exact-strike option signals use the requested strike and expiry. With
+`OPTION_STRIKE_VALIDATION_PROVIDER=polygon_first`, Polygon exact-contract history is
+tried first and the existing strategy service remains available where useful. Explicit
+delta signals use the delta/DTE strategy path.
+
+The order contract is always resolved separately through Alpaca. Historical validation
+does not silently replace the requested strike in the actual paper order.
+
+## Agent ON And OFF
+
+The decision-making layer can be changed while the bot is running:
 
 ```text
-stock-signals
+!agent_on
+!agent_off
+!agent_mode
 ```
 
-Users send raw signals there. The agent must not post output in this input channel.
+- **Agent ON:** current behavior. Equity signals use Stock Price Validation and options
+  use Options Strategy Validation before paper-order handling.
+- **Agent OFF:** every valid BUY/SELL signal proceeds directly to paper-order handling.
+  Parsing, contract lookup, market-hours, position, quantity, price-condition, buying
+  power, paper-endpoint, and broker safeguards remain active.
+- HOLD signals never create orders in either mode.
+- Only the bot owner or a member with Discord **Administrator** or **Manage Server**
+  permission can change the mode.
+- The selected mode is persisted in
+  `discord_stock_prediction_agent/agent_state.json` and survives restarts.
 
-Create a separate output channel:
+Useful status commands:
 
 ```text
-agent-review
+!agent_status
+!agent_positions
+!agent_option_positions
+!agent_summary
+!agent_learning
+!agent_option_validation
 ```
 
-Prediction reviews, trade confirmations, invalid-input messages, and protection-sell alerts go to `agent-review`.
+## Discord Channels And IDs
 
-Fill `discord_stock_prediction_agent\.env` with:
+Create two text channels:
+
+| Suggested channel | Purpose | Environment variable |
+|---|---|---|
+| `#stock-signals` | Raw user input only | `DISCORD_SIGNAL_CHANNEL_ID` |
+| `#agent-review` | Reviews, invalid input, decisions, queue/order updates | `AGENT_REVIEW_CHANNEL_ID` |
+
+Optional:
+
+| Channel | Purpose | Environment variable |
+|---|---|---|
+| `#paper-trade-log` | Separate broker/order and protection messages | `DISCORD_PAPER_LOG_CHANNEL_ID` |
+
+Channel IDs are deployment-specific and must not be hard-coded into source control.
+To obtain an ID:
+
+1. Discord **User Settings > Advanced > Developer Mode**: ON.
+2. Right-click the channel.
+3. Select **Copy Channel ID**.
+4. Paste only the numeric ID into the local `.env` file.
+
+The review channel also accepts these legacy variable names, in this priority order:
 
 ```text
-DISCORD_BOT_TOKEN
-DISCORD_SIGNAL_CHANNEL_ID
 AGENT_REVIEW_CHANNEL_ID
+DISCORD_AGENT_REVIEW_CHANNEL_ID
 SIGNAL_REVIEW_CHANNEL_ID
-ALPACA_API_KEY
-ALPACA_SECRET_KEY
-POLYGON_API_KEY
+DISCORD_SIGNAL_REVIEW_CHANNEL_ID
+DISCORD_REVIEW_CHANNEL_ID
 ```
 
-Options validation:
+## Discord Bot Setup
 
-```text
+1. Open the Discord Developer Portal and create an application.
+2. Add a bot user.
+3. Enable **Message Content Intent**.
+4. Invite the bot to the server with View Channels, Send Messages, Embed Links, Read
+   Message History, Add Reactions, and Use Application Commands permissions.
+5. Give the bot access to `#stock-signals` and `#agent-review`.
+6. Put the bot token only in the local `.env`; never commit or post it.
+
+## Environment Configuration
+
+The loader reads the project-root `.env`, followed by
+`discord_stock_prediction_agent/.env` as an optional local override. Both are ignored by
+Git.
+
+Minimum Discord and paper-trading configuration:
+
+```env
+DISCORD_BOT_TOKEN=your_discord_bot_token
+DISCORD_SIGNAL_CHANNEL_ID=your_stock_signals_channel_id
+AGENT_REVIEW_CHANNEL_ID=your_agent_review_channel_id
+DISCORD_PAPER_LOG_CHANNEL_ID=
+
+PAPER_TRADING_ENABLED=true
+ALPACA_API_KEY=your_alpaca_paper_key
+ALPACA_SECRET_KEY=your_alpaca_paper_secret
+ALPACA_BASE_URL=https://paper-api.alpaca.markets
+ALPACA_DATA_BASE_URL=https://data.alpaca.markets
+
+POLYGON_API_KEY=your_polygon_key
 OPTION_STRIKE_VALIDATION_PROVIDER=polygon_first
 ```
 
-Exact strike signals such as `AAPL 240C`, `SPY 600 CE`, and `TSLA 290P` are validated with Polygon first. The agent builds the exact Polygon option ticker from the underlying, expiry, call/put side, and strike, then checks historical aggregate bars for that real contract. Delta-style signals continue through the existing delta strategy validation flow.
+The Stock-Prediction-Agent also uses the provider variables documented in the root
+README, including Google/Gemini, RapidAPI/TradingView, and Tastytrade when those paths
+are enabled.
 
-If Polygon is unavailable or returns no exact-contract bars and the provider is `polygon_first`, the agent can still fall back to the existing Tastytrade validation path. If you want strike signals to depend only on Polygon exact-contract validation, set:
+Recommended runtime settings:
 
-```text
-OPTION_STRIKE_VALIDATION_PROVIDER=polygon
+```env
+AGENT_NAME=AI Stock Prediction Agent
+SIGNAL_WORKER_CONCURRENCY=4
+SIGNAL_QUEUE_LIMIT=20000
+SIGNAL_MAX_ATTEMPTS=3
+SIGNAL_RETRY_BASE_SECONDS=5
+SIGNAL_CLAIM_TIMEOUT_SECONDS=600
+PENDING_ORDER_BATCH_SIZE=100
+
+STOP_MONITOR_SECONDS=60
+AGENT_STOP_LOSS_PCT=0.5
+CONDITIONAL_TRIGGER_BAND_PCT=5.0
+MAX_EQUITY_QTY=1000000
+MAX_OPTION_QTY=1000
+MAX_DAILY_PAPER_TRADES=20
+ALLOW_DUPLICATE_PAPER_ORDERS=true
+
+OPTIONS_TRADING_ENABLED=true
+DEFAULT_OPTION_QTY=1
+DEFAULT_OPTION_ORDER_TYPE=auto
+OPTION_BACKTEST_LOOKBACK_DAYS=365
+DEFAULT_OPTION_STRATEGY_DELTA=30
+OPTION_VALIDATION_TIMEOUT_SECONDS=35
+OPTION_ALLOW_UNVALIDATED_FALLBACK=false
+
+LEARNING_ENABLED=true
+LEARNING_MIN_SAMPLES=5
+RUNTIME_LOG_LEVEL=INFO
+DEBUG_OUTPUT_ENABLED=false
 ```
 
-Optional decision tuning values:
+Decision thresholds can be tuned without changing Python code:
 
-```text
+```env
 BUY_MIN_RETURN_PCT=0.01
 BUY_STRONG_RETURN_PCT=1.0
 BUY_EXCELLENT_CONFIDENCE=80
 BUY_LOW_RISK=40
 BUY_DECISION_SCORE=45
+
 SELL_MIN_RETURN_PCT=-0.01
 SELL_STRONG_RETURN_PCT=-1.0
 SELL_LOW_CONFIDENCE=50
@@ -97,37 +225,159 @@ SELL_HIGH_RISK=60
 SELL_DECISION_SCORE=45
 ```
 
-These values control the equity Stock Price Validation decision gate without changing Python code.
+## Install And Run On Windows
 
-The agent reads `AGENT_REVIEW_CHANNEL_ID` first. These older names also work:
-
-```text
-DISCORD_AGENT_REVIEW_CHANNEL_ID=
-SIGNAL_REVIEW_CHANNEL_ID=
-DISCORD_SIGNAL_REVIEW_CHANNEL_ID=
-DISCORD_REVIEW_CHANNEL_ID=
-```
-
-Leave `DISCORD_PAPER_LOG_CHANNEL_ID` blank if you want paper trade logs to stay with the normal review output.
-
-Run:
+From the project root:
 
 ```powershell
-venv\Scripts\python.exe -m discord_stock_prediction_agent.discord_agent
+cd C:\Users\mdama\Stock-Prediction-Agent
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pip install -r discord_stock_prediction_agent\requirements.txt
 ```
 
-Safety rules:
+Command Prompt activation:
 
-- This agent uses Alpaca paper trading endpoints only by default.
-- `BUY` defaults to quantity 1 when quantity is not provided.
-- `SELL` first checks that Alpaca has shares. If quantity is missing, it sells the full available Alpaca position.
-- `BUY` is allowed when the user signal is `BUY` and the AI prediction passes one of these paths: strong positive return, tiny positive return with excellent confidence/risk, or weighted score.
-- `SELL` is allowed when the user signal is `SELL` and the AI prediction passes one of these paths: strong negative return, any negative return with low confidence/high risk, or weighted danger score.
-- All other cases become `HOLD`, and no paper trade is placed.
-- If final output is `SELL` but Alpaca has no shares, no trade is placed.
-- The 0.5% protection sell only applies to positions recorded in `agent_state.json` after this agent buys them.
-- Each processed signal is stored in `agent_state.json` under `decision_history` so the rules can be tuned from real outcomes over time.
-- Closed tracked paper trades are stored under `trade_outcomes`.
-- The agent updates `learning_profile` after tracked positions close: losing BUY outcomes make future BUY decisions stricter, while winning outcomes gradually loosen the gate.
-- The decision score also uses a benchmark market-regime check. A risk-on benchmark slightly supports BUY decisions; a risk-off benchmark supports SELL/caution.
-- News, geopolitics, and world-condition sentiment are not automatic yet. Add a news/sentiment API before using those factors in live scoring.
+```bat
+venv\Scripts\activate
+```
+
+Run the Streamlit Stock-Prediction-Agent dashboard:
+
+```powershell
+python -m streamlit run streamlit_app.py
+```
+
+Run the Discord agent in a separate terminal, from the project root:
+
+```powershell
+python -m discord_stock_prediction_agent.discord_agent
+```
+
+Do not run that module while the terminal is inside
+`discord_stock_prediction_agent`; the parent project directory must be the working
+directory. A process lock prevents two copies from using the same queues and state.
+
+## Example Signals
+
+Equities:
+
+```text
+buy TSLA qty 2
+SELL AAPL qty 1
+HOLD MSFT. Mixed indicators and earnings tomorrow.
+BUY AMZN LIMIT 235.50
+SELL TSLA if price falls below 295
+BUY GOOGL if price closes above 205, otherwise HOLD
+```
+
+Single-leg options:
+
+```text
+BTO AAPL 240C 08/21 @3.45 SL 2.20 TP 5.80
+STC AAPL 240C 08/21 @6.80
+STO SPY 620P 08/21 @2.40
+BTC SPY 620P 08/21 @1.05
+Buy 30 delta AAPL call qty 1
+```
+
+Multi-leg options:
+
+```text
+BTO AAPL 240C / STO AAPL 250C 09/19 @4.60 Debit Qty 5
+BUY SPY 640C + 640P 09/19 @8.20 Debit Qty 2
+STO SPY 620P / BTO SPY 610P / STO SPY 670C / BTO SPY 680C 09/19 @2.15 Credit Qty 10
+```
+
+## Order And Monitoring Behavior
+
+- A missing equity or option quantity defaults to 1 for an entry.
+- Equity SELL checks the available Alpaca position; without quantity it closes the
+  available position.
+- Close-option actions require a matching Alpaca option position.
+- Market-closed approved orders are queued and retried after Alpaca reports open.
+- Unavailable exact option contracts are stored and checked again.
+- Limit orders are submitted to Alpaca at the signal limit; Alpaca owns fill behavior.
+- Conditional equity and option entries wait for the specified price condition.
+- Agent-bought equities use the configured percentage protection monitor.
+- Option SL/TP/trailing conditions are monitored after the option position is visible.
+- Successfully submitted queued items are removed from pending state.
+- Permanent broker rejections are removed; transient failures remain eligible for retry.
+- Duplicate signals may create independent paper orders when
+  `ALLOW_DUPLICATE_PAPER_ORDERS=true`.
+
+## Runtime State
+
+These local files are created automatically and are intentionally ignored by Git:
+
+| File | Contents |
+|---|---|
+| `discord_stock_prediction_agent/agent_state.json` | mode, decisions, learning, tracked positions, and pending orders |
+| `discord_stock_prediction_agent/signal_queue.sqlite3` | durable incoming queue, retries, and dead-letter state |
+| `discord_stock_prediction_agent/options_validation_cache.json` | recent option validation cache |
+| `discord_stock_prediction_agent/symbol_cache.json` | refreshed tradable-symbol directory |
+| `discord_stock_prediction_agent/logs/discord_agent.log` | rotating runtime log |
+| `discord_stock_prediction_agent/discord_agent.lock` | single-process runtime lock |
+
+Back up `agent_state.json` and `signal_queue.sqlite3` before moving an active deployment.
+Do not commit them because they can contain Discord messages and broker metadata.
+
+## Main Files
+
+| File | Responsibility |
+|---|---|
+| `discord_agent.py` | Discord events, workers, decisions, monitors, commands, and output |
+| `signal_normalizer.py` | Discord text cleanup and format normalization |
+| `signal_parser.py` | equity parsing and conditional rules |
+| `options_parser.py` | single/multi-leg option parsing |
+| `prediction_bridge.py` | Stock Price Validation integration |
+| `options_strategy_bridge.py` | Options Strategy Validation integration |
+| `polygon_options_data.py` | exact-strike historical contract data |
+| `alpaca_paper.py` | paper account, contract, position, and order API |
+| `durable_signal_queue.py` | SQLite signal queue and retry lifecycle |
+| `state_store.py` | atomic JSON state, pending orders, learning, and positions |
+| `runtime_lock.py` | prevents duplicate agent processes |
+| `config.py` | environment loading and production checks |
+
+## Verification
+
+Compile the project:
+
+```powershell
+python -m compileall -q discord_stock_prediction_agent src tests
+```
+
+Run every Discord-agent regression module from the project root:
+
+```powershell
+Get-ChildItem discord_stock_prediction_agent\test_*.py | Sort-Object Name | ForEach-Object {
+    python -m ("discord_stock_prediction_agent." + $_.BaseName)
+}
+```
+
+Important coverage includes:
+
+- 2,172 deterministic real-world parser cases.
+- 2,400 mixed signals parsed and queued without loss.
+- 1,000 exact-strike option payload cases in the bulk report.
+- Agent mode, Alpaca idempotency, broker errors, multi-leg payloads, learning, queue
+  restart recovery, and process-lock behavior.
+
+Tests use mocks/local state unless a script explicitly states that it performs API or
+paper-order operations. Never run a bulk paper-order script against an account without
+reviewing its flags first.
+
+## Production Notes
+
+- Run one bot process per state directory.
+- Use a service manager and automatic restart policy for long-running deployments.
+- Keep `.env`, broker keys, tokens, state databases, and logs outside Git.
+- Restrict Discord channel permissions and mode-changing permissions.
+- Monitor the dead-letter count with `!agent_status` and review rotating logs.
+- Paper-test every new parser or execution rule before considering real-money support.
+- For a 2,000-member server, measure API rate limits and processing latency under the
+  expected burst pattern; worker concurrency alone does not remove provider limits.
+
+See [PRODUCTION_HARDENING.md](PRODUCTION_HARDENING.md) for the production-readiness
+checklist and remaining scaling work.
