@@ -36,6 +36,11 @@ from .options_symbol import likely_unsupported_by_alpaca, listed_expiry_fallback
 from .prediction_bridge import run_project_prediction
 from .runtime_lock import acquire_runtime_lock
 from .signal_parser import ParsedSignal
+from .stock_order_intent import (
+    execute_alpaca_order_plan,
+    gate_order_plan,
+    stock_review_chunks,
+)
 from .symbol_directory import refresh_symbol_cache_from_alpaca
 from .state_store import (
     add_decision_history,
@@ -1601,7 +1606,187 @@ async def _handle_sell(message: discord.Message, parsed: ParsedSignal, predictio
     )
 
 
+def _rich_intent_direction(intent: dict) -> str:
+    actions = [str(intent.get("action") or "").upper()]
+    actions.extend(
+        str(item.get("action") or "").upper()
+        for item in intent.get("actions", [])
+        if isinstance(item, dict)
+    )
+    if any(action in {"SELL", "SELL_SHORT", "SCALE_OUT"} for action in actions):
+        return "SELL"
+    if any(action in {"BUY", "BUY_TO_COVER", "LADDER_BUY", "MIXED_ENTRY"} for action in actions):
+        return "BUY"
+    return "HOLD"
+
+
+async def _process_rich_stock_order(message: discord.Message, parsed: ParsedSignal) -> bool:
+    """Review, gate, and submit a normalized rich stock order when present."""
+    intent = parsed.order_intent
+    if not isinstance(intent, dict):
+        return False
+
+    mode = "ON" if _agent_is_enabled() else "OFF"
+    await _send_review_or_reply(
+        message,
+        f"{parsed.symbol} normalized stock-order fields (Agent {mode}):",
+    )
+    for chunk in stock_review_chunks(intent):
+        await _send_review_or_reply(message, chunk)
+
+    legacy_market_fields = {
+        "asset_type", "action", "symbol", "quantity", "quantity_type", "order_type", "status",
+    }
+    if (
+        str(intent.get("action") or "").upper() in {"BUY", "SELL"}
+        and str(intent.get("order_type") or "").upper() == "MARKET"
+        and set(intent).issubset(legacy_market_fields)
+    ):
+        # Preserve the mature market-order queue, fill tracking, position state,
+        # and default protection path while still showing every parsed field.
+        return False
+
+    direction = _rich_intent_direction(intent)
+    prediction: dict = {}
+    if mode == "ON":
+        prediction = await asyncio.to_thread(run_project_prediction, parsed.symbol)
+        if prediction.get("status") != "SUCCESS":
+            await _block_trade(
+                message,
+                parsed.symbol,
+                "Agent ON could not produce a valid stock decision. The parsed order fields were retained, but no Alpaca order was placed.",
+                "rich_stock_prediction",
+            )
+            return True
+        decision = _evaluate_final_action(direction, prediction.get("ai_prediction") or {})
+        agent_decision = decision.action
+        await _send_optional_channel(
+            config.discord_review_channel_id,
+            message.channel,
+            embed=_prediction_embed(parsed, prediction, decision),
+        )
+    else:
+        agent_decision = direction
+        await _send_optional_channel(
+            config.discord_review_channel_id,
+            message.channel,
+            embed=_direct_equity_embed(parsed, _direct_signal_decision(direction)),
+        )
+
+    needs_position = (
+        str(intent.get("status") or "").startswith("VALID_IF_")
+        or intent.get("close_percentage") is not None
+        or intent.get("quantity_scope") is not None
+        or str(intent.get("action") or "").upper() in {"SELL", "BUY_TO_COVER", "SCALE_OUT"}
+        or any(
+            str(item.get("action") or "").upper() in {"SELL", "BUY_TO_COVER", "SCALE_OUT"}
+            for item in intent.get("actions", [])
+            if isinstance(item, dict)
+        )
+    )
+    position_quantity = None
+    if needs_position:
+        position, position_error = await asyncio.to_thread(alpaca.get_position, parsed.symbol)
+        if not position:
+            await _block_trade(
+                message,
+                parsed.symbol,
+                f"This order requires an existing Alpaca position. {_public_error(position_error)}",
+                "rich_stock_position",
+            )
+            return True
+        position_quantity = abs(_as_float(position.get("qty")))
+        if position_quantity <= 0:
+            await _block_trade(
+                message,
+                parsed.symbol,
+                "The Alpaca position has no usable quantity, so no order was placed.",
+                "rich_stock_position",
+            )
+            return True
+
+    plan = gate_order_plan(
+        intent,
+        agent_mode=mode,
+        agent_decision=agent_decision,
+        position_quantity=position_quantity,
+    )
+    if plan.blocked_reasons:
+        await _block_trade(
+            message,
+            parsed.symbol,
+            " ".join(plan.blocked_reasons),
+            "rich_stock_gate",
+        )
+        return True
+
+    if position_quantity is not None:
+        requested_close_qty = sum(
+            _as_float((operation.get("payload") or {}).get("qty"))
+            for operation in plan.operations
+            if operation.get("operation") == "submit_order"
+            and str((operation.get("payload") or {}).get("side") or "").lower()
+            == ("buy" if str(intent.get("action") or "").upper() == "BUY_TO_COVER" else "sell")
+        )
+        if requested_close_qty > position_quantity + 1e-9:
+            await _block_trade(
+                message,
+                parsed.symbol,
+                f"Requested close quantity {requested_close_qty:g} exceeds the Alpaca position quantity {position_quantity:g}.",
+                "rich_stock_position",
+            )
+            return True
+
+    for operation in plan.operations:
+        if operation.get("operation") != "submit_order":
+            continue
+        payload = operation.get("payload") or {}
+        side = str(payload.get("side") or "").lower()
+        qty = _as_float(payload.get("qty"), 1.0)
+        if not await _trade_guard(message, parsed.symbol, side, qty or 1.0, "equity"):
+            return True
+
+    result = await asyncio.to_thread(
+        execute_alpaca_order_plan,
+        alpaca,
+        plan,
+        client_order_id_factory=lambda index: _client_order_id(
+            f"rich{index}", message.id
+        ),
+    )
+    if result.get("errors"):
+        await _block_trade(
+            message,
+            parsed.symbol,
+            " ".join(str(error) for error in result["errors"]),
+            "rich_stock_execution",
+        )
+        return True
+
+    for order in result.get("submitted", []):
+        quantity = _as_float(order.get("qty") or order.get("notional"))
+        await asyncio.to_thread(
+            _record_order,
+            parsed.symbol,
+            str(order.get("side") or direction).lower(),
+            quantity,
+            str(order.get("status") or "submitted"),
+            str(order.get("id") or ""),
+            "equity",
+            "rich_stock_order",
+        )
+    await _send_review_or_reply(
+        message,
+        f"{parsed.symbol}: submitted {len(result.get('submitted', []))} Alpaca paper order(s); "
+        f"cancelled {len(result.get('cancelled', []))} prior order(s). "
+        f"All {len(result.get('considered_fields', []))} normalized leaf fields were reviewed.",
+    )
+    return True
+
+
 async def _process_signal(message: discord.Message, parsed: ParsedSignal) -> None:
+    if await _process_rich_stock_order(message, parsed):
+        return
     if parsed.action in {"BUY", "SELL"} and parsed.condition_type and parsed.condition_price:
         await asyncio.to_thread(
             add_conditional_equity_order,
@@ -2941,7 +3126,11 @@ async def _process_queued_signal_message(message: discord.Message) -> None:
             symbol_for_event,
             routed.reason or "Invalid input",
         )
-        await _send_review_or_reply(message, "Invalid input")
+        if routed.equity and isinstance(routed.equity.order_intent, dict):
+            await _send_review_or_reply(message, "Invalid/non-executable normalized stock-order fields:")
+            for chunk in stock_review_chunks(routed.equity.order_intent):
+                await _send_review_or_reply(message, chunk)
+        await _send_review_or_reply(message, routed.reason or "Invalid input")
         return
 
     if routed.kind == "NO_TRADE":

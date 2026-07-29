@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .signal_normalizer import normalize_signal_input
+from .stock_order_intent import parse_stock_order
 from .symbol_directory import is_symbol_like, resolve_cached_symbol
 
 
@@ -341,6 +342,7 @@ class ParsedSignal:
     condition_type: str = ""
     condition_price: Optional[float] = None
     order_type: str = "market"
+    order_intent: Optional[dict] = None
 
 
 def _normalize_symbol(value: str) -> str:
@@ -502,6 +504,52 @@ def parse_signal(message: str) -> ParsedSignal:
     compact = normalize_signal_input(raw)
     if not compact:
         return ParsedSignal(False, raw_text=raw, reason="Empty message.")
+
+    rich_intent = parse_stock_order(compact)
+    if rich_intent and rich_intent.get("status") == "INVALID_OR_NON_EXECUTABLE":
+        return ParsedSignal(
+            valid=False,
+            raw_text=raw,
+            reason="; ".join(str(issue) for issue in rich_intent.get("issues", [])),
+            order_intent=rich_intent,
+        )
+    if rich_intent and rich_intent.get("asset_type") == "STOCK":
+        action = str(rich_intent.get("action") or "").upper()
+        if not action and isinstance(rich_intent.get("actions"), list):
+            action = next(
+                (
+                    str(item.get("action") or "").upper()
+                    for item in rich_intent["actions"]
+                    if str(item.get("action") or "").upper() != "CANCEL_OPEN_ORDERS"
+                ),
+                "",
+            )
+        symbol = str(rich_intent.get("symbol") or "").upper()
+        if not symbol and isinstance(rich_intent.get("actions"), list):
+            symbol = next(
+                (str(item.get("symbol") or "").upper() for item in rich_intent["actions"] if item.get("symbol")),
+                "",
+            )
+        quantity = rich_intent.get("quantity")
+        if quantity is None:
+            quantity = rich_intent.get("initial_quantity", rich_intent.get("total_quantity"))
+        legacy_action = {
+            "SELL_SHORT": "SELL",
+            "BUY_TO_COVER": "BUY",
+            "SCALE_OUT": "SELL",
+            "LADDER_BUY": "BUY",
+            "MIXED_ENTRY": "BUY",
+        }.get(action, action)
+        return ParsedSignal(
+            valid=bool(action and symbol),
+            action=legacy_action,
+            symbol=symbol,
+            quantity=float(quantity) if quantity is not None else None,
+            raw_text=raw,
+            reason="Rich stock order parsed; every normalized field is attached as order_intent.",
+            order_type=str(rich_intent.get("order_type") or "MARKET").lower(),
+            order_intent=rich_intent,
+        )
 
     action = _infer_action(compact)
     if not action:

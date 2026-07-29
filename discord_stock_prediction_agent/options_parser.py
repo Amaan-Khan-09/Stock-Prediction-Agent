@@ -885,6 +885,13 @@ def classify_and_parse(text: str) -> ParsedMessage:
     if equity.valid:
         equity = replace(equity, raw_text=raw)
         return ParsedMessage(kind="EQUITY", equity=equity, raw_text=raw)
+    if equity.order_intent and equity.order_intent.get("status") == "INVALID_OR_NON_EXECUTABLE":
+        return ParsedMessage(
+            kind="INVALID",
+            equity=replace(equity, raw_text=raw),
+            raw_text=raw,
+            reason=equity.reason or "Invalid or non-executable stock order.",
+        )
 
     # Readable market commentary that isn't a tradeable equity or options signal.
     return ParsedMessage(
