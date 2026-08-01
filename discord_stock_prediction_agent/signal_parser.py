@@ -41,12 +41,10 @@ SYMBOL_ALIASES = {
     "CISCO": "CSCO",
     "ADOBE": "ADBE",
     "PAYPAL": "PYPL",
-    "BLOCK": "SQ",
-    "SQUARE": "SQ",
+    # BLOCK/SQUARE/TARGET intentionally omitted -- see PHRASE_ALIASES below for why.
     "UBER": "UBER",
     "LYFT": "LYFT",
     "WALMART": "WMT",
-    "TARGET": "TGT",
     "HOME DEPOT": "HD",
     "LOWES": "LOW",
     "MCDONALDS": "MCD",
@@ -159,10 +157,13 @@ PHRASE_ALIASES = {
     "CISCO": "CSCO",
     "ADOBE": "ADBE",
     "PAYPAL": "PYPL",
-    "BLOCK": "SQ",
-    "SQUARE": "SQ",
+    # BLOCK/SQUARE/TARGET are deliberately omitted here even though they're
+    # real company names (Block Inc, Square, Target Corp) -- they're also
+    # extremely common trading-signal vocabulary ("square off my position",
+    # "block this trade", "hit my target"), so treating the bare word as a
+    # company reference misreads the intended symbol far more often than it
+    # helps. Users can still reference these by their literal ticker (SQ/TGT).
     "WALMART": "WMT",
-    "TARGET": "TGT",
     "HOME DEPOT": "HD",
     "LOWES": "LOW",
     "MCDONALDS": "MCD",
@@ -343,6 +344,9 @@ class ParsedSignal:
     condition_price: Optional[float] = None
     order_type: str = "market"
     order_intent: Optional[dict] = None
+    limit_price: Optional[float] = None
+    stop_price: Optional[float] = None
+    time_in_force: str = "DAY"
 
 
 def _normalize_symbol(value: str) -> str:
@@ -356,6 +360,10 @@ def _normalized_text(text: str) -> str:
 
 def _infer_action(text: str) -> str:
     normalized = _normalized_text(text)
+    if re.search(r"\bBUY\s+TO\s+COVER\b|\bCOVER(?:ING)?\b", normalized):
+        return "BUY_TO_COVER"
+    if re.search(r"\b(?:SHORT\s+SELL|SELL\s+SHORT|SHORT(?:ING)?)\b", normalized):
+        return "SELL_SHORT"
     explicit = ""
     for word, mapped in ACTION_WORDS.items():
         if re.search(rf"\b{re.escape(word)}\b", normalized):
@@ -391,6 +399,8 @@ def _extract_quantity(text: str) -> Optional[float]:
         r"\bquantity\s*[:=]?\s*(\d+(?:\.\d+)?)\b",
         r"\bshares?\s*[:=]?\s*(\d+(?:\.\d+)?)\b",
         r"\b(\d+(?:\.\d+)?)\s*(?:shares?|qty)\b",
+        r"\b(?:BUY|SELL|SHORT|COVER)\s+(\d+(?:\.\d+)?)\s+[A-Z.]{1,12}\b",
+        r"\bBUY\s+TO\s+COVER\s+(\d+(?:\.\d+)?)\s+[A-Z.]{1,12}\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -415,14 +425,10 @@ def _is_conditional_setup(text: str) -> bool:
 
 
 
-def _extract_price_condition(text: str, action: str) -> tuple[str, Optional[float], str]:
+def _extract_price_condition(text: str, action: str) -> tuple[str, Optional[float]]:
     """Extract executable price instructions from equity signals."""
     raw = text or ""
     normalized = _normalized_text(raw)
-
-    limit_match = re.search(r"\bLIMIT\s*[:@]?\s*\$?\s*(\d+(?:\.\d+)?)\b", raw, flags=re.IGNORECASE)
-    if limit_match:
-        return "limit_price", float(limit_match.group(1)), "limit"
 
     patterns = [
         ("close_above", r"\b(?:PRICE\s+)?CLOSES?\s+ABOVE\s*\$?\s*(\d+(?:\.\d+)?)\b"),
@@ -435,13 +441,30 @@ def _extract_price_condition(text: str, action: str) -> tuple[str, Optional[floa
     for kind, pattern in patterns:
         match = re.search(pattern, raw, flags=re.IGNORECASE)
         if match:
-            return kind, float(match.group(1)), "market"
+            return kind, float(match.group(1))
 
-    at_match = re.search(r"\bAT\s*\$?\s*(\d+(?:\.\d+)?)\b", raw, flags=re.IGNORECASE)
-    if at_match and "MARKET" not in normalized:
-        return "limit_price", float(at_match.group(1)), "limit"
+    return "", None
 
-    return "", None, "market"
+
+def _extract_order_details(text: str) -> tuple[str, Optional[float], Optional[float], str]:
+    raw = text or ""
+    upper = _normalized_text(raw)
+    tif_match = re.search(r"\b(GTC|DAY|IOC|FOK)\b", upper)
+    tif = tif_match.group(1) if tif_match else "DAY"
+    stop_match = re.search(r"\bSTOP\s*[:@]?\s*\$?\s*(\d+(?:\.\d+)?)\b", raw, re.IGNORECASE)
+    limit_match = re.search(r"\bLIMIT\s*[:@]?\s*\$?\s*(\d+(?:\.\d+)?)\b", raw, re.IGNORECASE)
+    stop_price = float(stop_match.group(1)) if stop_match else None
+    limit_price = float(limit_match.group(1)) if limit_match else None
+    if stop_price is not None and limit_price is not None:
+        return "stop_limit", limit_price, stop_price, tif
+    if stop_price is not None:
+        return "stop", None, stop_price, tif
+    if limit_price is not None:
+        return "limit", limit_price, None, tif
+    at_match = re.search(r"(?:@|\bAT\b)\s*\$?\s*(\d+(?:\.\d+)?)\b", raw, re.IGNORECASE)
+    if at_match and "MARKET" not in upper:
+        return "limit", float(at_match.group(1)), None, tif
+    return "market", None, None, tif
 
 def _extract_symbol(text: str) -> str:
     normalized = _normalized_text(text)
@@ -463,6 +486,7 @@ def _extract_symbol(text: str) -> str:
         "WHILE", "UNLESS", "UNTIL", "YET", "WHEN", "THEN", "ELSE", "IT", "ITS",
         "LOOKS", "LOOK", "POSSIBLE", "MOMENTUM", "COULD", "REVERSE", "SOON",
         "NOT", "SURE", "MAY", "MIGHT", "MAYBE",
+        "COVER", "GTC", "DAY", "IOC", "FOK",
         "WE", "NEED", "OPTION", "OPTIONS", "STRIKE", "RATE", "EXPIRY", "EXPIRES",
         "EXPIRATION", "SAME", "DAY", "PREMIUM",
         "HIGH", "LOW", "VOLUME", "RSI", "MACD", "EMA", "SMA", "ATR", "CONFIDENCE",
@@ -475,6 +499,11 @@ def _extract_symbol(text: str) -> str:
         "FED", "FEDERAL", "RESERVE", "TREASURY", "YIELDS", "DOLLAR", "INDEX",
         "OIL", "AIRLINE", "AIRLINES", "GLOBAL", "MARKETS", "MARKET", "BREADTH",
         "R", "MIXED", "TECHNICAL", "TECHNICALS", "INDICATOR", "INDICATORS", "EARNINGS",
+        # Ordinary trading-signal syntax words that are also real tickers or
+        # company names (GO=Grocery Outlet, MY, OUT=Outfront Media, HALF,
+        # ENTIRE, THINK, PICK) -- without excluding them, casual phrasing like
+        # "close out amzn" or "go long on sofi" resolves to the wrong symbol.
+        "GO", "MY", "OUT", "HALF", "ENTIRE", "THINK", "PICK", "SOME", "ALL", "UP",
     }
     for token in tokens:
         token_key = re.sub(r"[^A-Za-z0-9.\-]", "", token or "").upper().replace("-", ".").strip(".")
@@ -533,22 +562,38 @@ def parse_signal(message: str) -> ParsedSignal:
         quantity = rich_intent.get("quantity")
         if quantity is None:
             quantity = rich_intent.get("initial_quantity", rich_intent.get("total_quantity"))
-        legacy_action = {
-            "SELL_SHORT": "SELL",
-            "BUY_TO_COVER": "BUY",
-            "SCALE_OUT": "SELL",
-            "LADDER_BUY": "BUY",
-            "MIXED_ENTRY": "BUY",
-        }.get(action, action)
+        condition_type, condition_price = _extract_price_condition(compact, action)
+        parsed_order_type = str(rich_intent.get("order_type") or "MARKET").lower()
+        parsed_limit_price = rich_intent.get("limit_price")
+        parsed_stop_price = rich_intent.get("stop_price")
+        # A close-confirmation condition is observed by the monitor. It is not an
+        # Alpaca stop order because the intraday price may cross before the close.
+        if condition_type in {"close_above", "close_below"}:
+            parsed_order_type = "market"
+            parsed_limit_price = None
+            parsed_stop_price = None
         return ParsedSignal(
             valid=bool(action and symbol),
-            action=legacy_action,
+            action=action,
             symbol=symbol,
             quantity=float(quantity) if quantity is not None else None,
             raw_text=raw,
             reason="Rich stock order parsed; every normalized field is attached as order_intent.",
-            order_type=str(rich_intent.get("order_type") or "MARKET").lower(),
+            condition_type=condition_type,
+            condition_price=condition_price,
+            order_type=parsed_order_type,
             order_intent=rich_intent,
+            limit_price=(
+                float(parsed_limit_price)
+                if parsed_limit_price is not None
+                else None
+            ),
+            stop_price=(
+                float(parsed_stop_price)
+                if parsed_stop_price is not None
+                else None
+            ),
+            time_in_force=str(rich_intent.get("time_in_force") or "DAY").upper(),
         )
 
     action = _infer_action(compact)
@@ -560,9 +605,10 @@ def parse_signal(message: str) -> ParsedSignal:
         return ParsedSignal(False, action=action, raw_text=raw, reason="No stock symbol found.")
 
     quantity = _extract_quantity(compact)
-    condition_type, condition_price, order_type = _extract_price_condition(compact, action)
+    condition_type, condition_price = _extract_price_condition(compact, action)
+    order_type, limit_price, stop_price, time_in_force = _extract_order_details(compact)
     reason = ""
-    if action in {"BUY", "SELL"} and condition_type and condition_price:
+    if action in {"BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"} and condition_type and condition_price:
         reason = (
             f"Price condition detected: {condition_type.replace('_', ' ')} "
             f"${condition_price:g}. The agent will watch this condition before paper trading."
@@ -578,4 +624,7 @@ def parse_signal(message: str) -> ParsedSignal:
         condition_type=condition_type,
         condition_price=condition_price,
         order_type=order_type,
+        limit_price=limit_price,
+        stop_price=stop_price,
+        time_in_force=time_in_force,
     )

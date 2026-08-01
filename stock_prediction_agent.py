@@ -456,9 +456,9 @@ def run_stock_prediction(spi: dict, price_history_context: List[dict]) -> dict:
     input_hash   = build_stock_prediction_hash(spi)
     price_basis  = str(spi.get("price_basis", "close") or "close")
 
-    # Get origin price
+    # Get origin price — respect price_basis setting (high/low/open/close)
     from historical_price_service import get_price_on_date
-    origin_price, eff_origin_date, price_err = get_price_on_date(history, origin_date)
+    origin_price, eff_origin_date, price_err = get_price_on_date(history, origin_date, price_basis=price_basis)
     if origin_price is None:
         return _error_result(
             spi,

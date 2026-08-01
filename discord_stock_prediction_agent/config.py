@@ -77,16 +77,19 @@ class AgentConfig:
     polygon_timeout_seconds: int = _int_env("POLYGON_TIMEOUT_SECONDS", 20)
 
     paper_trading_enabled: bool = _bool_env("PAPER_TRADING_ENABLED", True)
-    stop_loss_pct: float = _float_env("AGENT_STOP_LOSS_PCT", 0.5)
-    stop_monitor_seconds: int = _int_env("STOP_MONITOR_SECONDS", 60)
-    conditional_trigger_band_pct: float = _float_env("CONDITIONAL_TRIGGER_BAND_PCT", 5.0)
-    conditional_trigger_upper_band_pct: float = _float_env("CONDITIONAL_TRIGGER_UPPER_BAND_PCT", 10.0)
+    # Dedicated protection settings avoid inheriting the old 0.5% stop from
+    # AGENT_STOP_LOSS_PCT in existing deployments.
+    equity_stop_loss_pct: float = _float_env("EQUITY_STOP_LOSS_PCT", 1.0)
+    equity_take_profit_pct: float = _float_env("EQUITY_TAKE_PROFIT_PCT", 10.0)
+    option_stop_loss_pct: float = _float_env("OPTION_STOP_LOSS_PCT", 5.0)
+    option_take_profit_pct: float = _float_env("OPTION_TAKE_PROFIT_PCT", 10.0)
+    stop_loss_pct: float = equity_stop_loss_pct  # compatibility alias
+    stop_monitor_seconds: int = _int_env("PROTECTION_MONITOR_SECONDS", 15)
     max_equity_qty: float = _float_env("MAX_EQUITY_QTY", 1_000_000.0)
     max_option_qty: float = _float_env("MAX_OPTION_QTY", 1_000.0)
     max_daily_paper_trades: int = _int_env("MAX_DAILY_PAPER_TRADES", 20)
     allow_duplicate_paper_orders: bool = _bool_env("ALLOW_DUPLICATE_PAPER_ORDERS", True)
     per_symbol_cooldown_minutes: int = _int_env("PER_SYMBOL_COOLDOWN_MINUTES", 10)
-    duplicate_signal_ttl_minutes: int = _int_env("DUPLICATE_SIGNAL_TTL_MINUTES", 15)
     debug_output_enabled: bool = _bool_env("DEBUG_OUTPUT_ENABLED", False)
     signal_worker_concurrency: int = _int_env("SIGNAL_WORKER_CONCURRENCY", 4)
     signal_queue_limit: int = _int_env("SIGNAL_QUEUE_LIMIT", 20_000)
@@ -98,6 +101,40 @@ class AgentConfig:
     runtime_log_level: str = os.getenv("RUNTIME_LOG_LEVEL", "INFO").strip().upper()
     runtime_log_max_bytes: int = _int_env("RUNTIME_LOG_MAX_BYTES", 5_000_000)
     runtime_log_backup_count: int = _int_env("RUNTIME_LOG_BACKUP_COUNT", 5)
+
+    whatsapp_webhook_enabled: bool = _bool_env("WHATSAPP_WEBHOOK_ENABLED", False)
+    whatsapp_verify_token: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
+    whatsapp_access_token: str = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
+    whatsapp_phone_number_id: str = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+    whatsapp_app_secret: str = os.getenv("WHATSAPP_APP_SECRET", "").strip()
+    whatsapp_graph_api_version: str = os.getenv(
+        "WHATSAPP_GRAPH_API_VERSION", "v26.0"
+    ).strip()
+    whatsapp_host: str = os.getenv("WHATSAPP_HOST", "0.0.0.0").strip()
+    whatsapp_port: int = _int_env("WHATSAPP_PORT", 5000)
+    whatsapp_max_body_bytes: int = _int_env("WHATSAPP_MAX_BODY_BYTES", 1_000_000)
+    whatsapp_allowed_sender_ids: str = os.getenv(
+        "WHATSAPP_ALLOWED_SENDER_IDS", ""
+    ).strip()
+    whatsapp_allowed_group_ids: str = os.getenv(
+        "WHATSAPP_ALLOWED_GROUP_IDS", ""
+    ).strip()
+    # Separate, narrower allowlist for mode-changing/admin commands (!agent_on,
+    # !agent_off, !agent_retry_dead) over WhatsApp -- mirrors the Discord
+    # Administrator/Manage Server gate, since WhatsApp has no guild-permission
+    # concept. Being in whatsapp_allowed_sender_ids only grants signal access.
+    whatsapp_admin_sender_ids: str = os.getenv(
+        "WHATSAPP_ADMIN_SENDER_IDS", ""
+    ).strip()
+    # Where proactive/background alerts go (protection triggers, a queued
+    # order finally filling, a contract becoming tradable, ...). These fire
+    # from the periodic monitor loop, not in reply to an incoming message, so
+    # there's no message object to derive a WhatsApp destination from the way
+    # a normal reply does -- this is the WhatsApp equivalent of
+    # DISCORD_PAPER_LOG_CHANNEL_ID / AGENT_REVIEW_CHANNEL_ID. Phone number for
+    # an individual, or the group ID for the signals group.
+    whatsapp_alert_target: str = os.getenv("WHATSAPP_ALERT_TARGET", "").strip()
+    whatsapp_alert_is_group: bool = _bool_env("WHATSAPP_ALERT_IS_GROUP", True)
 
     default_horizon_days: int = _int_env("DEFAULT_PREDICTION_HORIZON_DAYS", 1)
     historical_context_days: int = _int_env("HISTORICAL_CONTEXT_DAYS", 365)
@@ -158,6 +195,15 @@ class AgentConfig:
     def uses_paper_alpaca_endpoint(self) -> bool:
         return "paper-api.alpaca.markets" in self.alpaca_base_url.lower()
 
+    @property
+    def has_whatsapp(self) -> bool:
+        return bool(
+            self.whatsapp_verify_token
+            and self.whatsapp_access_token
+            and self.whatsapp_phone_number_id
+            and self.whatsapp_app_secret
+        )
+
 
 config = AgentConfig()
 
@@ -182,7 +228,15 @@ def production_config_errors() -> list[str]:
     if config.signal_queue_limit < 100:
         errors.append("SIGNAL_QUEUE_LIMIT must be at least 100")
     if config.stop_monitor_seconds < 15:
-        errors.append("STOP_MONITOR_SECONDS must be at least 15")
+        errors.append("PROTECTION_MONITOR_SECONDS must be at least 15")
     if not 1 <= config.pending_order_batch_size <= 1_000:
         errors.append("PENDING_ORDER_BATCH_SIZE must be between 1 and 1000")
+    if config.whatsapp_webhook_enabled:
+        if not config.has_whatsapp:
+            errors.append(
+                "WhatsApp webhook is enabled but verify token, access token, "
+                "phone number ID, or app secret is missing"
+            )
+        if not 1 <= config.whatsapp_port <= 65535:
+            errors.append("WHATSAPP_PORT must be between 1 and 65535")
     return errors

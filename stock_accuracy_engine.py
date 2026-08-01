@@ -47,6 +47,8 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from jsonl_store import append_jsonl
+
 ROOT             = Path(__file__).resolve().parent
 STOCK_EVAL_FILE  = ROOT / "stock_prediction_evaluation_runs.jsonl"
 STOCK_INVALID_FILE = ROOT / "stock_prediction_evaluation_runs_invalid.jsonl"
@@ -176,16 +178,14 @@ def save_stock_prediction_record(
     record = _build_record(spi, ai_prediction, actual_validation)
     if is_valid_stock_record(record):
         try:
-            with open(STOCK_EVAL_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            append_jsonl(STOCK_EVAL_FILE, record)
             return True, "Record saved."
         except Exception as exc:
             return False, f"Save error: {exc}"
     else:
         # Write to invalid file for traceability
         try:
-            with open(STOCK_INVALID_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            append_jsonl(STOCK_INVALID_FILE, record)
         except Exception:
             pass
         return False, "Record failed validation — saved to invalid file."

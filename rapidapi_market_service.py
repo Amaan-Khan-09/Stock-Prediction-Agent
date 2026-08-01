@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -109,3 +109,68 @@ def run_rapidapi_instrument_check(symbol: str, exchange: str = "US") -> Dict[str
     hc = run_rapidapi_market_health_check(exchange=exchange)
     hc["symbol_checked"] = symbol
     return hc
+
+
+def fetch_top_movers_for_gemini() -> Dict[str, Any]:
+    """
+    Fetch top market movers for inclusion in Gemini prompt.
+
+    ONLY safe to call for LIVE predictions (origin_date within last 7 days).
+    Returns symbol names and volume/direction — no prices, so no leakage risk.
+    """
+    key_present = bool(_key())
+    if not key_present:
+        return {"status": "FAILED", "error": "RAPIDAPI_KEY not set", "context_text": ""}
+
+    mover_types = [
+        ("percent_change_gainers", "TOP % GAINERS"),
+        ("percent_change_losers",  "TOP % LOSERS"),
+        ("volume_gainers",         "HIGHEST VOLUME"),
+    ]
+
+    results: Dict[str, List[str]] = {}
+    any_success = False
+    for name, label in mover_types:
+        params = {"exchange": "US", "name": name, "locale": "en"}
+        try:
+            r = requests.get(
+                f"{_base()}{_MOVERS_PATH}",
+                headers=_headers(),
+                params=params,
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                syms = data.get("symbols", [])
+                # Extract top 10 symbol tickers only (no prices — leakage-safe)
+                top = [
+                    s.get("s", "").split(":")[-1].upper()
+                    for s in syms[:10]
+                    if isinstance(s, dict) and s.get("s")
+                ]
+                results[label] = top
+                any_success = True
+            else:
+                results[label] = []
+        except Exception:
+            results[label] = []
+
+    if not any_success:
+        return {"status": "FAILED", "error": "All mover requests failed", "context_text": ""}
+
+    lines = [
+        "LIVE MARKET CONTEXT (today's movers — symbol names + direction only, no prices, no leakage):",
+    ]
+    for label, syms in results.items():
+        if syms:
+            lines.append(f"  {label}: {', '.join(syms)}")
+    lines.append(
+        "Use this to assess if the symbol is in a high-momentum market regime. "
+        "If the symbol appears in GAINERS or LOSERS, weight momentum signals accordingly."
+    )
+
+    return {
+        "status":       "SUCCESS",
+        "context_text": "\n".join(lines),
+        "data":         results,
+    }

@@ -257,8 +257,9 @@ def _risk_score_from_history(history: List[Dict[str, Any]], cutoff_ts: int) -> D
 
 
 def _write_jsonl(path: str, obj: Dict[str, Any]) -> None:
-    with open(path, "a", encoding="utf-8") as f_out:
-        f_out.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    from jsonl_store import append_jsonl
+
+    append_jsonl(path, obj)
 
 
 def _signal_from_score(score: int) -> str:

@@ -67,6 +67,20 @@ def initialize_signal_queue() -> None:
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(signal_queue)").fetchall()
+            }
+            migrations = {
+                "transport": "TEXT NOT NULL DEFAULT 'discord'",
+                "reply_target": "TEXT NOT NULL DEFAULT ''",
+                "is_group": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in migrations.items():
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE signal_queue ADD COLUMN {name} {definition}"
+                    )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_signal_queue_ready
@@ -82,10 +96,27 @@ def enqueue_signal(
     channel_id: str,
     message_id: str,
     limit: int = 20_000,
+    transport: str = "discord",
+    reply_target: str = "",
+    is_group: bool = False,
 ) -> Dict[str, Any]:
     initialize_signal_queue()
     now = time.time()
-    stable_source = f"{channel_id}:{message_id}" if message_id else f"{channel_id}:{user_id}:{now}:{raw_text}"
+    transport_name = str(transport or "discord").strip().lower()
+    if transport_name == "discord":
+        # Preserve pre-transport IDs so a Discord redelivery cannot duplicate an
+        # item that was queued before this migration.
+        stable_source = (
+            f"{channel_id}:{message_id}"
+            if message_id
+            else f"{channel_id}:{user_id}:{now}:{raw_text}"
+        )
+    else:
+        stable_source = (
+            f"{transport_name}:{channel_id}:{message_id}"
+            if message_id
+            else f"{transport_name}:{channel_id}:{user_id}:{now}:{raw_text}"
+        )
     signal_id = hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:24]
     with _connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -115,8 +146,9 @@ def enqueue_signal(
             """
             INSERT INTO signal_queue (
                 id, raw_text, user_id, channel_id, message_id,
-                status, attempts, available_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?)
+                status, attempts, available_at, created_at,
+                transport, reply_target, is_group
+            ) VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)
             """,
             (
                 signal_id,
@@ -126,6 +158,9 @@ def enqueue_signal(
                 str(message_id or ""),
                 now,
                 now,
+                transport_name,
+                str(reply_target or ""),
+                1 if is_group else 0,
             ),
         )
         connection.execute("COMMIT")
@@ -135,6 +170,9 @@ def enqueue_signal(
         "user_id": str(user_id or ""),
         "channel_id": str(channel_id or ""),
         "message_id": str(message_id or ""),
+        "transport": transport_name,
+        "reply_target": str(reply_target or ""),
+        "is_group": bool(is_group),
         "created_at": _utcstamp(now),
         "accepted": True,
         "status": "queued",
@@ -272,3 +310,50 @@ def queue_depth() -> int:
 
 def dead_letter_count() -> int:
     return queue_stats()["dead"]
+
+
+def list_dead_signals(limit: int = 25) -> list[Dict[str, Any]]:
+    initialize_signal_queue()
+    with _connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, raw_text, transport, reply_target, attempts, created_at, last_error
+            FROM signal_queue
+            WHERE status = 'dead'
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (max(1, min(250, int(limit))),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def retry_dead_signals(limit: int = 100) -> int:
+    """Return a bounded number of dead letters to the queue for operator recovery."""
+    initialize_signal_queue()
+    now = time.time()
+    with _connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            """
+            SELECT id FROM signal_queue
+            WHERE status = 'dead'
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (max(1, min(1_000, int(limit))),),
+        ).fetchall()
+        identifiers = [str(row["id"]) for row in rows]
+        if identifiers:
+            placeholders = ",".join("?" for _ in identifiers)
+            connection.execute(
+                f"""
+                UPDATE signal_queue
+                SET status = 'queued', attempts = 0, available_at = ?,
+                    claimed_at = NULL, last_error = ''
+                WHERE id IN ({placeholders})
+                """,
+                (now, *identifiers),
+            )
+        connection.execute("COMMIT")
+    return len(identifiers)

@@ -8,6 +8,8 @@ Run from project root:
 """
 from __future__ import annotations
 
+import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -372,13 +374,15 @@ def test_empty_multi_leg_backtest_uses_structural_paper_gate() -> None:
                     "BTO TSLA 290P / STO TSLA 270P 09/19 @5.10 Debit Qty 1",
                     "BUY SPY 640C + 640P 09/19 @8.20 Debit Qty 2",
                     "BUY QQQ 600C + 570P 10/17 @7.10 Debit Qty 4",
+                    "STO SPY 620P / BTO SPY 610P / STO SPY 670C / BTO SPY 680C 09/19 @2.15 Credit Qty 10",
                 )
             ]
         finally:
             bridge.run_options_backtest = original
             bridge.CACHE_PATH = original_cache
 
-    _assert(len(calls) == 8, "full and recent exact-strike attempts were made for all four strategies")
+    _assert(len(calls) == 10, "full and recent exact-strike attempts were made for all five strategies")
+    _assert({call["num_legs"] for call in calls} == {2, 4}, "Tastytrade receives the real leg count")
     _assert(
         all(result["status"] == "MULTI_LEG_STRUCTURAL_APPROVED" for result in results),
         "all clean screenshot-style strategies use explicit structural approval status",
@@ -428,6 +432,49 @@ def test_valid_negative_multi_leg_backtest_is_not_overridden() -> None:
     _assert(result["decision"] == "SELL", "negative historical result remains SELL", str(result))
 
 
+def test_concurrent_cache_writes_preserve_every_result() -> None:
+    print("\nTest: concurrent option validations preserve every cache entry")
+    original_cache = bridge.CACHE_PATH
+    with TemporaryDirectory() as tmp:
+        bridge.CACHE_PATH = Path(tmp) / "cache.json"
+        try:
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                list(
+                    pool.map(
+                        lambda index: bridge._store_cache_entry(
+                            f"key-{index}", {"status": "SUCCESS", "index": index}
+                        ),
+                        range(100),
+                    )
+                )
+            loaded = json.loads(bridge.CACHE_PATH.read_text(encoding="utf-8"))
+        finally:
+            bridge.CACHE_PATH = original_cache
+    _assert(len(loaded) == 100, "all concurrent cache writes survived", str(len(loaded)))
+
+
+def test_expired_cache_entries_are_pruned_on_write() -> None:
+    print("\nTest: expired options-validation cache entries are pruned, not kept forever")
+    original_cache = bridge.CACHE_PATH
+    original_ttl = bridge.config.option_validation_cache_ttl_hours
+    with TemporaryDirectory() as tmp:
+        bridge.CACHE_PATH = Path(tmp) / "cache.json"
+        object.__setattr__(bridge.config, "option_validation_cache_ttl_hours", 1)
+        try:
+            stale_cache = {
+                "stale-key": {"created_at": 0.0, "result": {"status": "SUCCESS"}},
+            }
+            bridge.CACHE_PATH.write_text(json.dumps(stale_cache), encoding="utf-8")
+            bridge._store_cache_entry("fresh-key", {"status": "SUCCESS"})
+            loaded = json.loads(bridge.CACHE_PATH.read_text(encoding="utf-8"))
+        finally:
+            bridge.CACHE_PATH = original_cache
+            object.__setattr__(bridge.config, "option_validation_cache_ttl_hours", original_ttl)
+    _assert("stale-key" not in loaded, "expired entry was pruned")
+    _assert("fresh-key" in loaded, "newly written entry survives pruning")
+    _assert(len(loaded) == 1, "cache does not grow unbounded across TTL-expired entries", str(len(loaded)))
+
+
 def run_all() -> None:
     print("=" * 60)
     print("OPTIONS STRATEGY BRIDGE TEST HARNESS")
@@ -444,6 +491,8 @@ def run_all() -> None:
     test_multi_leg_payload_preserves_complete_strategy()
     test_empty_multi_leg_backtest_uses_structural_paper_gate()
     test_valid_negative_multi_leg_backtest_is_not_overridden()
+    test_concurrent_cache_writes_preserve_every_result()
+    test_expired_cache_entries_are_pruned_on_write()
 
     print("\n" + "=" * 60)
     print(f"Results: {PASS} passed, {FAIL} failed")

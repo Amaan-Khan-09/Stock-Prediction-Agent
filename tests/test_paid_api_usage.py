@@ -269,8 +269,8 @@ def test_options_backtest_failed_must_block_accuracy_save():
     """When options backtest fails, accuracy record must NOT be saved."""
     text = _read(ROOT / "stock_prediction_app.py")
     # The save logic must be conditional on backtest succeeding
-    assert "_backtest_succeeded" in text
-    assert "not saved" in text.lower() or "not_saved" in text.lower() or "accuracy record not saved" in text
+    assert "_backtest_succeeded" in text or "_backtest_truly_succeeded" in text
+    assert "not saved" in text.lower() or "not_saved" in text.lower() or "accuracy record not saved" in text or "NOT SAVED" in text
 
 
 def test_options_backtest_failed_shows_backtest_failed_agreement():
@@ -295,12 +295,12 @@ def test_underlying_stock_reference_section_exists():
 
 
 def test_options_save_conditional_on_backtest_success():
-    """save_stock_prediction_record must only be called when _backtest_succeeded is True."""
+    """save_stock_prediction_record must only be called when backtest truly succeeded."""
     text = _read(ROOT / "stock_prediction_app.py")
     # The save call must be inside a backtest-success conditional
-    assert "_backtest_succeeded" in text
+    assert "_backtest_succeeded" in text or "_backtest_truly_succeeded" in text
     # There must be a branch that blocks save when not backtest succeeded
-    assert "accuracy record not saved" in text or "NOT saved" in text or "not saved" in text.lower()
+    assert "accuracy record not saved" in text or "NOT saved" in text or "not saved" in text.lower() or "NOT SAVED" in text
 
 
 def test_backtest_stats_extracted_from_results_subkey():

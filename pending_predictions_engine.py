@@ -14,6 +14,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from jsonl_store import append_jsonl
+
 ROOT = Path(__file__).resolve().parent
 _PENDING_FILE = ROOT / "pending_future_predictions.jsonl"
 
@@ -51,8 +53,7 @@ def save_pending_prediction(spi: dict, ai_result: dict) -> Tuple[bool, str]:
             "validation_input_hash":         ai_result.get("stock_prediction_input_hash", ""),
             "features_used":                 ai_result.get("features_used", {}),
         }
-        with open(_PENDING_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        append_jsonl(_PENDING_FILE, record)
         return True, "Pending prediction saved."
     except Exception as exc:
         return False, f"Failed to save pending prediction: {exc}"

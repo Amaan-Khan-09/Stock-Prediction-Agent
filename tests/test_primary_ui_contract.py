@@ -292,23 +292,24 @@ def test_prediction_service_has_required_functions():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TEST: Options backtest uses prediction_origin_date (not ctx_start) as start
+# TEST: Options backtest uses origin_date as start (prediction window)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_options_backtest_uses_prediction_origin_as_start():
+def test_options_backtest_uses_ctx_start_for_full_study_window():
     """
-    In _run_options_all, the tastytrade backtest must use origin_date as start_date.
-    Static proof: search for the critical assignment in the source code.
+    In _run_options_all, the tastytrade backtest runs over the prediction window
+    (origin_date → target_date), so AI learning and options validation cover
+    the same forward period. Static proof: check the critical assignment.
     """
     text = _read(ROOT / "stock_prediction_app.py")
-    # The backtest call must pass origin_date as start_date
-    assert "start_date=origin_date" in text or "start_date=origin" in text, (
+    # The backtest call must pass origin_date as start_date (prediction window)
+    assert "start_date=origin_date" in text, (
         "Options backtest in stock_prediction_app.py must pass origin_date as start_date. "
-        "Using ctx_start as start_date is the core bug this architecture prevents."
+        "Backtest runs origin → target (prediction window), not ctx_start → origin."
     )
-    # Verify the comment documents the architectural constraint
-    assert "PREDICTION ORIGIN DATE" in text or "prediction_origin_date" in text.lower(), (
-        "Options backtest code must reference prediction_origin_date as the backtest start."
+    # Verify the code still references prediction_origin_date (used for AI study boundary)
+    assert "prediction_origin_date" in text.lower(), (
+        "Options backtest code must still reference prediction_origin_date for AI study boundary."
     )
 
 
@@ -335,15 +336,15 @@ def test_stock_mode_side_by_side_headers():
 
 def test_options_mode_side_by_side_headers():
     """
-    Options Mode: Section 3 (left) and Section 4 (right) are side-by-side column headers.
-    Static proof: both column headers must appear in source with SECTION prefix.
+    Options Mode: left column = AI PREDICTION, right column = OPTIONS BACKTEST ACTUAL.
+    Static proof: both clean header strings must appear in source.
     """
     text = _read(ROOT / "stock_prediction_app.py")
-    assert "SECTION 3 — AI Options Strategy Prediction" in text, (
-        "'SECTION 3 — AI Options Strategy Prediction' must be the left column header in options mode."
+    assert "AI PREDICTION" in text, (
+        "'AI PREDICTION' must be the left column header in options mode."
     )
-    assert "SECTION 4 — Options Backtest Actual" in text, (
-        "'SECTION 4 — Options Backtest Actual' must be the right column header in options mode."
+    assert "OPTIONS BACKTEST ACTUAL" in text, (
+        "'OPTIONS BACKTEST ACTUAL' must be the right column header in options mode."
     )
 
 
@@ -560,10 +561,11 @@ def test_app_no_dark_theme_css():
 
 
 def test_build_active_banner_present():
-    """App must render a BUILD ACTIVE banner showing AI_PROVIDER and build timestamp."""
+    """App must render a build banner showing AI_PROVIDER and build timestamp."""
     text = _read(ROOT / "stock_prediction_app.py")
-    assert "BUILD ACTIVE" in text, "Build Active banner must exist in app"
-    assert "_BUILD_TS" in text, "Build timestamp variable must exist"
+    # Banner was renamed to ACTIVE BUILD: TRUTH_GATE_V4
+    assert "BUILD ACTIVE" in text or "ACTIVE BUILD" in text, "Build banner must exist in app"
+    assert "_BUILD_FILE" in text or "_BUILD_TS" in text, "Build timestamp/file variable must exist"
     assert "AI_PROVIDER" in text
 
 

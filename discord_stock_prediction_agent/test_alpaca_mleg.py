@@ -62,7 +62,15 @@ def run_all() -> None:
     assert payload["qty"] == "2"
     assert payload["limit_price"] == "-2.3"
     assert payload["legs"][1]["ratio_qty"] == "2"
-    print("ALPACA MULTI-LEG PAYLOAD TESTS PASSED: debit and credit/ratio payloads")
+
+    rejected, error = client.submit_multi_leg_option_order(
+        [{**legs[0], "ratio_qty": "2"}, {**legs[1], "ratio_qty": "2"}],
+        1,
+        "limit",
+        4.60,
+    )
+    assert not rejected and "simplest form" in error
+    print("ALPACA MULTI-LEG PAYLOAD TESTS PASSED: debit, credit/ratio, and GCD safeguards")
 
 
 if __name__ == "__main__":

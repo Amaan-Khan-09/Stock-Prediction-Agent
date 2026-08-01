@@ -230,6 +230,20 @@ def compare_ai_vs_actual(
         (abs(ai_pred_ret) <= _BUY_THRESHOLD and abs(actual_ret) <= _BUY_THRESHOLD)
     )
 
+    # ── Quality classification ────────────────────────────────────────────────
+    if not decision_match:
+        quality_classification = "DECISION_MISMATCH"
+    elif absolute_return_error <= 10.0:
+        quality_classification = "CLEAN_MATCH"
+    elif absolute_return_error <= 15.0:
+        quality_classification = "DIRECTION_MATCH_MINOR_ERROR"
+    elif absolute_return_error <= 30.0:
+        quality_classification = "LOW_QUALITY_MATCH"
+    elif absolute_return_error <= 75.0:
+        quality_classification = "MAGNITUDE_FAILURE"
+    else:
+        quality_classification = "SEVERE_MAGNITUDE_FAILURE"
+
     agreement = "MATCH" if decision_match else "CONFLICT"
     # REVIEW on conflict: do not blindly use actual_dec — signal unreliable when engines disagree
     if agreement == "MATCH":
@@ -268,17 +282,20 @@ def compare_ai_vs_actual(
         "abs_price_error":         round(abs(target_price_error), 4),
         "abs_return_error_pct":    round(absolute_return_error, 4),
         "abs_capital_error":       round(absolute_capital_error, 4),
+        # Quality classification — never treat huge return error as clean success
+        "quality_classification":  quality_classification,
     }
 
 
 def _fail_cmp(reason: str) -> dict:
     return {
-        "status":          "FAILED",
-        "agreement":       "UNVERIFIED",
-        "final_decision":  "REVIEW",
-        "decision_match":  False,
-        "directional_match": False,
-        "error":           reason,
+        "status":                "FAILED",
+        "agreement":             "UNVERIFIED",
+        "final_decision":        "REVIEW",
+        "decision_match":        False,
+        "directional_match":     False,
+        "quality_classification": "UNVERIFIED",
+        "error":                 reason,
     }
 
 

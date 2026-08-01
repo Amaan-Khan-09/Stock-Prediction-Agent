@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from copy import deepcopy
@@ -12,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .config import config
+from .multi_leg_validation import validate_multi_leg_strategy
 from .options_parser import ParsedOptionSignal
 from .polygon_options_data import validate_exact_strike_with_polygon
 from .options_symbol import resolve_underlying_for_prediction
@@ -21,7 +25,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(1, str(PROJECT_ROOT / "tools"))
 CACHE_PATH = Path(__file__).resolve().parent / "options_validation_cache.json"
-_TASTYTRADE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="option-validation")
+_CACHE_LOCK = threading.RLock()
+_TASTYTRADE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(4, min(16, config.signal_worker_concurrency * 2)),
+    thread_name_prefix="option-validation",
+)
 
 try:
     from src.services.tastytrade_backtester_service import run_options_backtest
@@ -186,20 +194,66 @@ def _is_rate_limited_result(result: Dict[str, Any]) -> bool:
     return "429" in message or "rate limit" in message or "too many requests" in message
 
 
-def _read_cache() -> Dict[str, Any]:
+def _read_cache_unlocked() -> Dict[str, Any]:
     try:
         if CACHE_PATH.exists():
-            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+            loaded = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+            raise ValueError("cache root must be a JSON object")
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Ignoring unreadable options-validation cache %s: %s",
+            CACHE_PATH,
+            exc,
+        )
     return {}
 
 
+def _read_cache() -> Dict[str, Any]:
+    with _CACHE_LOCK:
+        return _read_cache_unlocked()
+
+
 def _write_cache(cache: Dict[str, Any]) -> None:
-    try:
-        CACHE_PATH.write_text(json.dumps(cache, indent=2, default=str), encoding="utf-8")
-    except Exception:
-        pass
+    payload = json.dumps(cache, indent=2, default=str)
+    with _CACHE_LOCK:
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = CACHE_PATH.with_name(
+            f"{CACHE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, CACHE_PATH)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _prune_expired_entries(cache: Dict[str, Any]) -> Dict[str, Any]:
+    ttl_seconds = max(1, config.option_validation_cache_ttl_hours) * 3600
+    now = time.time()
+    return {
+        key: entry
+        for key, entry in cache.items()
+        if now - float((entry or {}).get("created_at", 0)) <= ttl_seconds
+    }
+
+
+def _store_cache_entry(key: str, result: Dict[str, Any]) -> None:
+    """Merge one result atomically so concurrent validations cannot lose entries.
+
+    Expired entries are dropped on every write -- the cache key embeds a
+    rolling backtest date window, so without pruning it grows without bound
+    (one stale entry per symbol/strategy/day forever) instead of staying
+    bounded to roughly what's actually still within the TTL.
+    """
+    with _CACHE_LOCK:
+        cache = _prune_expired_entries(_read_cache_unlocked())
+        cache[key] = {"created_at": time.time(), "result": result}
+        _write_cache(cache)
 
 
 def _cache_key(strategy_input: Dict[str, Any]) -> str:
@@ -224,8 +278,7 @@ def _cache_key(strategy_input: Dict[str, Any]) -> str:
 def _run_cached_tastytrade_strategy(strategy_input: Dict[str, Any]) -> Dict[str, Any]:
     key = _cache_key(strategy_input)
     ttl_seconds = max(1, config.option_validation_cache_ttl_hours) * 3600
-    cache = _read_cache()
-    cached = cache.get(key) or {}
+    cached = (_read_cache().get(key) or {})
     if cached and time.time() - float(cached.get("created_at", 0)) <= ttl_seconds:
         result = deepcopy(cached.get("result") or {})
         result["cache_hit"] = True
@@ -233,8 +286,12 @@ def _run_cached_tastytrade_strategy(strategy_input: Dict[str, Any]) -> Dict[str,
 
     result = _run_tastytrade_strategy_bounded(strategy_input)
     if not _is_rate_limited_result(result):
-        cache[key] = {"created_at": time.time(), "result": result}
-        _write_cache(cache)
+        try:
+            _store_cache_entry(key, result)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Could not persist options-validation cache entry; validation result remains usable."
+            )
     result["cache_hit"] = False
     return result
 
@@ -376,38 +433,9 @@ def _multi_leg_fallback_gate(
     option: ParsedOptionSignal, strategy_input: Dict[str, Any], reason: str
 ) -> Dict[str, Any]:
     """Validate a complete multi-leg paper setup when historical trials are empty."""
-    legs = list(option.legs or [])
-    issues: list[str] = []
-    if not 2 <= len(legs) <= 4:
-        issues.append("Alpaca multi-leg orders require 2 to 4 option legs")
-    roots = {str(leg.root or "").upper() for leg in legs}
-    if not roots or "" in roots or len(roots) != 1:
-        issues.append("all option legs must use the same underlying")
-    if any(float(leg.strike or 0) <= 0 for leg in legs):
-        issues.append("every leg requires a valid strike")
-    if any(str(leg.side or "").upper() not in {"CALL", "PUT"} for leg in legs):
-        issues.append("every leg requires CALL or PUT")
-    if any(int(leg.ratio_qty or 0) <= 0 for leg in legs):
-        issues.append("every leg requires a positive ratio")
-    if any(
-        not leg.expiry_date
-        and _as_int((strategy_input.get("custom_legs") or [{}])[index].get("daysUntilExpiration"), 0) <= 0
-        for index, leg in enumerate(legs)
-    ):
-        issues.append("every leg requires an expiry or valid DTE")
-
-    actions = {str(leg.order_action or "").lower() for leg in legs}
-    open_actions = {"open_long", "open_short"}
-    close_actions = {"close_long", "close_short"}
-    if actions and actions <= open_actions:
-        decision = "BUY"
-    elif actions and actions <= close_actions:
-        decision = "SELL"
-    elif option.structure == "roll" and actions & open_actions and actions & close_actions:
-        decision = "SELL" if option.price_effect == "credit" else "BUY"
-    else:
-        decision = "REVIEW"
-        issues.append("leg actions do not form a supported atomic entry, exit, or roll")
+    assessment = validate_multi_leg_strategy(option)
+    issues = list(assessment.get("issues") or [])
+    decision = str(assessment.get("decision") or "REVIEW")
 
     if issues:
         return {
@@ -443,10 +471,12 @@ def _multi_leg_fallback_gate(
         ),
         "fallback_reason": reason,
         "fallback_approval": "complete_multi_leg_structure",
+        "structural_validation": assessment,
     }
 
 
 def _run_tastytrade_strategy(strategy_input: Dict[str, Any]) -> Dict[str, Any]:
+    custom_legs = list(strategy_input.get("custom_legs") or [])
     return run_options_backtest(
         symbol=strategy_input["symbol"],
         start_date=strategy_input["options_backtest_start_date"],
@@ -454,8 +484,8 @@ def _run_tastytrade_strategy(strategy_input: Dict[str, Any]) -> Dict[str, Any]:
         dte=strategy_input["dte"],
         delta=strategy_input["delta"],
         quantity=strategy_input["quantity"],
-        num_legs=1,
-        custom_legs=strategy_input["custom_legs"],
+        num_legs=max(1, int(strategy_input.get("legs") or len(custom_legs) or 1)),
+        custom_legs=custom_legs,
     )
 
 
@@ -624,6 +654,17 @@ def _delta_proxy_primary_strategy_input(strategy_input: Dict[str, Any]) -> Dict[
 def run_options_strategy_validation(option: ParsedOptionSignal) -> Dict[str, Any]:
     """Run project options validation/backtest and return a decision-ready result."""
     strategy_input = build_options_strategy_input(option)
+    if option.is_multi_leg:
+        structural = validate_multi_leg_strategy(option)
+        if not structural["passed"]:
+            return {
+                "status": "MULTI_LEG_FALLBACK_REVIEW",
+                "decision": "REVIEW",
+                "strategy_input": strategy_input,
+                "backtest": {"profit_loss": "-", "win_rate": "-"},
+                "structural_validation": structural,
+                "error": "Multi-leg preflight blocked the strategy: " + "; ".join(structural["issues"]),
+            }
     polygon_validation: Dict[str, Any] | None = None
     if (
         strategy_input.get("strike_selection") == "strike"

@@ -57,6 +57,64 @@ REPRESENTATIVE_CASES = [
         "SELL 25 QQQ MARKET ON CLOSE",
         {"asset_type": "STOCK", "action": "SELL", "symbol": "QQQ", "quantity": 25, "order_type": "MARKET_ON_CLOSE", "execution_session": "MARKET_CLOSE", "status": "VALID"},
     ),
+    (
+        # The natural phrasing for opening a short -- "SELL SHORT X" -- must
+        # not be read as a plain SELL. It previously was, because the parser
+        # only recognized "SHORT" as literally the first word of the message.
+        "SELL SHORT TSLA QTY 10",
+        {"asset_type": "STOCK", "action": "SELL_SHORT", "symbol": "TSLA", "quantity": 10, "order_type": "MARKET", "status": "VALID"},
+    ),
+    (
+        "SHORT SELL TSLA QTY 10",
+        {"asset_type": "STOCK", "action": "SELL_SHORT", "symbol": "TSLA", "quantity": 10, "order_type": "MARKET", "status": "VALID"},
+    ),
+    (
+        "GO SHORT AMD QTY 20",
+        {"asset_type": "STOCK", "action": "SELL_SHORT", "symbol": "AMD", "quantity": 20, "order_type": "MARKET", "status": "VALID"},
+    ),
+    (
+        # Regression: the action phrase itself ("ENTER"/"GO") used to win the
+        # ticker slot for any symbol outside the small known-symbol allowlist,
+        # silently building an order for the wrong company. RIVN isn't in the
+        # allowlist, so this previously resolved to symbol "ENTER"/"GO".
+        "ENTER LONG RIVN 100 SHARES MARKET",
+        {"asset_type": "STOCK", "action": "BUY", "symbol": "RIVN", "quantity": 100, "order_type": "MARKET", "status": "VALID"},
+    ),
+    (
+        "GO SHORT RIVN 100 SHARES MARKET",
+        {"asset_type": "STOCK", "action": "SELL_SHORT", "symbol": "RIVN", "quantity": 100, "order_type": "MARKET", "status": "VALID"},
+    ),
+    (
+        # "GO" is itself a real ticker (Grocery Outlet) -- confirm it still
+        # resolves correctly when it isn't part of a "GO SHORT" action phrase.
+        "BUY GO 10 SHARES MARKET",
+        {"asset_type": "STOCK", "action": "BUY", "symbol": "GO", "quantity": 10, "order_type": "MARKET", "status": "VALID"},
+    ),
+    (
+        # Any of the ~14k actively tradable symbols the live Alpaca directory
+        # knows about must resolve correctly, not just the ~30 hardcoded names.
+        "SELL LULU 5 SHARES MARKET",
+        {"asset_type": "STOCK", "action": "SELL", "symbol": "LULU", "quantity": 5, "order_type": "MARKET", "status": "VALID"},
+    ),
+    (
+        # A company name must resolve to its actual ticker, not be returned
+        # as the literal (non-tradable) name text.
+        "Buy 10 shares of Apple",
+        {"asset_type": "STOCK", "action": "BUY", "symbol": "AAPL", "quantity": 10, "order_type": "MARKET", "status": "VALID"},
+    ),
+    (
+        "BUY COIN QTY 3",
+        {"asset_type": "STOCK", "action": "BUY", "symbol": "COIN", "quantity": 3, "order_type": "MARKET", "status": "VALID"},
+    ),
+    (
+        # Regression: several blocklisted syntax words (ALL, NOW, ON, OPEN, ...)
+        # are themselves real tickers in the Alpaca directory. "ALL" here means
+        # ordinary English ("sell everything"), not the Allstate ticker -- the
+        # blocklist must still win over an incidental symbol-directory hit so
+        # the real target (RIVN) is found instead.
+        "SELL ALL MY SHARES OF RIVN",
+        {"asset_type": "STOCK", "action": "SELL", "symbol": "RIVN", "order_type": "MARKET", "status": "VALID"},
+    ),
 ]
 
 

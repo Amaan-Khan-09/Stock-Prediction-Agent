@@ -7,7 +7,8 @@ to look up / submit).
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Optional
+from math import gcd
+from typing import List, Optional, Sequence, Tuple
 
 
 # Cash-settled index roots have no OCC-cleared option contract of their own
@@ -137,3 +138,27 @@ def listed_expiry_fallbacks(expiry_date: str) -> list[str]:
             result.append(text)
             seen.add(text)
     return result
+
+
+def reduce_ratios_by_gcd(ratios: Sequence[int]) -> Tuple[List[int], int]:
+    """Reduce a list of multi-leg ratios to lowest terms via their GCD.
+
+    Shared by options_parser.py and multi_leg_contract.py, which each parse
+    legs into different intermediate shapes (dataclasses vs. dicts) but were
+    previously re-implementing this exact same reduction independently.
+
+    Returns (reduced_ratios, common_gcd). common_gcd is 1 (ratios unchanged,
+    clamped to >= 1) when there is no shared factor greater than 1 -- including
+    the single-ratio case, where the "common factor" is the ratio itself, so a
+    lone leg with ratio 3 reduces to ratio 1 with common_gcd 3 (i.e. that ratio
+    is folded into quantity by the caller instead of staying a per-leg multiplier).
+    """
+    clean = [max(1, int(r)) for r in ratios]
+    if not clean:
+        return clean, 1
+    common = clean[0]
+    for r in clean[1:]:
+        common = gcd(common, r)
+    if common <= 1:
+        return clean, 1
+    return [r // common for r in clean], common

@@ -230,13 +230,35 @@ _RUN_KEYS = (
     "opts_result", "opts_params", "backtest_payload",
     "saved", "save_msg", "input_hash", "run_id", "run_ts",
     "error_msg", "active_mode", "run_type",
-    "rapidapi_health", "tastytrade_health",
+    "rapidapi_health", "tastytrade_health", "run_context",
 )
 
 
 def _clear_run():
     for k in _RUN_KEYS:
         st.session_state.pop(k, None)
+
+
+def _log_invalid_run(
+    run_id: str, input_hash: str, symbol: str, mode: str,
+    failure_reason: str, provider_error: str,
+) -> None:
+    """Append a failed/blocked run to the quarantine log — never the accuracy log."""
+    import datetime as _dt
+    from jsonl_store import append_jsonl
+    log_path = Path(__file__).parent / "data" / "invalid_runs.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "run_id": run_id,
+        "input_hash": input_hash,
+        "symbol": symbol,
+        "mode": mode,
+        "failure_reason": failure_reason,
+        "provider_error": provider_error[:500] if provider_error else None,
+        "timestamp_utc": _dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "accuracy_saved": False,
+    }
+    append_jsonl(log_path, entry)
 
 
 _BUILD_TS = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -298,16 +320,6 @@ def _sign_fmt(v, fmt=",.2f", suffix=""):
         return str(v)
 
 
-def _win_rate_fmt(v):
-    if v is None:
-        return "---"
-    try:
-        rate = float(v or 0)
-        return f"{rate * 100:.1f}%" if rate <= 1 else f"{rate:.1f}%"
-    except Exception:
-        return str(v)
-
-
 def _decision_badge(d: str) -> str:
     c = {"BUY": "#00875A", "SELL": "#DF1B41", "HOLD": "#D97706"}.get(
         str(d).upper(), "#6B7280"
@@ -328,6 +340,71 @@ def _err_card(m):  _card(m, "#991B1B", "#FEF2F2", "#DC2626")
 def _info_card(m): _card(m)
 def _warn_card(m): _card(m, "#78350F", "#FFFBEB", "#F59E0B")
 def _ok_card(m):   _card(m, "#065F46", "#D1FAE5", "#059669")
+
+
+def _render_failure_panel():
+    """Professional run-blocked panel — replaces simple error card.
+    Shows all provider/run context so user knows exactly what failed and why.
+    No old results shown alongside this panel.
+    """
+    error_msg = st.session_state.get("error_msg", "Unknown error")
+    ctx       = st.session_state.get("run_context", {})
+    run_id    = ctx.get("run_id") or st.session_state.get("run_id", "---")
+    ih        = ctx.get("input_hash") or st.session_state.get("input_hash", "---")
+    symbol    = ctx.get("symbol", "---")
+    mode      = ctx.get("mode", "---")
+    ps        = ctx.get("provider_status", {})
+    errs      = ctx.get("errors", [])
+    ts        = ctx.get("timestamp_utc") or st.session_state.get("run_ts", "---")
+
+    st.markdown(
+        '<div style="background:#7F1D1D;padding:.6rem 1.2rem;border-radius:6px;'
+        'margin:1rem 0 .3rem 0">'
+        '<span style="color:#FEF2F2;font-weight:900;font-size:.95rem">'
+        'RUN BLOCKED — DATA / PROVIDER NOT AVAILABLE — OLD OUTPUT CLEARED'
+        '</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(
+            _table([
+                ("Run ID",          run_id),
+                ("Input Hash",      f'<code>{ih[:16]}…</code>' if len(str(ih)) > 16 else f'<code>{ih}</code>'),
+                ("Symbol",          symbol),
+                ("Mode",            mode),
+                ("Timestamp UTC",   ts),
+                ("Accuracy Saved",  '<b style="color:#DC2626">NO</b>'),
+            ]),
+            unsafe_allow_html=True,
+        )
+    with c2:
+        prov_rows = []
+        for k, v in ps.items():
+            color = "#DC2626" if v in ("FAILED", "NOT_AVAILABLE_ON_PLAN", "FAILED_DNS", "NOT_CONFIGURED", "AUTH_FAILED") \
+                   else "#D97706" if v in ("PENDING", "NOT_RUN", "SKIPPED") \
+                   else "#059669"
+            prov_rows.append((k, f'<span style="color:{color};font-weight:700">{v}</span>'))
+        if prov_rows:
+            st.markdown(_table(prov_rows), unsafe_allow_html=True)
+
+    _err_card(f"<b>Failure reason:</b> {error_msg}")
+
+    if errs:
+        for e in errs:
+            _err_card(f"<b>Detail:</b> {e}")
+
+    st.markdown(
+        _table([
+            ("Next actions", ""),
+            ("&nbsp;&nbsp;1", "Retry after network / provider is available"),
+            ("&nbsp;&nbsp;2", "Configure a reliable historical data provider (.env)"),
+            ("&nbsp;&nbsp;3", "Use another symbol with available data"),
+            ("&nbsp;&nbsp;4", "Do NOT interpret any old output above as current run result"),
+        ]),
+        unsafe_allow_html=True,
+    )
 
 
 def _section_header(n, title: str, sub: str = ""):
@@ -357,6 +434,21 @@ def _table(rows):
         f"{lbl}</td>"
         f'<td style="color:#0A2540;font-weight:700;font-size:.78rem;'
         f'padding:.28rem .5rem;border-bottom:1px solid #F0F4F8">'
+        f"{val}</td></tr>"
+        for lbl, val in rows
+    )
+    return f'<table style="width:100%;border-collapse:collapse">{cells}</table>'
+
+
+def _table_dark(rows):
+    """Table for dark-background panels — white/light text so it is always readable."""
+    cells = "".join(
+        f"<tr>"
+        f'<td style="color:#CBD5E1;font-size:.73rem;font-weight:600;'
+        f'padding:.28rem .5rem;width:44%;border-bottom:1px solid rgba(255,255,255,0.18)">'
+        f"{lbl}</td>"
+        f'<td style="color:#F8FAFC;font-weight:700;font-size:.78rem;'
+        f'padding:.28rem .5rem;border-bottom:1px solid rgba(255,255,255,0.18)">'
         f"{val}</td></tr>"
         for lbl, val in rows
     )
@@ -466,24 +558,124 @@ def _render_decision_distribution_diagnostics():
 
 def main():
     _apply_light_demo_theme()  # re-inject on every Streamlit rerun
-    # ── Build metadata banner — proof of active code version ─────────────────
-    _active_ai   = os.getenv("AI_PROVIDER", "gemini").upper()
-    _gemini_key  = bool(os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", ""))
-    _allow_fb    = os.getenv("ALLOW_BASELINE_FALLBACK", "false")
-    _banner_col  = "#10B981" if _active_ai == "GEMINI" and _gemini_key else "#F59E0B"
+    _render_batch_validation_sidebar()
+
+    # ── TRUTH_GATE_V4 banner — visible in every mode, every run ──────────────
+    import datetime as _dt_main
+    _patch_now = _dt_main.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    _active_ai  = os.getenv("AI_PROVIDER", "gemini").upper()
+    _gemini_key = bool(os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", ""))
+    _allow_fb   = os.getenv("ALLOW_BASELINE_FALLBACK", "false")
+    _tt_cred    = ("REFRESH" if os.getenv("TASTYTRADE_REFRESH_TOKEN")
+                   else "ACCESS" if os.getenv("TASTYTRADE_ACCESS_TOKEN")
+                   else "MISSING")
+    _rapi_key   = bool(os.getenv("RAPIDAPI_KEY"))
+    _banner_col = "#10B981" if _active_ai == "GEMINI" and _gemini_key else "#F59E0B"
+    _tt_color   = "#EF4444" if _tt_cred == "MISSING" else ("#F59E0B" if _tt_cred == "ACCESS" else "#10B981")
+    _rapi_color = "#EF4444" if not _rapi_key else "#10B981"
     st.markdown(
-        f'<div style="background:#052E1A;border:1px solid {_banner_col};border-radius:6px;'
-        f'padding:.35rem 1rem;margin-bottom:.5rem;font-size:.7rem;'
-        f'display:flex;justify-content:space-between;align-items:center">'
-        f'<span style="color:#6EE7B7;font-weight:700">BUILD ACTIVE</span>'
-        f'<span style="color:#D1FAE5">AI_PROVIDER: <b style="color:{_banner_col}">{_active_ai}</b></span>'
-        f'<span style="color:#D1FAE5">Gemini Key: <b style="color:{_banner_col}">{"PRESENT" if _gemini_key else "MISSING"}</b></span>'
-        f'<span style="color:#D1FAE5">Fallback: <b>{_allow_fb.upper()}</b></span>'
-        f'<span style="color:#D1FAE5">Built: <b>{_BUILD_TS}</b></span>'
-        f'<span style="color:#D1FAE5">File: <b>{_BUILD_FILE[-40:]}</b></span>'
+        f'<div style="background:#0D0D0D;border:2px solid #F59E0B;border-radius:6px;'
+        f'padding:.45rem 1rem;margin-bottom:.4rem;font-size:.7rem">'
+        f'<span style="color:#F59E0B;font-weight:900;font-size:.78rem">ACTIVE BUILD: TRUTH_GATE_V4</span>&nbsp;&nbsp;'
+        f'<span style="color:#9CA3AF">entrypoint: <b style="color:#D1D5DB">{_BUILD_FILE[-45:]}</b></span>&nbsp;&nbsp;'
+        f'<span style="color:#9CA3AF">render: <b style="color:#D1D5DB">{_patch_now}</b></span>&nbsp;&nbsp;'
+        f'<span style="color:#9CA3AF">AI: <b style="color:{_banner_col}">{_active_ai} {"KEY OK" if _gemini_key else "KEY MISSING"}</b></span>&nbsp;&nbsp;'
+        f'<span style="color:#9CA3AF">TT cred: <b style="color:{_tt_color}">{_tt_cred}</b></span>&nbsp;&nbsp;'
+        f'<span style="color:#9CA3AF">RapidAPI: <b style="color:{_rapi_color}">{"PRESENT" if _rapi_key else "MISSING"}</b></span>&nbsp;&nbsp;'
+        f'<span style="color:#9CA3AF">Fallback: <b style="color:#D1D5DB">{_allow_fb.upper()}</b></span>'
         f'</div>',
         unsafe_allow_html=True,
     )
+    # FORCE_DISABLE_TASTYTRADE check — highest priority
+    _force_disable_tt = os.getenv("FORCE_DISABLE_TASTYTRADE", "false").lower() == "true"
+    if _force_disable_tt:
+        st.error(
+            "FORCE_DISABLE_TASTYTRADE=true — Tastytrade is DISABLED for verification. "
+            "Options backtest will be blocked regardless of credentials. "
+            "Remove this env var to re-enable."
+        )
+    if _tt_cred == "MISSING":
+        st.warning(
+            "TASTYTRADE CREDENTIALS MISSING — No TASTYTRADE_REFRESH_TOKEN or TASTYTRADE_ACCESS_TOKEN in .env. "
+            "Options backtest will be blocked. Set refresh token for persistent auth."
+        )
+    if _tt_cred == "ACCESS":
+        # Try to detect staleness from JWT exp claim (non-sensitive — just the exp timestamp)
+        _tt_stale_msg = None
+        try:
+            import base64 as _b64, json as _json_jwt
+            _raw_tok = os.getenv("TASTYTRADE_ACCESS_TOKEN", "")
+            _parts = _raw_tok.split(".")
+            if len(_parts) == 3:
+                _padded = _parts[1] + "=" * (-len(_parts[1]) % 4)
+                _payload = _json_jwt.loads(_b64.urlsafe_b64decode(_padded))
+                _exp_ts  = _payload.get("exp")
+                if _exp_ts:
+                    import datetime as _dt_jwt
+                    _exp_dt  = _dt_jwt.datetime.utcfromtimestamp(_exp_ts)
+                    _now_jwt = _dt_jwt.datetime.utcnow()
+                    if _exp_dt < _now_jwt:
+                        _tt_stale_msg = (
+                            f"TASTYTRADE ACCESS TOKEN IS EXPIRED (expired at {_exp_dt.strftime('%Y-%m-%d %H:%M')} UTC, "
+                            f"now {_now_jwt.strftime('%Y-%m-%d %H:%M')} UTC). "
+                            "Options backtest will fail. Paste a fresh access token or add a refresh token."
+                        )
+                    else:
+                        _mins_left = int((_exp_dt - _now_jwt).total_seconds() / 60)
+                        if _mins_left < 5:
+                            _tt_stale_msg = (
+                                f"TASTYTRADE ACCESS TOKEN EXPIRES IN {_mins_left} MIN ({_exp_dt.strftime('%H:%M')} UTC). "
+                                "Refresh now or options backtest will fail mid-run."
+                            )
+        except Exception:
+            pass
+        if _tt_stale_msg:
+            st.error(_tt_stale_msg)
+        else:
+            st.warning(
+                "TASTYTRADE ACCESS TOKEN ONLY (no refresh token) — Access tokens expire every ~15 minutes. "
+                "App will fail for options if token is stale. Add TASTYTRADE_REFRESH_TOKEN for persistent auth."
+            )
+    # RapidAPI capability panel (honest about what current plan supports)
+    if _rapi_key:
+        with st.expander("RapidAPI Plan Capabilities (click to verify what is available)"):
+            st.markdown(
+                '<div style="font-size:.74rem;line-height:1.7">'
+                '<b style="color:#FCD34D">RapidAPI key is present.</b> '
+                'What each endpoint actually provides on the current plan:<br>'
+                '<table style="width:100%;font-size:.71rem;border-collapse:collapse">'
+                '<tr style="color:#93C5FD"><th style="text-align:left;padding:.15rem .4rem">Endpoint</th>'
+                '<th style="text-align:left;padding:.15rem .4rem">Used for</th>'
+                '<th style="text-align:left;padding:.15rem .4rem">Status</th></tr>'
+                '<tr><td style="padding:.12rem .4rem">TradingView quote</td>'
+                '<td style="padding:.12rem .4rem">Historical OHLCV bars</td>'
+                '<td style="color:#10B981;padding:.12rem .4rem">ACTIVE (used for price history)</td></tr>'
+                '<tr><td style="padding:.12rem .4rem">Market movers / screener</td>'
+                '<td style="padding:.12rem .4rem">Sector/momentum signals</td>'
+                '<td style="color:#10B981;padding:.12rem .4rem">ACTIVE — wired into prompt, but only for near-term '
+                'live predictions (origin date within 7 days of today); omitted for historical backtests to avoid leakage</td></tr>'
+                '<tr><td style="padding:.12rem .4rem">Options chain data</td>'
+                '<td style="padding:.12rem .4rem">Live strike/IV for exact-strike selection</td>'
+                '<td style="color:#EF4444;padding:.12rem .4rem">NOT WIRED — exact-strike unsupported by TT backtest</td></tr>'
+                '<tr><td style="padding:.12rem .4rem">Earnings calendar</td>'
+                '<td style="padding:.12rem .4rem">Earnings warning in AI prompt</td>'
+                '<td style="color:#10B981;padding:.12rem .4rem">ACTIVE — wired into prompt when earnings fall inside the prediction window</td></tr>'
+                '</table>'
+                '<br><span style="color:#9CA3AF">To use additional endpoints: wire them into the Gemini feature packet '
+                '(see calibration_profile_builder.py and failure_analyzer.py for roadmap).</span>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        with st.expander("RapidAPI Key Missing — Impact on This Run"):
+            st.markdown(
+                '<div style="font-size:.74rem;color:#FCA5A5">'
+                '<b>RAPIDAPI_KEY not set in .env</b><br>'
+                'Historical data falls back to yfinance (free, rate-limited, no options chain).<br>'
+                'No market-mover signals available. Add RAPIDAPI_KEY to unlock TradingView endpoint.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
 
     # Page header
     st.markdown(
@@ -526,7 +718,7 @@ def main():
         if st.session_state.get("ai_result") and st.session_state.get("active_mode") == "stock":
             _render_results()
         if st.session_state.get("error_msg") and not st.session_state.get("ai_result"):
-            _err_card(st.session_state["error_msg"])
+            _render_failure_panel()
 
     else:
         _info_card(
@@ -549,10 +741,13 @@ def main():
         if st.session_state.get("ai_result") and st.session_state.get("active_mode") == "options":
             _render_options_results()
         if st.session_state.get("error_msg") and not st.session_state.get("ai_result"):
-            _err_card(st.session_state["error_msg"])
+            _render_failure_panel()
 
     # Section 6 -- Accuracy log always visible
     _render_records()
+
+    # Section 7 -- Accuracy Calibration Dashboard always visible
+    _render_calibration_dashboard()
 
     # Sidebar rolling validation
     _sidebar_rolling()
@@ -631,6 +826,20 @@ def _render_stock_form():
         run_id = str(uuid.uuid4())[:8].upper()
         st.session_state["run_id"] = run_id
         st.session_state["active_mode"] = "stock"
+        # Capture exact user-entered inputs immediately after submit
+        st.session_state["user_input_snapshot"] = {
+            "symbol":                        symbol.strip().upper(),
+            "benchmark":                     benchmark.strip().upper(),
+            "initial_capital":               float(capital),
+            "historical_context_start_date": ctx_start.strip(),
+            "prediction_origin_date":        origin_dt.strip(),
+            "decision_horizon_days":         int(horizon),
+            "target_date":                   tgt_str,
+            "validation_mode":               val_mode,
+            "price_basis":                   price_basis,
+            "run_id":                        run_id,
+            "submitted_at_utc":              datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
         _run_all(
             symbol=symbol.strip().upper(),
             ctx_start=ctx_start.strip(),
@@ -992,11 +1201,29 @@ def _run_all(
         return
 
     input_hash = build_stock_prediction_hash(spi)
-    st.session_state.update({
-        "spi":        spi,
+    _run_ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    _run_ctx = {
+        "run_id":     run_id,
         "input_hash": input_hash,
-        "run_type":   run_type,
-        "run_ts":     datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "mode":       "stock",
+        "symbol":     symbol,
+        "timestamp_utc": _run_ts,
+        "provider_status": {
+            "historical_data": "PENDING",
+            "rapidapi":        "PENDING",
+            "tastytrade":      "NOT_APPLICABLE",
+            "gemini":          "PENDING",
+        },
+        "validation_status": "STARTED",
+        "errors": [],
+        "accuracy_eligible": False,
+    }
+    st.session_state.update({
+        "spi":         spi,
+        "input_hash":  input_hash,
+        "run_type":    run_type,
+        "run_ts":      _run_ts,
+        "run_context": _run_ctx,
     })
 
     try:
@@ -1009,32 +1236,88 @@ def _run_all(
         hist, hist_err = fetch_price_history(symbol, min_days=days_req)
 
     if not hist:
-        # Show clean single error — hist_err already includes provider detail
-        st.session_state["error_msg"] = hist_err
+        _run_ctx["provider_status"]["historical_data"] = "FAILED"
+        _run_ctx["provider_status"]["gemini"]          = "NOT_RUN"
+        _run_ctx["validation_status"] = "HISTORICAL_DATA_UNAVAILABLE"
+        _run_ctx["errors"].append(hist_err or "Historical price data unavailable")
+        st.session_state["run_context"] = _run_ctx
+        st.session_state["error_msg"]   = hist_err
+        _log_invalid_run(run_id, input_hash, symbol, "stock",
+                         "HISTORICAL_DATA_UNAVAILABLE", hist_err or "")
         return
 
+    _run_ctx["provider_status"]["historical_data"] = "SUCCESS"
     st.session_state["price_hist"]  = hist
     st.session_state["ctx_summary"] = get_context_summary(hist, ctx_start, origin_date)
 
     # ── Paid API health checks (proof of live API calls) ─────────────────────
-    with st.spinner("Calling paid APIs (RapidAPI + Tastytrade health check)..."):
+    _force_disable_tt_stock = os.getenv("FORCE_DISABLE_TASTYTRADE", "false").lower() == "true"
+    with st.spinner("Calling paid APIs (RapidAPI health check)..."):
         _rapi_result = _rapidapi_hc()
-        _tt_result   = _tastytrade_hc()
+        if _force_disable_tt_stock:
+            _tt_result = {
+                "called": False, "endpoint": "NOT_CALLED",
+                "http_status": None, "latency_ms": None,
+                "token_refreshed": False, "customer_verified": False,
+                "refresh_present": False, "role": "DISABLED_BY_FORCE_DISABLE_TASTYTRADE",
+                "used_in_stock_mode": False, "used_in_options_mode": False,
+                "error": "FORCE_DISABLE_TASTYTRADE=true — not called",
+                "blocked_by": "MISSING_FORCED", "backtest_allowed": False,
+            }
+        else:
+            _tt_result = _tastytrade_hc()
     st.session_state["rapidapi_health"]   = _rapi_result
     st.session_state["tastytrade_health"] = _tt_result
+    _run_ctx["provider_status"]["rapidapi"] = "CALLED" if _rapi_result.get("called") else "NOT_CONFIGURED"
+    _run_ctx["provider_status"]["tastytrade"] = "FORCE_DISABLED" if _force_disable_tt_stock else (
+        "VERIFIED" if _tt_result.get("customer_verified") else "NOT_USED_IN_STOCK_MODE"
+    )
+    st.session_state["run_context"] = _run_ctx
 
     # Strict two-bound context filter: AI sees ONLY [ctx_start, origin_date]
     ctx_bars = [b for b in hist if ctx_start <= b["date"] <= origin_date]
     if not ctx_bars:
+        _run_ctx["provider_status"]["gemini"] = "NOT_RUN"
+        _run_ctx["errors"].append(
+            f"No price bars between {ctx_start} and {origin_date}. "
+            "Provider returned bars outside this range or no data for these dates."
+        )
+        st.session_state["run_context"] = _run_ctx
         st.session_state["error_msg"] = (
             f"No price bars found between {ctx_start} and {origin_date}. "
-            "The API may not have data for this date range."
+            f"Provider returned {len(hist)} bars but none in your requested range. "
+            f"Earliest available: {hist[0]['date'] if hist else 'N/A'}. "
+            f"Latest available: {hist[-1]['date'] if hist else 'N/A'}. "
+            "If you entered a date like 2017, the provider may not have data that far back."
         )
+        _log_invalid_run(run_id, input_hash, symbol, "stock",
+                         "NO_BARS_IN_REQUESTED_DATE_RANGE",
+                         f"Requested {ctx_start} to {origin_date}, provider has {hist[0]['date'] if hist else 'N/A'} to {hist[-1]['date'] if hist else 'N/A'}")
         return
 
     # Pre-flight context validation
     _first_bar = ctx_bars[0]["date"]
     _last_bar  = ctx_bars[-1]["date"]
+
+    # Effective date discrepancy — user entered a date the provider can't reach
+    _effective_ctx_start = _first_bar
+    _date_gap_days = 0
+    if _effective_ctx_start > ctx_start:
+        try:
+            _req_dt  = datetime.strptime(ctx_start, "%Y-%m-%d").date()
+            _eff_dt  = datetime.strptime(_effective_ctx_start, "%Y-%m-%d").date()
+            _date_gap_days = (_eff_dt - _req_dt).days
+        except Exception:
+            _date_gap_days = 0
+        _run_ctx["effective_ctx_start"]    = _effective_ctx_start
+        _run_ctx["requested_ctx_start"]    = ctx_start
+        _run_ctx["ctx_start_gap_days"]     = _date_gap_days
+        _run_ctx["input_binding_warning"]  = (
+            f"You requested context from {ctx_start} but provider only has data from {_effective_ctx_start} "
+            f"({_date_gap_days} days short). AI used {_effective_ctx_start} as effective start, NOT {ctx_start}."
+        )
+        st.session_state["run_context"] = _run_ctx
+
     if _first_bar < ctx_start:
         st.session_state["error_msg"] = (
             f"AI context leakage detected: first bar {_first_bar} is before "
@@ -1129,21 +1412,20 @@ def _run_options_all(
     options_params = options_params or {}
     today = date.today()
 
-    # Server-side exact-strike guard: blocks malformed calls before provider/API work starts.
-    _srv_is_exact = options_params.get("contract_selection_method") == "EXACT_STRIKE" or options_params.get("strike_selection") == "strike"
-    _srv_strike = options_params.get("requested_strike") or options_params.get("strike_price")
+    # ── Exact-strike server-side guard (belt-and-suspenders) ─────────────────
+    _srv_is_exact = options_params.get("contract_selection_method") == "EXACT_STRIKE"
+    _srv_strike   = options_params.get("requested_strike") or options_params.get("strike_price")
     if _srv_is_exact and not _srv_strike:
-        st.session_state["opts_params"] = options_params
         st.session_state["opts_result"] = {
-            "status": "REVIEW_REQUIRED",
-            "reason": "EXACT_STRIKE mode requires a valid strike price. Run blocked before provider call.",
-            "backtest_status": "NOT_RUN",
+            "status":                "REVIEW_REQUIRED",
+            "reason":                "EXACT_STRIKE mode requires a valid strike price. Run blocked on server side.",
+            "backtest_status":       "NOT_RUN",
             "exact_validation_status": "INVALID_INPUT",
-            "accuracy_saved": False,
-            "accuracy_skip_reason": "MISSING_STRIKE_SERVER_GUARD",
+            "accuracy_saved":        False,
+            "accuracy_skip_reason":  "MISSING_STRIKE_SERVER_GUARD",
         }
-        st.session_state["saved"] = False
-        st.session_state["save_msg"] = "NOT SAVED - exact strike missing"
+        st.session_state["saved"]    = False
+        st.session_state["save_msg"] = "NOT SAVED — exact strike missing (server guard)"
         return
 
     # Detect run type
@@ -1171,12 +1453,43 @@ def _run_options_all(
         return
 
     input_hash = build_stock_prediction_hash(spi)
+    _run_ts2 = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    _tt_cred_source = (
+        "REFRESH_TOKEN" if os.getenv("TASTYTRADE_REFRESH_TOKEN")
+        else "ACCESS_TOKEN" if os.getenv("TASTYTRADE_ACCESS_TOKEN")
+        else "MISSING"
+    )
+    _run_ctx2 = {
+        "run_id":     run_id,
+        "input_hash": input_hash,
+        "mode":       "options",
+        "symbol":     symbol,
+        "timestamp_utc": _run_ts2,
+        "provider_status": {
+            "historical_data":   "PENDING",
+            "rapidapi":          "PENDING",
+            "tastytrade":        "PENDING",
+            "tastytrade_cred":   _tt_cred_source,
+            "gemini":            "PENDING",
+        },
+        "tastytrade_debug": {
+            "credential_source":     _tt_cred_source,
+            "token_refresh_status":  "NOT_RUN",
+            "customer_check_status": "NOT_RUN",
+            "backtest_create":       "NOT_RUN",
+            "backtest_poll":         "NOT_RUN",
+        },
+        "validation_status": "STARTED",
+        "errors": [],
+        "accuracy_eligible": False,
+    }
     st.session_state.update({
         "spi":          spi,
         "input_hash":   input_hash,
         "run_type":     run_type,
-        "run_ts":       datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "run_ts":       _run_ts2,
         "opts_params":  options_params,
+        "run_context":  _run_ctx2,
     })
 
     try:
@@ -1189,17 +1502,71 @@ def _run_options_all(
         hist, hist_err = fetch_price_history(symbol, min_days=days_req)
 
     if not hist:
-        st.session_state["error_msg"] = hist_err
+        _run_ctx2["provider_status"]["historical_data"] = "FAILED"
+        _run_ctx2["provider_status"]["gemini"]          = "NOT_RUN"
+        _run_ctx2["provider_status"]["tastytrade"]      = "NOT_RUN"
+        _run_ctx2["validation_status"] = "HISTORICAL_DATA_UNAVAILABLE"
+        _run_ctx2["errors"].append(hist_err or "Historical price data unavailable")
+        st.session_state["run_context"] = _run_ctx2
+        st.session_state["error_msg"]   = hist_err
+        _log_invalid_run(run_id, input_hash, symbol, "options",
+                         "HISTORICAL_DATA_UNAVAILABLE", hist_err or "")
         return
 
     st.session_state["price_hist"]  = hist
     st.session_state["ctx_summary"] = get_context_summary(hist, ctx_start, origin_date)
 
-    # ── Paid API health checks (proof of live API calls) ─────────────────────
-    with st.spinner("Calling paid APIs (RapidAPI + Tastytrade health check)..."):
+    # ── TRUTH GATE FIRST: auth check before any Tastytrade health call ────────
+    # This ensures that when FORCE_DISABLE_TASTYTRADE=true, we never call the
+    # real health check and store stale "success" data in tastytrade_health.
+    with st.spinner("Verifying Tastytrade auth (live API check)..."):
+        from verify_tastytrade_auth_truth import verify_tastytrade_auth_truth as _tt_auth_check
+        _tt_truth_early = _tt_auth_check()
+    _run_ctx2["tastytrade_auth_truth"] = _tt_truth_early
+    # Merge into tastytrade_debug immediately
+    _run_ctx2["tastytrade_debug"]["credential_source"]     = _tt_truth_early["credential_source"]
+    _run_ctx2["tastytrade_debug"]["token_refresh_status"]  = _tt_truth_early["token_refresh_status"]
+    _run_ctx2["tastytrade_debug"]["customer_check_status"] = _tt_truth_early["customer_check_status"]
+    _run_ctx2["tastytrade_debug"]["auth_http_status"]      = _tt_truth_early["auth_http_status"]
+    _run_ctx2["tastytrade_debug"]["backtest_allowed"]      = _tt_truth_early["backtest_allowed"]
+    _run_ctx2["tastytrade_debug"]["auth_truth_reason"]     = _tt_truth_early["reason"]
+    _run_ctx2["provider_status"]["tastytrade"] = (
+        "FORCE_DISABLED"  if _tt_truth_early["credential_source"] == "MISSING_FORCED" else
+        "NOT_CONFIGURED"  if _tt_truth_early["credential_source"] == "MISSING" else
+        "AUTH_FAILED"     if not _tt_truth_early["backtest_allowed"] else
+        "AUTH_OK"
+    )
+    st.session_state["run_context"] = _run_ctx2
+
+    # ── Paid API health checks ────────────────────────────────────────────────
+    # RapidAPI: always call (independent of TT auth)
+    # Tastytrade: ONLY call _tastytrade_hc() when auth truth already confirmed OK
+    # This prevents stale "customer verified YES" appearing when force-disabled.
+    with st.spinner("Calling RapidAPI health check..."):
         _rapi_result2 = _rapidapi_hc()
-        _tt_result2   = _tastytrade_hc()
-    st.session_state["rapidapi_health"]   = _rapi_result2
+    st.session_state["rapidapi_health"] = _rapi_result2
+
+    if _tt_truth_early["backtest_allowed"]:
+        # Auth confirmed live — run health check for additional telemetry
+        _tt_result2 = _tastytrade_hc()
+    else:
+        # Auth blocked — do NOT call real health check; synthesize a "not called" result
+        _cred_src_e  = _tt_truth_early["credential_source"]
+        _tt_result2 = {
+            "called":               False,
+            "endpoint":             "NOT_CALLED",
+            "http_status":          None,
+            "latency_ms":           None,
+            "token_refreshed":      False,
+            "customer_verified":    False,
+            "refresh_present":      _tt_truth_early["refresh_token_present"],
+            "role":                 "authentication_and_account_health_check",
+            "used_in_stock_mode":   False,
+            "used_in_options_mode": True,
+            "error":                _tt_truth_early["reason"],
+            "blocked_by":           _cred_src_e,
+            "backtest_allowed":     False,
+        }
     st.session_state["tastytrade_health"] = _tt_result2
 
     # Strict two-bound context filter
@@ -1272,62 +1639,126 @@ def _run_options_all(
         st.session_state["save_msg"] = save_msg
         return
 
-    _is_exact_mode = options_params.get("contract_selection_method") == "EXACT_STRIKE" or options_params.get("strike_selection") == "strike"
+    _is_exact_mode   = options_params.get("contract_selection_method") == "EXACT_STRIKE"
     _confirmed_strike = options_params.get("requested_strike") or options_params.get("strike_price")
     _confirmed_expiry = options_params.get("expiry_date")
+
     opts_result: Dict[str, Any] = {
-        "status":          "SKIPPED",
-        "backtest_range":  f"{origin_date} to {target_date}",
-        "note":            "Options backtest window = prediction window only",
-        "strike_selection": options_params.get("strike_selection", "delta"),
-        "contract_method": "EXACT_STRIKE" if _is_exact_mode else "DELTA_SELECTION",
-        "requested_strike": _confirmed_strike,
-        "expiry_date": _confirmed_expiry,
-        "delta_ui": options_params.get("delta_ui"),
-        "dte": options_params.get("dte", 45),
-        "quantity": options_params.get("quantity", 1),
-        "direction": options_params.get("direction", ""),
-        "opt_type": options_params.get("opt_type", ""),
-        "exact_validation_status": "NOT_RUN" if _is_exact_mode else None,
+        "status":                "SKIPPED",
+        "backtest_range":        f"{origin_date} to {target_date}",
+        "note":                  "Options backtest window = prediction window only",
+        "strike_selection":      options_params.get("strike_selection", "delta"),
+        "contract_method":       options_params.get("contract_selection_method", "DELTA_SELECTION"),
+        "requested_strike":      _confirmed_strike,
+        "expiry_date":           _confirmed_expiry,
+        "delta_ui":              options_params.get("delta_ui"),
+        "dte":                   options_params.get("dte", 45),
+        "quantity":              options_params.get("quantity", 1),
+        "direction":             options_params.get("direction", ""),
+        "opt_type":              options_params.get("opt_type", ""),
+        "exact_validation_status": "NOT_RUN",
+        "eligible_for_exact_accuracy": False if _is_exact_mode else None,
     }
 
+    _accuracy_skip_reason = None
+
     if _TT_AVAILABLE:
-        with st.spinner(
+        # ── Read auth truth already computed above (single source of truth) ───
+        # verify_tastytrade_auth_truth() was called BEFORE the health checks.
+        # Do NOT call it again — use the stored result to avoid second API round trip.
+        _run_ctx2  = st.session_state.get("run_context", _run_ctx2)
+        _tt_truth  = _run_ctx2.get("tastytrade_auth_truth", _tt_truth_early)
+        _tt_dbg    = _run_ctx2.get("tastytrade_debug", {})
+
+        if not _tt_truth["backtest_allowed"]:
+            _cred_src = _tt_truth["credential_source"]
+            opts_result["status"] = "BACKTEST_CREATE_FAILED"
+            opts_result["error"]  = _tt_truth["reason"]
+            _tt_dbg["backtest_create"] = (
+                "BLOCKED_NO_CREDENTIALS"  if _cred_src in ("MISSING", "MISSING_FORCED") else
+                "BLOCKED_AUTH_FAILED"
+            )
+            _run_ctx2["tastytrade_debug"] = _tt_dbg
+            st.session_state["run_context"] = _run_ctx2
+            _accuracy_skip_reason = (
+                "TASTYTRADE_NOT_CONFIGURED" if _cred_src in ("MISSING", "MISSING_FORCED") else
+                "TASTYTRADE_AUTH_FAILED"
+            )
+        else:
+          with st.spinner(
             f"Running options backtest ({origin_date} to {target_date})..."
-        ):
+          ):
             try:
                 direction_map = {"Buy": "long", "Sell": "short"}
                 type_map      = {"Call": "call", "Put": "put"}
 
-                strike_mode = options_params.get("strike_selection") == "strike"
-                leg = {
-                    "type":              "equity-option",
-                    "direction":         direction_map.get(options_params.get("direction", "Sell"), "short"),
-                    "quantity":          options_params.get("quantity", 1),
-                    "side":              type_map.get(options_params.get("opt_type", "Put"), "put"),
-                    "daysUntilExpiration": options_params.get("dte", 45),
-                    "strikeSelection":   "strike" if strike_mode else "delta",
-                }
-                if strike_mode and options_params.get("strike_price"):
-                    leg["strikePrice"] = float(options_params["strike_price"])
+                # Build leg based on actual selection mode — NEVER mix strike and delta
+                if _is_exact_mode and _confirmed_strike:
+                    # Tastytrade does NOT support fixed-strike backtesting via its API.
+                    # Mark exact validation as UNSUPPORTED, then run a delta proxy
+                    # labeled clearly as DELTA_PROXY_APPROXIMATE.
+                    opts_result["exact_validation_status"] = "UNSUPPORTED_BY_PROVIDER"
+                    opts_result["exact_validation_note"] = (
+                        "Tastytrade API does not support fixed-strike backtesting. "
+                        f"Requested strike {_confirmed_strike} cannot be verified exactly. "
+                        "Running delta-proxy (ATM ~50) as reference ONLY — labeled DELTA_PROXY_APPROXIMATE."
+                    )
+                    opts_result["eligible_for_exact_accuracy"] = False
+                    _accuracy_skip_reason = "EXACT_STRIKE_UNSUPPORTED_BY_PROVIDER"
+                    # Proxy leg uses delta=50 (ATM reference), clearly not exact
+                    leg = {
+                        "type":                "equity-option",
+                        "direction":           direction_map.get(options_params.get("direction", "Sell"), "short"),
+                        "quantity":            options_params.get("quantity", 1),
+                        "side":                type_map.get(options_params.get("opt_type", "Put"), "put"),
+                        "daysUntilExpiration": options_params.get("dte", 45),
+                        "strikeSelection":     "delta",
+                        "delta":               50,
+                    }
+                    opts_result["validation_type"] = "DELTA_PROXY_APPROXIMATE"
+                    opts_result["fallback_used"]   = True
                 else:
-                    leg["delta"] = int(options_params.get("delta") or 30)
+                    # Delta selection mode — use exactly what the user entered (no silent default)
+                    _delta_ui = options_params.get("delta_ui") or options_params.get("delta")
+                    if not _delta_ui:
+                        opts_result.update({"status": "REVIEW_REQUIRED", "reason": "Delta value missing in Delta mode — cannot proceed."})
+                        return opts_result
+                    leg = {
+                        "type":                "equity-option",
+                        "direction":           direction_map.get(options_params.get("direction", "Sell"), "short"),
+                        "quantity":            options_params.get("quantity", 1),
+                        "side":                type_map.get(options_params.get("opt_type", "Put"), "put"),
+                        "daysUntilExpiration": options_params.get("dte", 45),
+                        "strikeSelection":     "delta",
+                        "delta":               int(_delta_ui),
+                    }
+                    opts_result["validation_type"] = "DELTA_SELECTION"
+                    opts_result["fallback_used"]   = False
+                    opts_result["eligible_for_exact_accuracy"] = False
+
                 payload = _tt_build_legs(
                     symbol=symbol,
-                    start_date=origin_date,   # PREDICTION ORIGIN DATE -- not ctx_start
-                    end_date=target_date,     # TARGET DATE
+                    start_date=origin_date,
+                    end_date=target_date,
                     legs=[leg],
                 )
-                st.session_state["backtest_payload"] = payload.to_dict()  # store as plain dict for debug display
-                backtest_id, err = _tt_create_backtest(payload)
+                st.session_state["backtest_payload"] = payload.to_dict()
+                backtest_id, create_note = _tt_create_backtest(payload)
+                # A non-empty create_note alongside a real backtest_id means the
+                # backend fell back to a degraded payload (e.g. it dropped the
+                # requested exit conditions after a 400) -- the backtest that
+                # actually ran is not the one the user configured. Surface this
+                # instead of silently showing it as a clean SUCCESS.
+                _exit_conditions_degraded = bool(backtest_id and create_note)
+                if _exit_conditions_degraded:
+                    opts_result["exit_conditions_degraded"] = True
+                    opts_result["exit_conditions_degraded_reason"] = create_note
                 if backtest_id:
                     bt_data, poll_err = _tt_poll_backtest(backtest_id)
                     if bt_data:
-                        # Stats are nested under bt_data["results"] not top-level
                         _res_obj = bt_data.get("results") or {}
                         stats    = _res_obj.get("statistics") or {}
                         _trials  = _res_obj.get("trials") or []
-                        # Map the API's human-readable stat keys to opts_result fields
                         _win_pct_raw = (
                             stats.get("Win percentage") or stats.get("winRate")
                             or stats.get("win_rate") or 0
@@ -1335,11 +1766,11 @@ def _run_options_all(
                         _win_pct = float(_win_pct_raw or 0)
                         if _win_pct > 1.0:
                             _win_pct = _win_pct / 100.0
-                        _total_pl = (
+                        _total_pl = float(
                             stats.get("Total profit/loss") or stats.get("totalProfitLoss")
                             or stats.get("profit_loss") or 0
                         )
-                        _avg_pnl = (
+                        _avg_pnl = float(
                             stats.get("Avg. profit/loss per trade")
                             or stats.get("Avg. return per trade")
                             or stats.get("avgProfitLoss") or stats.get("avg_pnl") or 0
@@ -1348,54 +1779,73 @@ def _run_options_all(
                             stats.get("Number of trades") or stats.get("numTrades")
                             or stats.get("total_trades") or len(_trials) or 0
                         )
-                        opts_result = {
-                            "status":         "SUCCESS",
-                            "backtest_id":    backtest_id,
-                            "backtest_range": f"{origin_date} to {target_date}",
-                            "direction":      options_params.get("direction", ""),
-                            "opt_type":       options_params.get("opt_type", ""),
-                            "quantity":       options_params.get("quantity", 1),
-                            "delta":          options_params.get("delta", 30),
-                            "strike_selection": options_params.get("strike_selection", "delta"),
-                            "strike_price":   options_params.get("strike_price"),
-                            "expiry_date":    options_params.get("expiry_date"),
-                            "contract_method": "EXACT_STRIKE" if strike_mode else "DELTA_SELECTION",
-                            "dte":            options_params.get("dte", 45),
-                            "win_rate":       _win_pct,
-                            "profit_loss":    float(_total_pl or 0),
-                            "avg_pnl":        float(_avg_pnl or 0),
-                            "total_trades":   _n_trades,
-                            "raw_stats":      stats,
-                        }
+
+                        # Detect FLAT_NO_TRADES — 0 trades + $0 P&L = not a real validation
+                        if _n_trades == 0 and _total_pl == 0.0:
+                            opts_result.update({
+                                "status":       "FLAT_NO_TRADES",
+                                "backtest_id":  backtest_id,
+                                "win_rate":     0.0,
+                                "profit_loss":  0.0,
+                                "avg_pnl":      0.0,
+                                "total_trades": 0,
+                                "raw_stats":    stats,
+                                "note":         (
+                                    "Tastytrade returned 0 trades and $0 P&L. "
+                                    "No matching option contracts found in this window for the selected parameters. "
+                                    "Not counted as validated."
+                                ),
+                            })
+                            if not _accuracy_skip_reason:
+                                _accuracy_skip_reason = "FLAT_NO_TRADES"
+                        else:
+                            opts_result.update({
+                                "status":       "SUCCESS",
+                                "backtest_id":  backtest_id,
+                                "win_rate":     _win_pct,
+                                "profit_loss":  _total_pl,
+                                "avg_pnl":      _avg_pnl,
+                                "total_trades": _n_trades,
+                                "raw_stats":    stats,
+                            })
                     else:
                         opts_result["status"] = "BACKTEST_POLL_FAILED"
                         opts_result["error"]  = poll_err
                 else:
                     opts_result["status"] = "BACKTEST_CREATE_FAILED"
-                    opts_result["error"]  = err
+                    opts_result["error"]  = create_note
             except Exception as exc:
                 opts_result["status"] = "ERROR"
                 opts_result["error"]  = f"{type(exc).__name__}: {exc}"
     else:
-        opts_result["error"] = "Tastytrade backtester not available (import failed)"
+        opts_result["error"] = "Tastytrade backtester not available (import failed or credentials missing)"
 
     st.session_state["opts_result"] = opts_result
-    _backtest_succeeded = opts_result.get("status") == "SUCCESS"
+
+    # ── Accuracy save gate ────────────────────────────────────────────────────
+    # Only save when:
+    # (a) backtest truly succeeded (real trades occurred)
+    # (b) not exact-strike mode (since exact is unsupported — proxy result ≠ exact accuracy)
+    # (c) not FLAT_NO_TRADES
+    _backtest_truly_succeeded = opts_result.get("status") == "SUCCESS"
+    _save_blocked_reason = _accuracy_skip_reason  # set above if exact/flat
 
     # Underlying stock reference — always fetch, but used for display only
     with st.spinner(f"Fetching underlying stock price on {target_date} (reference only)..."):
         val_result = run_stock_validation(spi, ai_result, hist)
     st.session_state["val_result"] = val_result
 
-    # Save options accuracy ONLY if options backtest succeeded
-    # Do NOT compare AI options prediction against stock price — different comparables
-    if _backtest_succeeded:
+    if _backtest_truly_succeeded and not _save_blocked_reason:
         saved, save_msg = save_stock_prediction_record(spi, ai_result, val_result)
         if not val_result.get("status") == "SUCCESS":
-            saved, save_msg = False, "Options backtest succeeded but underlying stock validation failed — not saved"
+            saved, save_msg = False, "Backtest succeeded but underlying stock validation failed — not saved"
     else:
-        saved  = False
-        save_msg = f"Options backtest {opts_result.get('status', 'FAILED')} — accuracy record not saved"
+        saved    = False
+        _bt_stat = opts_result.get("status", "FAILED")
+        if _save_blocked_reason:
+            save_msg = f"NOT SAVED — {_save_blocked_reason}: {_bt_stat}"
+        else:
+            save_msg = f"NOT SAVED — options backtest {_bt_stat}"
 
     st.session_state["saved"]    = saved
     st.session_state["save_msg"] = save_msg
@@ -1449,6 +1899,22 @@ def _render_results():
         cap_v   = float(val.get("actual_final_capital") or cap)
         pl_v    = float(val.get("actual_total_pl") or 0)
         act_dec = val.get("actual_decision", "---")
+
+    # ── Input Binding Warning — show if effective date differs from requested ──
+    _run_ctx_stock = st.session_state.get("run_context", {})
+    _ibw = _run_ctx_stock.get("input_binding_warning")
+    if _ibw:
+        st.markdown(
+            f'<div style="background:#7C2D12;border:2px solid #DC2626;border-radius:6px;'
+            f'padding:.75rem 1.1rem;margin-bottom:.5rem">'
+            f'<div style="color:#FCA5A5;font-weight:900;font-size:.84rem">INPUT BINDING WARNING</div>'
+            f'<div style="color:#FED7AA;font-size:.77rem;margin-top:.3rem">{_ibw}</div>'
+            f'<div style="color:#FCA5A5;font-size:.72rem;margin-top:.3rem">'
+            f'Your date was recorded in the snapshot. The AI used the effective date above — '
+            f'NOT your requested date. See Developer Debug for full snapshot comparison.</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
     # ── Section 2 — Inputs Used + Two-Window ─────────────────────────────────
     _section_header(2, "Inputs Used", "Walk-forward setup — two-window architecture")
@@ -1551,6 +2017,8 @@ def _render_results():
         f'{"YES — HTTP " + str(_etp_rapi_hc_etp.get("http_status","?")) if _etp_rapi_called else "Not yet (run prediction first)"}</b><br>'
         f'RapidAPI Status: <b>{"200 OK" if _etp_rapi_ok else ("Error" if _etp_rapi_called else "---")}</b><br>'
         f'RapidAPI OHLCV: <b style="color:#F59E0B">{_etp_rapidapi_hist}</b><br>'
+        f'Role: <b>LIVE_MARKET_MOVERS / PROVIDER_HEALTH</b><br>'
+        f'Used for Historical OHLCV: <b>NO</b> (health check only)<br>'
         f'Historical Bars: <b>{_etp_hist_label}</b><br>'
         f'Historical Source: <b>{_etp_hist_src}</b></div>'
         # Validation values
@@ -1618,19 +2086,24 @@ def _render_results():
         f'Used In Options Mode: {_api_badge(True, "YES — health check", "NO")}<br>'
         + (f'Error: <span style="color:#EF4444">{_rapi_err}</span>' if _rapi_err else "")
         + f'</div>'
-        # Tastytrade column
+        # Tastytrade column — stock mode: not used for backtesting
         f'<div style="color:#F1F5F9">'
-        f'Refresh Token: {_api_badge(_tt_ref_ok, "PRESENT", "MISSING")}<br>'
-        f'Token Refreshed: {_api_badge(_tt_refreshed)}<br>'
-        f'Called This Run: {_api_badge(_tt_called)}<br>'
-        f'HTTP Status: <b>{_tt_status if _tt_called else "---"}</b><br>'
-        f'Endpoint: <code style="font-size:.66rem">{_tt_endpoint.replace("https://","")}</code><br>'
-        f'Customer Verified: {_api_badge(_tt_ok)}<br>'
-        f'Role: <b>auth &amp; account health check</b><br>'
+        + (
+            f'<b style="color:#EF4444">FORCE_DISABLE_TASTYTRADE=true</b><br>'
+            f'Token Called: NOT_CALLED (forced disabled)<br>'
+            f'Customer Check: NOT_CALLED<br>'
+            f'Backtest: DISABLED<br>'
+            if _tt_hc_r.get("blocked_by") == "MISSING_FORCED" else
+            f'Token Checked: {_api_badge(_tt_called, "YES — health check", "NO")}<br>'
+            f'Token Refreshed: {_api_badge(_tt_refreshed)}<br>'
+            f'Customer Verified: {_api_badge(_tt_ok)}<br>'
+            f'HTTP Status: <b>{_tt_status if _tt_called else "---"}</b><br>'
+            + (f'Error: <span style="color:#EF4444">{_tt_err}</span><br>' if _tt_err else "")
+        )
+        + f'Role: <b>auth &amp; account health check (stock mode only)</b><br>'
         f'Used In Stock Mode: {_api_badge(False, "YES", "NO — stock uses price validation")}<br>'
         f'Used In Options Mode: {_api_badge(True, "YES — backtester", "NO")}<br>'
-        + (f'Error: <span style="color:#EF4444">{_tt_err}</span>' if _tt_err else "")
-        + f'</div>'
+        f'</div>'
         f'</div>'
         f'</div>',
         unsafe_allow_html=True,
@@ -1781,13 +2254,31 @@ def _render_results():
         price_err   = float(cmp.get("target_price_error") or 0)
         pl_err      = float(cmp.get("pl_error") or 0)
 
-        mc = st.columns(6)
-        mc[0].metric("Decision Match",  "YES" if dec_match else "NO")
-        mc[1].metric("Direction Match", "YES" if dir_match else "NO")
-        mc[2].metric("Price Error",     f"${price_err:+,.2f}")
-        mc[3].metric("Return Error",    f"{ret_err:+.2f}pp")
-        mc[4].metric("Capital Error",   f"${cap_err:+,.0f}")
-        mc[5].metric("P&L Error",       f"${pl_err:+,.0f}")
+        _dm_col  = "#059669" if dec_match else "#DC2626"
+        _dir_col = "#059669" if dir_match else "#DC2626"
+        _pe_col  = "#DC2626" if abs(price_err) > 20 else ("#F59E0B" if abs(price_err) > 5 else "#059669")
+        _re_col  = "#DC2626" if abs(ret_err) > 20 else ("#F59E0B" if abs(ret_err) > 5 else "#059669")
+        _ce_col  = "#DC2626" if abs(cap_err) > 5000 else ("#F59E0B" if abs(cap_err) > 1000 else "#059669")
+        _pl_col  = "#DC2626" if abs(pl_err) > 5000 else ("#F59E0B" if abs(pl_err) > 1000 else "#059669")
+        _cards = [
+            ("Decision Match", "YES" if dec_match else "NO", _dm_col),
+            ("Direction Match", "YES" if dir_match else "NO", _dir_col),
+            ("Price Error", f"${price_err:+,.2f}", _pe_col),
+            ("Return Error", f"{ret_err:+.2f}pp", _re_col),
+            ("Capital Error", f"${cap_err:+,.0f}", _ce_col),
+            ("P&L Error", f"${pl_err:+,.0f}", _pl_col),
+        ]
+        _cards_html = "".join(
+            '<div style="flex:1;min-width:100px;background:#F8FAFC;border:1px solid #E5E7EB;'
+            'border-radius:6px;padding:.5rem .7rem;text-align:center">'
+            f'<div style="font-size:.63rem;color:#6B7280;font-weight:600">{label}</div>'
+            f'<div style="font-size:1rem;font-weight:800;color:{color}">{value}</div></div>'
+            for label, value, color in _cards
+        )
+        st.markdown(
+            f'<div style="display:flex;gap:.6rem;flex-wrap:wrap;margin:.4rem 0">{_cards_html}</div>',
+            unsafe_allow_html=True,
+        )
 
         c4a, c4b, c4c = st.columns([5, 5, 4])
         with c4a:
@@ -1944,12 +2435,14 @@ def _render_results():
                 ("Input Hash",            f'<code style="font-size:.68rem">{hash_v}</code>'),
                 ("AI Output Hash",        f'<code style="font-size:.68rem">{ai.get("stock_prediction_input_hash", "---")}</code>'),
                 ("Hash Match",            "YES" if ai.get("stock_prediction_input_hash") == hash_v else "NO"),
-                ("Leakage Check",         ai.get("leakage_check", "---")),
-                ("Bars visible to AI",    f'{fu.get("bars_used", "---")} (cutoff {origin})'),
-                ("Last AI bar date",      fu.get("last_ai_bar_date", "---")),
-                ("Target price hidden",   "YES — not in AI context"),
-                ("actual_provider_used",  ai.get("source", "---")),
-                ("Model version",         ai.get("model_version", "---")),
+                ("Leakage Check",              ai.get("leakage_check", "---")),
+                ("Bars visible to AI",         f'{fu.get("bars_used", "---")} (cutoff {origin})'),
+                ("Last AI bar date",           fu.get("last_ai_bar_date", "---")),
+                ("Target price hidden",        "YES — not in AI context"),
+                ("actual_provider_used",       "external_historical_provider"),
+                ("actual_validation_engine",   "historical_stock_price_validation"),
+                ("ai_source",                  ai.get("source", "---")),
+                ("Model version",              ai.get("model_version", "---")),
             ]),
             unsafe_allow_html=True,
         )
@@ -1978,6 +2471,25 @@ def _render_results():
             unsafe_allow_html=True,
         )
 
+    with st.expander("User Input Snapshot vs Effective Input (date binding proof)"):
+        _snap = st.session_state.get("user_input_snapshot", {})
+        _rctx = st.session_state.get("run_context", {})
+        _ibw2 = _rctx.get("input_binding_warning")
+        if _ibw2:
+            st.error(_ibw2)
+        _uis1, _uis2 = st.columns(2)
+        with _uis1:
+            st.markdown("**User-Entered Inputs (exact, captured at submit)**")
+            st.json(_snap)
+        with _uis2:
+            st.markdown("**Effective Inputs Used by AI (after provider constraints)**")
+            st.json({
+                "effective_ctx_start":    _rctx.get("effective_ctx_start") or _snap.get("historical_context_start_date", "same as requested"),
+                "requested_ctx_start":    _rctx.get("requested_ctx_start") or _snap.get("historical_context_start_date"),
+                "ctx_start_gap_days":     _rctx.get("ctx_start_gap_days", 0),
+                "provider_status":        _rctx.get("provider_status", {}),
+                "input_binding_warning":  _ibw2 or "NONE — inputs matched",
+            })
     with st.expander("Input JSON"):
         st.json(spi)
     with st.expander("AI visible history summary (first / last 3 bars)"):
@@ -2065,6 +2577,47 @@ def _render_options_results():
     cmp         = val.get("comparison", {}) if val_ok else {}
     cmp_ok      = cmp.get("status") == "SUCCESS"
 
+    # ── Input Binding Warning — show if effective date differs from requested ──
+    _run_ctx_opts = st.session_state.get("run_context", {})
+    _ibw_opts = _run_ctx_opts.get("input_binding_warning")
+    if _ibw_opts:
+        st.markdown(
+            f'<div style="background:#7C2D12;border:2px solid #DC2626;border-radius:6px;'
+            f'padding:.75rem 1.1rem;margin-bottom:.5rem">'
+            f'<div style="color:#FCA5A5;font-weight:900;font-size:.84rem">INPUT BINDING WARNING</div>'
+            f'<div style="color:#FED7AA;font-size:.77rem;margin-top:.3rem">{_ibw_opts}</div>'
+            f'<div style="color:#FCA5A5;font-size:.72rem;margin-top:.3rem">'
+            f'Your date was recorded in the snapshot. The AI used the effective date above — '
+            f'NOT your requested date. See Developer Debug for full snapshot comparison.</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Exit Conditions Degraded Warning — backtester silently dropped the
+    # requested stop-loss/take-profit after a 400 and fell back to a simpler
+    # payload. The trade actually backtested is not what was configured.
+    if opts.get("exit_conditions_degraded"):
+        st.markdown(
+            f'<div style="background:#7C2D12;border:2px solid #DC2626;border-radius:6px;'
+            f'padding:.75rem 1.1rem;margin-bottom:.5rem">'
+            f'<div style="color:#FCA5A5;font-weight:900;font-size:.84rem">EXIT CONDITIONS DEGRADED</div>'
+            f'<div style="color:#FED7AA;font-size:.77rem;margin-top:.3rem">'
+            f'Tastytrade rejected the requested stop-loss/take-profit combination. The backtest below '
+            f'ran with a simpler fallback exit rule instead — it is NOT validating the SL/TP you configured.</div>'
+            f'<div style="color:#FCA5A5;font-size:.72rem;margin-top:.3rem">'
+            f'{opts.get("exit_conditions_degraded_reason", "")[:400]}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    elif opts.get("exit_conditions_caveat"):
+        st.markdown(
+            f'<div style="background:#78350F;border:1px solid #F59E0B;border-radius:6px;'
+            f'padding:.6rem 1rem;margin-bottom:.5rem">'
+            f'<div style="color:#FDE68A;font-size:.75rem">{opts.get("exit_conditions_caveat", "")}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
     # ── Section 2 — Historical Context ───────────────────────────────────────
     _section_header(
         2, "Historical Context Used by AI",
@@ -2120,32 +2673,40 @@ def _render_options_results():
     with i2:
         _p_sel = opts_p.get("strike_selection", "delta")
         _p_is_strike = _p_sel == "strike"
-        _p_contract_row = (
-            ("Strike Price", _fmt(opts_p.get("strike_price"), "$") if opts_p.get("strike_price") else "---")
+        _p_strike_row = (
+            ("Strike",  str(opts_p.get("strike_price", "---")))
             if _p_is_strike else
-            ("Delta", str(opts_p.get("delta", "---")))
+            ("Delta",   str(opts_p.get("delta", "---")))
         )
-        _p_expiry_rows = [("Expiry Date", opts_p.get("expiry_date") or "---")] if _p_is_strike else []
+        _p_expiry_row = (
+            [("Expiry Date", opts_p.get("expiry_date") or "---")]
+            if _p_is_strike else []
+        )
         st.markdown(
             _table([
                 ("Direction",          opts_p.get("direction", "---")),
                 ("Type",               opts_p.get("opt_type", "---")),
                 ("Quantity",           f"{opts_p.get('quantity', '---')} contract(s)"),
                 ("Strike Selection",   _p_sel.title()),
-                _p_contract_row,
-                ("DTE",                f"{opts_p.get('dte', '---')} days"),
-            ] + _p_expiry_rows + [
+                _p_strike_row,
+                ("DTE",                f"{opts_p.get('dte', '---')} days"),]
+                + _p_expiry_row + [
                 ("Entry Schedule",     opts_p.get("entry_schedule", "---")),
                 ("Exit Rule",          opts_p.get("exit_rule", "---")),
-                ("Backtest Window",    f"{origin}  ->  {target}"),
+                ("Backtest Window",    f"{origin}  →  {target}"),
             ]),
             unsafe_allow_html=True,
         )
 
-    # Paid API Usage Proof (options mode)
+    # ── Paid API Usage Proof (options mode) — single truth source ────────────
+    # RapidAPI: from session_state["rapidapi_health"] (real health check)
+    # Tastytrade: from run_context["tastytrade_auth_truth"] ONLY (never from stale health)
+    _rapi_hc_o   = st.session_state.get("rapidapi_health") or {}
+    _run_ctx_tt  = st.session_state.get("run_context", {})
+    # Single auth truth object — same one used by Developer Debug
+    _tt_truth_ui = _run_ctx_tt.get("tastytrade_auth_truth", {})
+    _current_rid = _run_ctx_tt.get("run_id", "")
 
-    _rapi_hc_o = st.session_state.get("rapidapi_health") or {}
-    _tt_hc_o   = st.session_state.get("tastytrade_health") or {}
     _ro_called   = _rapi_hc_o.get("called", False)
     _ro_status   = _rapi_hc_o.get("http_status", 0)
     _ro_endpoint = _rapi_hc_o.get("endpoint", "---")
@@ -2154,26 +2715,34 @@ def _render_options_results():
     _ro_err      = _rapi_hc_o.get("error")
     _ro_key_ok   = _rapi_hc_o.get("key_present", False)
     _ro_leakage  = _rapi_hc_o.get("used_in_prediction_context", False)
-    _to_called   = _tt_hc_o.get("called", False)
-    _to_status   = _tt_hc_o.get("http_status", 0)
-    _to_ok       = _tt_hc_o.get("customer_verified", False)
-    _to_endpoint = _tt_hc_o.get("endpoint", "---")
-    _to_refreshed = _tt_hc_o.get("token_refreshed", False)
-    _to_err      = _tt_hc_o.get("error")
-    _to_ref_ok   = _tt_hc_o.get("refresh_present", False)
+
+    # Tastytrade truth — read from auth_truth, never from stale tastytrade_health
+    _tt_cred_src   = _tt_truth_ui.get("credential_source", "NOT_RUN")
+    _tt_rt_present = _tt_truth_ui.get("refresh_token_present", False)
+    _tt_at_present = _tt_truth_ui.get("access_token_present", False)
+    _tt_ref_att    = _tt_truth_ui.get("token_refresh_attempted", False)
+    _tt_ref_stat   = _tt_truth_ui.get("token_refresh_status", "NOT_RUN")
+    _tt_cust_stat  = _tt_truth_ui.get("customer_check_status", "NOT_RUN")
+    _tt_http       = _tt_truth_ui.get("auth_http_status")
+    _tt_allowed_ui = _tt_truth_ui.get("backtest_allowed", False)
+    _tt_reason_ui  = _tt_truth_ui.get("reason", "---")
 
     def _ab(ok: bool, y: str = "YES", n: str = "NO") -> str:
         c = "#10B981" if ok else "#EF4444"
         return f'<span style="color:{c};font-weight:800">{y if ok else n}</span>'
 
+    def _stat_badge(s: str) -> str:
+        c = "#10B981" if s == "SUCCESS" else "#F59E0B" if s == "NOT_RUN" else "#EF4444"
+        return f'<span style="color:{c};font-weight:700">{s}</span>'
+
     st.markdown(
         f'<div style="background:#0A1628;border:1px solid #2563EB;'
         f'border-radius:8px;padding:.7rem 1.1rem;margin:.6rem 0">'
         f'<div style="color:#93C5FD;font-weight:800;font-size:.82rem;margin-bottom:.5rem">'
-        f'PAID API USAGE PROOF</div>'
+        f'PAID API USAGE PROOF — Run {_current_rid or "N/A"}</div>'
         f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:.3rem 1.2rem;font-size:.71rem">'
         f'<div style="color:#FCD34D;font-weight:700;margin-bottom:.2rem">RAPIDAPI (TradingView)</div>'
-        f'<div style="color:#FCD34D;font-weight:700;margin-bottom:.2rem">TASTYTRADE (OAuth)</div>'
+        f'<div style="color:#FCD34D;font-weight:700;margin-bottom:.2rem">TASTYTRADE (OAuth) — AUTH TRUTH</div>'
         f'<div style="color:#F1F5F9">'
         f'API Key Present: {_ab(_ro_key_ok)}<br>'
         f'Called This Run: {_ab(_ro_called)}<br>'
@@ -2185,25 +2754,29 @@ def _render_options_results():
         + (f'Error: <span style="color:#EF4444">{_ro_err}</span>' if _ro_err else "")
         + f'</div>'
         f'<div style="color:#F1F5F9">'
-        f'Refresh Token: {_ab(_to_ref_ok, "PRESENT", "MISSING")}<br>'
-        f'Token Refreshed: {_ab(_to_refreshed)}<br>'
-        f'Customer Verified: {_ab(_to_ok)}<br>'
-        f'Auth Endpoint: <code style="font-size:.66rem">{_to_endpoint.replace("https://","")}</code><br>'
-        f'Auth HTTP Status: <b>{_to_status if _to_called else "---"}</b><br>'
-        + (f'Auth Error: <span style="color:#EF4444">{_to_err}</span><br>' if _to_err else "")
+        f'Credential Source: <b>{_tt_cred_src}</b><br>'
+        f'Refresh Token Present: {_ab(_tt_rt_present, "YES", "NO")}<br>'
+        f'Access Token Present: {_ab(_tt_at_present, "YES", "NO")}<br>'
+        f'Token Refresh Attempted: {_ab(_tt_ref_att, "YES", "NOT_RUN")}<br>'
+        f'Token Refresh Status: {_stat_badge(_tt_ref_stat)}<br>'
+        f'Customer Check Status: {_stat_badge(_tt_cust_stat)}<br>'
+        f'Auth HTTP Status: <b>{"N/A" if _tt_http is None else _tt_http}</b><br>'
+        f'Backtest Allowed: {_ab(_tt_allowed_ui)}<br>'
         + f'<br><b style="color:#FCD34D">OPTIONS BACKTEST:</b><br>'
         f'Backtest Status: <b style="color:{"#10B981" if opts_status == "SUCCESS" else "#EF4444"}">'
         f'{opts_status}</b><br>'
-        f'Backtest ID: <b>{opts.get("backtest_id","---")}</b><br>'
+        f'Backtest ID: <b>{opts.get("backtest_id") or "—"}</b><br>'
         + (
             f'Options P&L: <b style="color:{"#10B981" if float(opts.get("profit_loss",0) or 0)>=0 else "#EF4444"}">'
             f'${float(opts.get("profit_loss",0) or 0):+,.2f}</b><br>'
-            f'Win Rate: <b>{_win_rate_fmt(opts.get("win_rate"))}</b><br>'
+                f'Win Rate: <b>{float(opts.get("win_rate", 0) or 0) * 100:.1f}%</b><br>'
             f'Trials / Trades: <b>{opts.get("total_trades","---")}</b><br>'
-            if opts_status == "SUCCESS" else ""
+            if opts_status == "SUCCESS" else
+            f'P&L: <b>N/A</b><br>Win Rate: <b>N/A</b><br>Trades: <b>N/A</b><br>'
         )
         + f'Accuracy Saved: {_ab(st.session_state.get("saved", False))}<br>'
-        + (f'Backtest Error: <span style="color:#EF4444">{opts.get("error","")}</span>' if opts_status != "SUCCESS" else "")
+        + (f'Auth/Backtest Reason: <span style="color:#FCA5A5;font-size:.67rem">{_tt_reason_ui}</span>' if not _tt_allowed_ui else "")
+        + (f'<br>Backtest Error: <span style="color:#EF4444">{opts.get("error","")}</span>' if opts_status not in ("SUCCESS", "SKIPPED") else "")
         + f'</div>'
         f'</div>'
         f'</div>',
@@ -2306,20 +2879,22 @@ def _render_options_results():
         _3b_sel = opts_p.get("strike_selection", "delta")
         _3b_is_strike = _3b_sel == "strike"
         _3b_contract_row = (
-            ("Strike Price", _fmt(opts_p.get("strike_price"), "$") if opts_p.get("strike_price") else "---")
+            ("Strike",  str(opts_p.get("strike_price", "---")))
             if _3b_is_strike else
-            ("Delta", str(opts_p.get("delta", "---")))
+            ("Delta",   str(opts_p.get("delta", "---")))
         )
-        _3b_expiry_rows = [("Expiry Date", opts_p.get("expiry_date") or "---")] if _3b_is_strike else []
+        _3b_extra = (
+            [("Expiry Date", opts_p.get("expiry_date") or "---")]
+            if _3b_is_strike else []
+        )
         st.markdown(
             _table([
                 ("Strike Selection", _3b_sel.title()),
                 _3b_contract_row,
                 ("DTE",              f"{opts_p.get('dte', '---')} days"),
-            ] + _3b_expiry_rows),
+            ] + _3b_extra),
             unsafe_allow_html=True,
         )
-
     with oc3:
         st.markdown(
             _table([
@@ -2524,6 +3099,50 @@ def _render_options_results():
     fu  = ai.get("features_used", {}) or {}
     mom = ai.get("_momentum_signals", {}) or {}
 
+    # ── TASTYTRADE AUTH TRUTH CHECK panel ─────────────────────────────────────
+    _tt_truth_d = st.session_state.get("run_context", {}).get("tastytrade_auth_truth", {})
+    _tt_allowed = _tt_truth_d.get("backtest_allowed", None)
+    _tt_truth_color = (
+        "#064E3B" if _tt_allowed is True else
+        "#7C2D12" if _tt_allowed is False else "#1E3A5F"
+    )
+    _tt_truth_label_color = (
+        "#10B981" if _tt_allowed is True else
+        "#EF4444" if _tt_allowed is False else "#93C5FD"
+    )
+    _tt_truth_label = (
+        "BACKTEST ALLOWED" if _tt_allowed is True else
+        "BACKTEST BLOCKED" if _tt_allowed is False else "NOT YET CHECKED"
+    )
+    if _tt_truth_d:
+        st.markdown(
+            f'<div style="background:{_tt_truth_color};border:2px solid {_tt_truth_label_color};'
+            f'border-radius:8px;padding:.75rem 1.2rem;margin-bottom:.7rem;color:#F8FAFC">'
+            f'<div style="color:{_tt_truth_label_color};font-weight:900;font-size:.85rem;margin-bottom:.4rem">'
+            f'TASTYTRADE AUTH TRUTH CHECK — {_tt_truth_label}</div>'
+            + _table_dark([
+                ("Credential Source",         _tt_truth_d.get("credential_source", "---")),
+                ("Access Token Present",       str(_tt_truth_d.get("access_token_present", "---"))),
+                ("Access Token (masked)",      _tt_truth_d.get("access_token_masked") or "N/A"),
+                ("Refresh Token Present",      str(_tt_truth_d.get("refresh_token_present", "---"))),
+                ("Refresh Token (masked)",     _tt_truth_d.get("refresh_token_masked") or "N/A"),
+                ("Token Refresh Attempted",    str(_tt_truth_d.get("token_refresh_attempted", "---"))),
+                ("Token Refresh Status",       _tt_truth_d.get("token_refresh_status", "---")),
+                ("Token Refresh HTTP Status",  str(_tt_truth_d.get("token_refresh_http_status") or "N/A")),
+                ("Customer Check Attempted",   str(_tt_truth_d.get("customer_check_attempted", "---"))),
+                ("Customer Check Status",      _tt_truth_d.get("customer_check_status", "---")),
+                ("Auth HTTP Status",           str(_tt_truth_d.get("auth_http_status") or "N/A")),
+                ("Backtest Allowed",           _tt_truth_label),
+                ("Reason",                     _tt_truth_d.get("reason", "---")),
+                ("Secrets Masked",             "YES — no token values exposed"),
+                ("Timestamp UTC",              _tt_truth_d.get("timestamp_utc", "---")),
+            ]) +
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("Tastytrade Auth Truth Check: not yet run this session (submit an options run to see it).")
+
     d1, d2 = st.columns(2)
     with d1:
         st.markdown(
@@ -2562,6 +3181,48 @@ def _render_options_results():
         st.json(opts_p)
     with st.expander("Backtest Payload (exact request to Tastytrade)"):
         st.json(bt_payload if bt_payload else {"note": "Payload not stored (tastytrade unavailable)"})
+    with st.expander("User Input Snapshot vs Effective Input (date binding proof)"):
+        _snap_o = st.session_state.get("user_input_snapshot", {})
+        _rctx_o = st.session_state.get("run_context", {})
+        _ibw_o  = _rctx_o.get("input_binding_warning")
+        if _ibw_o:
+            st.error(_ibw_o)
+        _uo1, _uo2 = st.columns(2)
+        with _uo1:
+            st.markdown("**User-Entered Inputs (exact, captured at submit)**")
+            st.json(_snap_o)
+        with _uo2:
+            st.markdown("**Effective Inputs Used by AI (after provider constraints)**")
+            st.json({
+                "effective_ctx_start":    _rctx_o.get("effective_ctx_start") or _snap_o.get("historical_context_start_date", "same as requested"),
+                "requested_ctx_start":    _rctx_o.get("requested_ctx_start") or _snap_o.get("historical_context_start_date"),
+                "ctx_start_gap_days":     _rctx_o.get("ctx_start_gap_days", 0),
+                "provider_status":        _rctx_o.get("provider_status", {}),
+                "input_binding_warning":  _ibw_o or "NONE — inputs matched",
+            })
+    _run_ctx_d = st.session_state.get("run_context", {})
+    _tt_dbg_d  = _run_ctx_d.get("tastytrade_debug", {})
+    with st.expander("Tastytrade Auth Debug (credential source, auth chain, backtest chain)"):
+        _cred_src = _tt_dbg_d.get("credential_source") or (
+            "REFRESH_TOKEN" if os.getenv("TASTYTRADE_REFRESH_TOKEN")
+            else "ACCESS_TOKEN" if os.getenv("TASTYTRADE_ACCESS_TOKEN")
+            else "MISSING"
+        )
+        st.markdown(
+            _table([
+                ("Credential Source",     _cred_src),
+                ("TT Token Refresh",      _tt_dbg_d.get("token_refresh_status", "NOT_RUN")),
+                ("Customer Check",        _tt_dbg_d.get("customer_check_status", "NOT_RUN")),
+                ("Backtest Create",       _tt_dbg_d.get("backtest_create", "NOT_RUN")),
+                ("Backtest Poll",         _tt_dbg_d.get("backtest_poll", "NOT_RUN")),
+                ("Final TT Status",       opts_status),
+                ("Accuracy Skip Reason",  opts.get("accuracy_skip_reason", "NONE")),
+                ("Accuracy Saved",        str(saved)),
+            ]),
+            unsafe_allow_html=True,
+        )
+    with st.expander("Run Context (provider status for this run)"):
+        st.json(_run_ctx_d)
     with st.expander("AI Prediction Raw JSON"):
         st.json({k: v for k, v in ai.items() if k != "_momentum_signals"})
     with st.expander("Momentum Signals Used by AI"):
@@ -2913,6 +3574,243 @@ def _run_rolling(symbol, ctx_start, n_months, capital, benchmark):
         st.sidebar.success(f"Done -- {len(results)} months validated")
         _section_header("", f"Rolling Validation -- {symbol} ({n_months} months)")
         st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — ACCURACY CALIBRATION DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _render_calibration_dashboard():
+    """Section 7: Accuracy Calibration & Failure Analysis dashboard."""
+    import json as _json_cd
+
+    st.markdown("---")
+    _section_header(7, "Accuracy Calibration & Failure Analysis")
+
+    DATA_DIR = Path(__file__).resolve().parent / "data"
+
+    def _load_json(path):
+        try:
+            p = Path(path)
+            if p.exists():
+                return _json_cd.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return None
+
+    batch_sum = _load_json(DATA_DIR / "batch_validation_summary.json")
+    fail_json = _load_json(DATA_DIR / "failure_analysis.json")
+    cal_json  = _load_json(DATA_DIR / "calibration_profiles.json")
+    ba_report = _load_json(DATA_DIR / "calibration_before_after_report.json")
+
+    col1, col2, col3, col4 = st.columns(4)
+    if batch_sum:
+        col1.metric("Decision Match", f"{batch_sum.get('decision_match_pct', '?')}%")
+        col2.metric("Hold Rate", f"{batch_sum.get('hold_rate_pct', '?')}%")
+        col3.metric("Direction Match", f"{batch_sum.get('direction_match_pct', '?')}%")
+        col4.metric("Avg Return Error", f"{batch_sum.get('avg_return_error_pp', '?')}pp")
+
+        hold_rate = batch_sum.get("hold_rate_pct", 0) or 0
+        if hold_rate > 55:
+            st.error(f"HOLD bias CRITICAL: {hold_rate}% HOLD rate — model is over-conservative.")
+        elif hold_rate > 45:
+            st.warning(f"HOLD bias CAUTION: {hold_rate}% HOLD rate — consider threshold adjustment.")
+
+        # Top failure categories
+        if batch_sum.get("top_failure_reasons"):
+            with st.expander("Top Failure Categories", expanded=True):
+                for item in batch_sum["top_failure_reasons"][:8]:
+                    st.write(f"**{item['count']}x** {item['reason']}")
+
+        # Per-symbol match
+        if batch_sum.get("match_by_symbol"):
+            with st.expander("Per-Symbol Decision Match %"):
+                sym_data = batch_sum["match_by_symbol"]
+                for sym, d in sorted(sym_data.items(), key=lambda x: x[1].get("match_pct", 0)):
+                    st.write(f"**{sym}**: {d['match_pct']}% ({d['matches']}/{d['runs']} runs)")
+
+        # Recommendations
+        if batch_sum.get("recommended_prompt_changes"):
+            with st.expander("Recommended Improvements"):
+                for rec in batch_sum["recommended_prompt_changes"]:
+                    st.write(f"- {rec}")
+    else:
+        st.info("No batch summary found. Run batch validation first.")
+
+    # HOLD bias
+    if fail_json and fail_json.get("hold_bias"):
+        hb = fail_json["hold_bias"]
+        with st.expander(f"HOLD Bias Analysis -- {hb.get('severity','?')}"):
+            col1, col2 = st.columns(2)
+            col1.metric("Overall Hold Rate", f"{hb.get('overall_hold_rate','?')}%")
+            col2.metric("False Neutral Rate", f"{hb.get('false_neutral_rate','?')}%")
+            if hb.get("warning"):
+                st.warning(hb["warning"])
+            if hb.get("hold_rate_by_symbol"):
+                st.write("Hold rate by symbol:", hb["hold_rate_by_symbol"])
+
+    # Before/after
+    if ba_report and not ba_report.get("error"):
+        with st.expander("Before/After Calibration Comparison"):
+            st.write(f"**Assessment:** {ba_report.get('honest_assessment','N/A')}")
+            dm_d  = ba_report.get("decision_match_delta")
+            hr_d  = ba_report.get("hold_rate_delta")
+            if dm_d is not None:
+                st.write(
+                    f"Decision Match: {ba_report.get('baseline_decision_match')}% "
+                    f"-> {ba_report.get('post_decision_match')}% "
+                    f"(delta {dm_d:+.1f}pp)"
+                )
+            if hr_d is not None:
+                st.write(
+                    f"Hold Rate: {ba_report.get('baseline_hold_rate')}% "
+                    f"-> {ba_report.get('post_hold_rate')}% "
+                    f"(delta {hr_d:+.1f}pp)"
+                )
+
+    # CLI commands
+    with st.expander("CLI Commands to Run Calibration"):
+        st.code(
+            "# Step 1: Run baseline batch\n"
+            "python batch_validation_runner.py --focused --max-runs 50 --tag baseline\n\n"
+            "# Step 2: Run failure analysis\n"
+            "python failure_analyzer.py --tag baseline\n\n"
+            "# Step 3: Build calibration profile\n"
+            "python calibration_profile_builder.py --tag baseline\n\n"
+            "# Step 4: Run post-calibration batch (after prompt changes)\n"
+            "python batch_validation_runner.py --focused --max-runs 50 --tag post_calibration\n"
+            "python failure_analyzer.py --tag post_calibration\n"
+            "python calibration_profile_builder.py --tag post_calibration\n\n"
+            "# Step 5: Compare\n"
+            "python compare_calibration_runs.py --baseline baseline --post post_calibration\n\n"
+            "# Step 6: Accuracy record hygiene\n"
+            "python clean_accuracy_records.py --dry-run",
+            language="bash",
+        )
+
+    # Download buttons
+    col1, col2 = st.columns(2)
+    csv_path = DATA_DIR / "batch_validation_results.csv"
+    fail_path = DATA_DIR / "failure_analysis.json"
+    if csv_path.exists():
+        with open(csv_path, "rb") as f:
+            col1.download_button("Download Batch CSV", f, "batch_validation_results.csv", "text/csv")
+    if fail_path.exists():
+        with open(fail_path, "rb") as f:
+            col2.download_button("Download Failure JSON", f, "failure_analysis.json", "application/json")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BATCH VALIDATION SECTION — shown in sidebar
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _render_batch_validation_sidebar() -> None:
+    """Render a collapsed batch validation launcher in the sidebar."""
+    with st.sidebar:
+        st.markdown("---")
+        with st.expander("Batch Validation / Model Improvement", expanded=False):
+            st.markdown(
+                '<span style="color:#6B7280;font-size:.75rem">'
+                "Run AI vs actual comparison across multiple stocks and time windows. "
+                "Results saved to data/batch_validation_results.csv"
+                "</span>",
+                unsafe_allow_html=True,
+            )
+
+            bv_symbols = st.text_input(
+                "Symbols (comma-separated)",
+                value="SPY,TSLA",
+                key="bv_symbols",
+            )
+            bv_horizons = st.text_input(
+                "Horizons (days, comma-separated)",
+                value="7,14,30",
+                key="bv_horizons",
+            )
+            bv_max_runs = st.number_input(
+                "Max runs",
+                value=20, min_value=1, max_value=200, step=5,
+                key="bv_max_runs",
+            )
+            bv_months = st.number_input(
+                "Months back",
+                value=12, min_value=1, max_value=36,
+                key="bv_months",
+            )
+            bv_run = st.button("Run Batch Validation", key="bv_run", type="secondary")
+
+            if bv_run:
+                try:
+                    from batch_validation_runner import run_batch
+                    symbols  = [s.strip().upper() for s in bv_symbols.split(",") if s.strip()]
+                    horizons = [int(h.strip()) for h in bv_horizons.split(",") if h.strip()]
+                    with st.spinner(f"Running {bv_max_runs} validations ..."):
+                        summary = run_batch(
+                            symbols     = symbols,
+                            horizons    = horizons,
+                            max_runs    = int(bv_max_runs),
+                            months_back = int(bv_months),
+                            verbose     = False,
+                        )
+                    st.success("Batch complete!")
+                    st.metric("Decision Match %", f"{summary.get('decision_match_pct', 0):.1f}%")
+                    st.metric("Hold Rate %",      f"{summary.get('hold_rate_pct', 0):.1f}%")
+                    st.metric("Avg Return Err pp",
+                              f"{summary.get('avg_return_error_pp') or 0:.2f}")
+                    if summary.get("top_failure_reasons"):
+                        st.markdown("**Top Failure Reasons:**")
+                        for item in summary["top_failure_reasons"][:4]:
+                            st.markdown(f"- `{item['reason']}` × {item['count']}")
+                    if summary.get("recommended_prompt_changes"):
+                        st.markdown("**Recommendations:**")
+                        for rec in summary["recommended_prompt_changes"][:3]:
+                            st.markdown(f"- {rec}")
+                    # Download buttons
+                    from pathlib import Path as _P
+                    csv_f  = _P("data") / "batch_validation_results.csv"
+                    json_f = _P("data") / "batch_validation_summary.json"
+                    if csv_f.exists():
+                        st.download_button(
+                            "Download Results CSV",
+                            data=csv_f.read_bytes(),
+                            file_name="batch_validation_results.csv",
+                            mime="text/csv",
+                        )
+                    if json_f.exists():
+                        st.download_button(
+                            "Download Summary JSON",
+                            data=json_f.read_bytes(),
+                            file_name="batch_validation_summary.json",
+                            mime="application/json",
+                        )
+                except ImportError as ie:
+                    st.error(f"batch_validation_runner not available: {ie}")
+                except Exception as exc:
+                    st.error(f"Batch validation error: {exc}")
+
+            # Failure analysis button
+            st.markdown("---")
+            fa_run = st.button("Analyze Failures", key="fa_run", type="secondary")
+            if fa_run:
+                try:
+                    from failure_analyzer import analyze
+                    with st.spinner("Analyzing ..."):
+                        analysis = analyze(verbose=False)
+                    st.success("Analysis complete!")
+                    st.metric("Decision Match %",
+                              f"{analysis.get('decision_match_pct', 0):.1f}%")
+                    st.metric("Hold Rate %",
+                              f"{analysis.get('hold_rate_pct', 0):.1f}%")
+                    if analysis.get("recommendations"):
+                        st.markdown("**Recommendations:**")
+                        for r in analysis["recommendations"][:3]:
+                            st.markdown(f"- {r}")
+                except ImportError:
+                    st.warning("Run batch validation first to generate analysis data.")
+                except Exception as exc:
+                    st.error(f"Analysis error: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

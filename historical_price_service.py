@@ -60,6 +60,18 @@ _AMEX = frozenset({
 # ETF set used by external historical provider for correct asset-class routing
 _ETF_SYMBOLS = _AMEX
 
+# ── Index symbol normalization ─────────────────────────────────────────────────
+# Maps common index names → correct ticker for each provider.
+# SPX/NDX/DJI are index names, not tradeable tickers — providers need specific formats.
+_INDEX_SYMBOL_MAP: Dict[str, Dict[str, str]] = {
+    "SPX":  {"yfinance": "^GSPC",  "tradingview": "SP:SPX",    "nasdaq": "^GSPC"},
+    "NDX":  {"yfinance": "^NDX",   "tradingview": "NASDAQ:NDX","nasdaq": "^NDX"},
+    "DJI":  {"yfinance": "^DJI",   "tradingview": "DJ:DJI",    "nasdaq": "^DJI"},
+    "DJIA": {"yfinance": "^DJI",   "tradingview": "DJ:DJI",    "nasdaq": "^DJI"},
+    "VIX":  {"yfinance": "^VIX",   "tradingview": "CBOE:VIX",  "nasdaq": "^VIX"},
+    "RUT":  {"yfinance": "^RUT",   "tradingview": "TVC:RUT",   "nasdaq": "^RUT"},
+}
+
 # ── Provider configuration ─────────────────────────────────────────────────────
 # "auto"                → try RapidAPI historical first; use external_historical if unavailable
 # "rapidapi_tradingview"→ RapidAPI only (fails if historical endpoints not on plan)
@@ -266,6 +278,8 @@ def _fetch_external_historical_provider(
         if clean.startswith(prefix):
             clean = clean[len(prefix):]
             break
+    # Resolve index names (SPX → ^GSPC for NASDAQ API)
+    clean = _INDEX_SYMBOL_MAP.get(clean, {}).get("nasdaq", clean)
 
     assetclass = "etf" if clean in _ETF_SYMBOLS else "stocks"
     url    = f"https://api.nasdaq.com/api/quote/{clean}/historical"
@@ -335,6 +349,262 @@ def _fetch_external_historical_provider(
         return [], f"External historical provider error for {clean}: {type(exc).__name__}: {exc}"
 
 
+# ── yfinance provider (long-range historical, data back to IPO) ─────────────────
+def _fetch_yfinance(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+) -> Tuple[List[Dict], str]:
+    """
+    Fetch daily OHLCV bars via yfinance.
+    Returns (bars, error_msg). Bars carry source="yfinance".
+    Used as fallback when other providers cannot cover the requested date range.
+
+    auto_adjust=False intentionally: RapidAPI TradingView and the NASDAQ external
+    provider both return raw/unadjusted closes (no dividend/split adjustment).
+    Fetching yfinance with auto_adjust=True would silently mix adjusted and
+    unadjusted price series whenever a symbol falls back to yfinance while a
+    benchmark (or vice versa) comes from RapidAPI/NASDAQ, corrupting relative-
+    strength and return comparisons between the two. Matching yfinance's
+    convention to the other providers' here keeps every source comparable.
+    """
+    try:
+        import yfinance as yf
+        clean = symbol.upper()
+        for prefix in ("NASDAQ:", "NYSE:", "AMEX:", "ARCA:"):
+            if clean.startswith(prefix):
+                clean = clean[len(prefix):]
+                break
+        # Resolve index names to yfinance tickers (SPX → ^GSPC, etc.)
+        clean = _INDEX_SYMBOL_MAP.get(clean, {}).get("yfinance", clean)
+        ticker = yf.Ticker(clean)
+        df = ticker.history(start=start_date, end=end_date, auto_adjust=False)
+        if df is None or df.empty:
+            return [], f"yfinance returned no data for {clean} ({start_date} to {end_date})"
+        bars: List[Dict] = []
+        for ts, row in df.iterrows():
+            try:
+                day_str = ts.strftime("%Y-%m-%d")
+                close = float(row.get("Close", 0) or 0)
+                if close <= 0:
+                    continue
+                bars.append({
+                    "date":   day_str,
+                    "close":  round(close, 4),
+                    "open":   round(float(row.get("Open",   0) or close), 4),
+                    "high":   round(float(row.get("High",   0) or close), 4),
+                    "low":    round(float(row.get("Low",    0) or close), 4),
+                    "volume": float(row.get("Volume", 0) or 0),
+                    "source": "yfinance",
+                })
+            except (ValueError, TypeError, AttributeError):
+                continue
+        if not bars:
+            return [], f"yfinance parsed 0 valid bars for {clean}"
+        bars.sort(key=lambda b: b["date"])
+        return bars, ""
+    except ImportError:
+        return [], "yfinance not installed — run: pip install yfinance"
+    except Exception as exc:
+        return [], f"yfinance error for {symbol}: {type(exc).__name__}: {exc}"
+
+
+def _fetch_rapidapi_for_range(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+) -> Tuple[List[Dict], str]:
+    """
+    Attempt to fetch bars for an exact date range via TradingView RapidAPI.
+    Calculates the required range in days from today. Capped at _MAX_RANGE.
+    Returns (bars filtered to requested window, error_msg).
+    Bars carry source="rapidapi_tradingview".
+    """
+    key = os.getenv("RAPIDAPI_KEY", "").strip()
+    if not key:
+        return [], "RAPIDAPI_KEY not set — skipping TradingView RapidAPI"
+
+    try:
+        from datetime import datetime as _dt
+        start_dt   = _dt.strptime(start_date[:10], "%Y-%m-%d").date()
+        days_needed = (date.today() - start_dt).days + 30
+        range_n     = min(days_needed, _MAX_RANGE)
+
+        base    = symbol.upper().replace("-", ".").strip()
+        # Resolve index names to TradingView format (SPX → SP:SPX, etc.)
+        _idx_tv = _INDEX_SYMBOL_MAP.get(base, {}).get("tradingview")
+        if _idx_tv:
+            exchanges = [_idx_tv]
+        else:
+            sym_fmt = _fmt(symbol)
+            if sym_fmt.startswith("NASDAQ:"):
+                exchanges = [sym_fmt, f"NYSE:{base}", f"AMEX:{base}"]
+            elif sym_fmt.startswith("NYSE:"):
+                exchanges = [sym_fmt, f"NASDAQ:{base}", f"AMEX:{base}"]
+            elif sym_fmt.startswith("AMEX:"):
+                exchanges = [sym_fmt, f"NASDAQ:{base}", f"NYSE:{base}"]
+            else:
+                exchanges = [f"NASDAQ:{base}", f"NYSE:{base}", f"AMEX:{base}"]
+
+        for fmt_sym in exchanges:
+            try:
+                resp = requests.post(
+                    f"{_BASE_URL}/api/price/batch",
+                    headers=_rapidapi_headers(),
+                    json={"requests": [{"symbol": fmt_sym, "timeframe": "D", "range": range_n}]},
+                    timeout=10,
+                )
+                if resp.status_code in (401, 402, 403):
+                    return [], f"RapidAPI auth/billing error ({resp.status_code}) — check RAPIDAPI_KEY"
+                if resp.status_code == 429:
+                    return [], "RapidAPI rate limit (429)"
+                if resp.status_code == 200:
+                    bars = _extract_bars(resp.json())
+                    bars = [b for b in bars if start_date <= b["date"] <= end_date]
+                    if bars:
+                        for b in bars:
+                            b["source"] = "rapidapi_tradingview"
+                        return _deduplicate_and_sort(bars), ""
+            except requests.Timeout:
+                continue
+            except Exception:
+                continue
+
+        return [], (
+            f"RapidAPI TradingView returned 0 bars for {symbol} "
+            f"in {start_date} to {end_date} (range_n={range_n})"
+        )
+    except Exception as exc:
+        return [], f"RapidAPI range fetch error: {type(exc).__name__}: {exc}"
+
+
+def fetch_price_history_for_range(
+    symbol: str,
+    requested_start: str,
+    requested_end: str,
+) -> Tuple[List[Dict], str, Dict]:
+    """
+    Fetch daily OHLCV for a specific date range using a provider fallback chain.
+
+    Provider order:
+      1. TradingView RapidAPI (paid — tried first for all requests)
+      2. NASDAQ external provider (free fallback)
+      3. yfinance (free last resort — covers pre-2023 history)
+
+    Returns (bars, error, coverage_info).
+    coverage_info keys:
+        requested_start  — user-requested first date
+        effective_start  — first bar date actually returned
+        provider         — name of provider used
+        coverage_status  — "FULL" if effective_start <= requested_start, else "PARTIAL"
+        providers_tried  — list of {provider, status, first_bar, error}
+    """
+    try:
+        from datetime import datetime as _vdt
+        _vs = _vdt.strptime(requested_start, "%Y-%m-%d").date()
+        _ve = _vdt.strptime(requested_end,   "%Y-%m-%d").date()
+        if _vs >= _ve:
+            _bad = f"Invalid date range: start={requested_start} >= end={requested_end}. Start must be before end."
+            return [], _bad, {"requested_start": requested_start, "coverage_status": "FAILED", "error": _bad}
+    except ValueError as _date_exc:
+        _bad = f"Malformed date: {_date_exc}. Expected YYYY-MM-DD."
+        return [], _bad, {"requested_start": requested_start, "coverage_status": "FAILED", "error": _bad}
+
+    chain: List[Dict] = []
+    sym_key = symbol.upper().replace("-", ".").replace(":", "_")
+
+    def _coverage_status(first_bar: Optional[str], req_start: str) -> str:
+        """FULL = first bar within 7 calendar days of req_start (weekend/holiday buffer)."""
+        if not first_bar:
+            return "FAILED"
+        try:
+            from datetime import datetime as _dt
+            gap = (_dt.strptime(first_bar, "%Y-%m-%d") - _dt.strptime(req_start, "%Y-%m-%d")).days
+            return "FULL" if gap <= 7 else "PARTIAL"
+        except Exception:
+            return "PARTIAL" if first_bar else "FAILED"
+
+    # ── Provider 1: TradingView RapidAPI (paid subscription) ──────────────────
+    tv_bars, tv_err = _fetch_rapidapi_for_range(symbol, requested_start, requested_end)
+    tv_first  = tv_bars[0]["date"] if tv_bars else None
+    tv_status = _coverage_status(tv_first, requested_start)
+    chain.append({
+        "provider":  "rapidapi_tradingview",
+        "status":    tv_status,
+        "first_bar": tv_first,
+        "bars":      len(tv_bars),
+        "error":     tv_err,
+    })
+    if tv_status == "FULL":
+        _PROVIDER_USED[sym_key] = "rapidapi_tradingview"
+        return tv_bars, "", {
+            "requested_start": requested_start,
+            "effective_start": tv_first,
+            "provider":        "rapidapi_tradingview",
+            "coverage_status": "FULL",
+            "providers_tried": chain,
+        }
+
+    # ── Provider 2: NASDAQ external ────────────────────────────────────────────
+    nash_bars, nash_err = _fetch_external_historical_provider(
+        symbol, requested_start, requested_end
+    )
+    nash_first  = nash_bars[0]["date"] if nash_bars else None
+    nash_status = _coverage_status(nash_first, requested_start)
+    chain.append({
+        "provider":  "nasdaq_external",
+        "status":    nash_status,
+        "first_bar": nash_first,
+        "bars":      len(nash_bars),
+        "error":     nash_err,
+    })
+    if nash_status == "FULL":
+        _PROVIDER_USED[sym_key] = "external_historical_provider"
+        return nash_bars, "", {
+            "requested_start": requested_start,
+            "effective_start": nash_first,
+            "provider":        "nasdaq_external",
+            "coverage_status": "FULL",
+            "providers_tried": chain,
+        }
+
+    # ── Provider 3: yfinance (last resort — covers decades of history) ─────────
+    yf_bars, yf_err = _fetch_yfinance(symbol, requested_start, requested_end)
+    yf_first  = yf_bars[0]["date"] if yf_bars else None
+    yf_status = _coverage_status(yf_first, requested_start)
+    chain.append({
+        "provider":  "yfinance",
+        "status":    yf_status,
+        "first_bar": yf_first,
+        "bars":      len(yf_bars),
+        "error":     yf_err,
+    })
+    if yf_bars:
+        eff_start  = yf_first or requested_start
+        final_stat = yf_status
+        _PROVIDER_USED[sym_key] = "yfinance"
+        return yf_bars, "", {
+            "requested_start": requested_start,
+            "effective_start": eff_start,
+            "provider":        "yfinance",
+            "coverage_status": final_stat,
+            "providers_tried": chain,
+        }
+
+    # ── All providers failed ────────────────────────────────────────────────────
+    combined_err = (
+        f"No provider could fetch data for {symbol} from {requested_start}. "
+        f"TradingView RapidAPI: {tv_err}. NASDAQ: {nash_err}. yfinance: {yf_err}."
+    )
+    return [], combined_err, {
+        "requested_start": requested_start,
+        "effective_start": None,
+        "provider":        None,
+        "coverage_status": "FAILED",
+        "providers_tried": chain,
+    }
+
+
 # ── In-memory cache (10 min TTL) ───────────────────────────────────────────────
 _PRICE_CACHE: Dict[str, Dict] = {}
 _CACHE_TTL = 10 * 60
@@ -360,15 +630,26 @@ def fetch_price_history(symbol: str, min_days: int = 500) -> Tuple[List[Dict], s
     if HISTORICAL_PRICE_PROVIDER == "external_historical":
         end_d   = date.today()
         start_d = end_d - timedelta(days=min_days + 90)
-        ext_bars, ext_err = _fetch_external_historical_provider(
-            symbol, start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
-        )
+        start_s, end_s = start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
+        ext_bars, ext_err = _fetch_external_historical_provider(symbol, start_s, end_s)
         if ext_bars:
             ext_bars = _deduplicate_and_sort(ext_bars)
             _PRICE_CACHE[sym_key] = {"bars": ext_bars, "ts": time.time()}
             _PROVIDER_USED[sym_key] = "external_historical_provider"
             return ext_bars, ""
-        return [], f"Historical price data unavailable for {symbol}. {ext_err}"
+        # yfinance last resort — same tier fetch_price_history_for_range() already
+        # uses for benchmark bars; the primary predicted-symbol path previously
+        # stopped at NASDAQ and would fail outright here.
+        yf_bars, yf_err = _fetch_yfinance(symbol, start_s, end_s)
+        if yf_bars:
+            yf_bars = _deduplicate_and_sort(yf_bars)
+            _PRICE_CACHE[sym_key] = {"bars": yf_bars, "ts": time.time()}
+            _PROVIDER_USED[sym_key] = "yfinance"
+            return yf_bars, ""
+        return [], (
+            f"Historical price data unavailable for {symbol}. "
+            f"NASDAQ: {ext_err}. yfinance: {yf_err}."
+        )
 
     key = os.getenv("RAPIDAPI_KEY", "").strip()
     if not key:
@@ -497,19 +778,27 @@ def fetch_price_history(symbol: str, min_days: int = 500) -> Tuple[List[Dict], s
     if HISTORICAL_PRICE_PROVIDER == "auto":
         end_d   = date.today()
         start_d = end_d - timedelta(days=range_n + 90)
-        ext_bars, ext_err = _fetch_external_historical_provider(
-            symbol, start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
-        )
+        start_s, end_s = start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
+        ext_bars, ext_err = _fetch_external_historical_provider(symbol, start_s, end_s)
         if ext_bars:
             ext_bars = _deduplicate_and_sort(ext_bars)
             _PRICE_CACHE[sym_key] = {"bars": ext_bars, "ts": time.time()}
             _PROVIDER_USED[sym_key] = "external_historical_provider"
             return ext_bars, ""
-        # Both RapidAPI and external failed
+        # yfinance last resort — RapidAPI and NASDAQ both failed. Previously this
+        # was a dead end for the primary predicted-symbol path even though the
+        # benchmark path (fetch_price_history_for_range) already had this tier.
+        yf_bars, yf_err = _fetch_yfinance(symbol, start_s, end_s)
+        if yf_bars:
+            yf_bars = _deduplicate_and_sort(yf_bars)
+            _PRICE_CACHE[sym_key] = {"bars": yf_bars, "ts": time.time()}
+            _PROVIDER_USED[sym_key] = "yfinance"
+            return yf_bars, ""
+        # RapidAPI, NASDAQ, and yfinance all failed
         return [], (
             f"Historical price data unavailable for {symbol}. "
             f"RapidAPI TradingView: historical endpoints not available on current plan. "
-            f"External historical provider: {ext_err}. "
+            f"External historical provider: {ext_err}. yfinance: {yf_err}. "
             "Check Developer Debug for details."
         )
 
@@ -530,6 +819,7 @@ def get_price_on_date(
     history: List[Dict],
     target_date: str,
     max_gap_days: int = 5,
+    price_basis: str = "close",
 ) -> Tuple[Optional[float], str, str]:
     """
     Find the actual trading-day price closest to target_date.
@@ -542,6 +832,7 @@ def get_price_on_date(
     max_gap_days: if the nearest available date is more than this many calendar days
                   away from target_date, returns an error rather than a potentially
                   wrong price.
+    price_basis: which OHLCV field to return ("close", "high", "low", "open"). Defaults to "close".
     """
     if not history:
         return None, "", "Price history is empty — cannot look up price"
@@ -575,7 +866,8 @@ def get_price_on_date(
             f"Data may not cover this date range."
         )
 
-    return best_bar["close"], best_bar["date"], ""
+    price = float(best_bar.get(price_basis) or best_bar.get("close") or 0)
+    return price, best_bar["date"], ""
 
 
 def filter_history_up_to(history: List[Dict], cutoff_date: str) -> List[Dict]:

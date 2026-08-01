@@ -63,11 +63,15 @@ logs/
 
 # Discord agent runtime state (may contain user signals and order metadata)
 discord_stock_prediction_agent/agent_state.json
+discord_stock_prediction_agent/agent_state.backup.json
 discord_stock_prediction_agent/options_validation_cache.json
 discord_stock_prediction_agent/symbol_cache.json
 discord_stock_prediction_agent/signal_queue.sqlite3
 discord_stock_prediction_agent/signal_queue.sqlite3-shm
 discord_stock_prediction_agent/signal_queue.sqlite3-wal
+discord_stock_prediction_agent/pending_market_orders.sqlite3
+discord_stock_prediction_agent/pending_market_orders.sqlite3-shm
+discord_stock_prediction_agent/pending_market_orders.sqlite3-wal
 discord_stock_prediction_agent/*.tmp
 discord_stock_prediction_agent/logs/
 discord_stock_prediction_agent/discord_agent.lock

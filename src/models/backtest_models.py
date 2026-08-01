@@ -16,6 +16,8 @@ class BacktestLeg:
 
     type MUST be "equity-option" — any other value returns type=unknown, statistics=null.
     direction MUST be "short" or "long" (not "sell"/"buy").
+    Supported strikeSelection values: "strike", "delta", "percentageOtm",
+    "priceOffset", and "premium".
     """
     type: str = "equity-option"
     direction: str = "short"
@@ -25,22 +27,42 @@ class BacktestLeg:
     strike_selection: str = "delta"
     delta: int = 30
     strike_price: Optional[float] = None
+    percentage_otm: Optional[float] = None
+    price_offset: Optional[float] = None
+    premium_amount: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        strike_selection = (self.strike_selection or "delta").lower()
-        data = {
+        selection = (self.strike_selection or "delta").strip()
+        d = {
             "type": self.type,
             "direction": self.direction,
             "quantity": self.quantity,
             "side": self.side,
             "daysUntilExpiration": self.days_until_expiration,
-            "strikeSelection": strike_selection,
+            "strikeSelection": selection,
         }
-        if strike_selection == "strike" and self.strike_price is not None:
-            data["strikePrice"] = self.strike_price
+        if selection.lower() == "strike" and self.strike_price is not None:
+            d["strikeSelection"] = "strike"
+            d["strikePrice"] = float(self.strike_price)
+        elif selection == "delta":
+            d["delta"] = self.delta
+        elif selection == "percentageOtm":
+            d["percentageOtm"] = self.percentage_otm
+        elif selection == "priceOffset":
+            d["priceOffset"] = self.price_offset
+        elif selection == "premium":
+            d["premium"] = self.premium_amount
         else:
-            data["delta"] = self.delta
-        return data
+            d["delta"] = self.delta
+        return d
+
+
+_EXIT_RULE_MAP: Dict[str, Dict] = {
+    "Exit at target date":  {},
+    "Exit after N days":    {"type": "days_held"},
+    "Target profit 50%":    {"type": "profit_percentage", "profitPercentage": 50},
+    "Stop loss 200%":       {"type": "loss_percentage",   "lossPercentage": 200},
+}
 
 
 @dataclass
@@ -51,16 +73,50 @@ class BacktestPayload:
     end_date: str
     legs: List[BacktestLeg] = field(default_factory=list)
     entry_frequency: str = "every day"
+    exit_rule: str = "Exit at target date"
     status: str = "pending"
+    stop_loss_pct: Optional[float] = None
+    take_profit_pct: Optional[float] = None
+    exit_after_days: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
+        # TastyTrade exitConditions is a Go STRUCT (backtesting.ExitConditions),
+        # NOT a slice. Sending a JSON array causes HTTP 400:
+        #   "cannot unmarshal array into Go struct field Backtest.exitConditions"
+        # Always build a single flat dict — never a list.
+        # Include "type" field in all cases (single AND combined) matching proven working format.
+        has_tp   = bool(self.take_profit_pct and self.take_profit_pct > 0)
+        has_sl   = bool(self.stop_loss_pct   and self.stop_loss_pct   > 0)
+        has_days = bool(self.exit_after_days  and self.exit_after_days > 0)
+
+        exit_cond: Dict[str, Any] = {}
+        if has_tp:
+            exit_cond["profitPercentage"] = float(self.take_profit_pct)
+        if has_sl:
+            exit_cond["lossPercentage"] = float(self.stop_loss_pct)
+        if has_days:
+            exit_cond["daysHeld"] = int(self.exit_after_days)
+
+        # Always include type field — use primary condition's type as the struct discriminator.
+        # Combined (TP + SL): type="profit_percentage" with both percentage fields present.
+        if exit_cond:
+            if has_tp:
+                exit_cond["type"] = "profit_percentage"
+            elif has_sl:
+                exit_cond["type"] = "loss_percentage"
+            elif has_days:
+                exit_cond["type"] = "days_held"
+
+        if not exit_cond:
+            exit_cond = _EXIT_RULE_MAP.get(self.exit_rule, {})
+
         return {
             "startDate": self.start_date,
             "endDate": self.end_date,
             "symbol": self.symbol,
             "status": self.status,
             "entryConditions": {"frequency": self.entry_frequency},
-            "exitConditions": {},
+            "exitConditions": exit_cond,
             "legs": [leg.to_dict() for leg in self.legs],
         }
 

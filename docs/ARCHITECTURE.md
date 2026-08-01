@@ -151,6 +151,6 @@ extract_backtest_summary() → UI render
 - Use `.env` variables only — loaded via `python-dotenv`.
 - Never log Authorization headers or token values.
 - Never expose tokens in Streamlit error messages.
-- Never place real trades — no order endpoints are implemented.
+- Never place live-money trades. The Discord extension implements Alpaca paper-order endpoints and rejects non-paper broker configuration.
 - Do not use `https://api.cert.tastyworks.com` for this integration.
 - Do not commit `.env` — it is in `.gitignore`.

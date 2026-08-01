@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, List, TypeVar
@@ -19,6 +20,10 @@ from .signal_normalizer import signal_template_signature
 STATE_PATH = AGENT_DIR / "agent_state.json"
 _STATE_LOCK = threading.RLock()
 _T = TypeVar("_T")
+
+
+def _state_backup_path() -> Path:
+    return STATE_PATH.with_name(f"{STATE_PATH.stem}.backup{STATE_PATH.suffix}")
 
 
 def _state_mutation(function: Callable[..., _T]) -> Callable[..., _T]:
@@ -36,6 +41,9 @@ def _empty_state() -> Dict[str, Any]:
         "pending_buy_orders": {},
         "pending_sell_orders": {},
         "pending_option_orders": {},
+        "pending_option_entry_orders": {},
+        "pending_multi_leg_entry_orders": {},
+        "pending_exit_orders": {},
         "decision_history": [],
         "learning_profile": {
             "buy_score_adjustment": 0.0,
@@ -48,6 +56,7 @@ def _empty_state() -> Dict[str, Any]:
         },
         "trade_outcomes": [],
         "option_positions": {},
+        "multi_leg_positions": {},
         "option_journal": [],
         "signal_events": [],
         "order_events": [],
@@ -55,8 +64,6 @@ def _empty_state() -> Dict[str, Any]:
         "signal_learning": {},
         "parser_learning": {},
         "option_validation_events": [],
-        "signal_queue": [],
-        "processing_signal": None,
         "conditional_equity_orders": {},
         "agent_control": {
             "mode": "ON",
@@ -68,34 +75,59 @@ def _empty_state() -> Dict[str, Any]:
 
 def load_state() -> Dict[str, Any]:
     with _STATE_LOCK:
-        if not STATE_PATH.exists():
+        if not STATE_PATH.exists() and not _state_backup_path().exists():
             return _empty_state()
-        try:
-            loaded = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-            state = _empty_state()
-            if isinstance(loaded, dict):
+        errors: list[str] = []
+        for candidate in (STATE_PATH, _state_backup_path()):
+            if not candidate.exists():
+                continue
+            try:
+                loaded = json.loads(candidate.read_text(encoding="utf-8"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("state root must be a JSON object")
+                state = _empty_state()
                 state.update(loaded)
-            return state
-        except Exception:
-            return _empty_state()
+                if candidate == _state_backup_path():
+                    logging.getLogger(__name__).error(
+                        "Recovered agent state from backup after the primary state file failed: %s",
+                        "; ".join(errors) or "primary file unavailable",
+                    )
+                return state
+            except Exception as exc:
+                errors.append(f"{candidate.name}: {type(exc).__name__}: {exc}")
+        raise RuntimeError(
+            "Agent state is unreadable; refusing to continue with empty protection state. "
+            + "; ".join(errors)
+        )
 
 
 def save_state(state: Dict[str, Any]) -> None:
     payload = json.dumps(state, indent=2, sort_keys=True)
     with _STATE_LOCK:
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temporary = STATE_PATH.with_name(
-            f"{STATE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-        )
-        try:
-            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, STATE_PATH)
-        finally:
-            if temporary.exists():
-                temporary.unlink(missing_ok=True)
+        for destination in (STATE_PATH, _state_backup_path()):
+            temporary = destination.with_name(
+                f"{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            try:
+                with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                for attempt in range(5):
+                    try:
+                        os.replace(temporary, destination)
+                        break
+                    except PermissionError:
+                        if attempt == 4:
+                            raise
+                        # Windows scanners/indexers can briefly hold a JSON
+                        # destination after it is replaced. Keep the atomic
+                        # write and retry the replace instead of losing state.
+                        time.sleep(0.02 * (2 ** attempt))
+            finally:
+                if temporary.exists():
+                    temporary.unlink(missing_ok=True)
 
 
 def _learning_profile(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -141,7 +173,27 @@ def _learning_key(features: Dict[str, Any]) -> str:
     direction = str(features.get("direction") or "").upper()
     keywords = ",".join(sorted(str(x).lower() for x in (features.get("keywords") or []))) or "plain"
     dte_bucket = str(features.get("dte_bucket") or "na")
-    return "|".join([asset, action, direction or "na", keywords, dte_bucket])
+    strategy = str(features.get("strategy") or "plain").lower()
+    order_type = str(features.get("order_type") or "na").upper()
+    contract_status = str(features.get("contract_status") or "na").upper()
+    semantic_fields = ",".join(
+        sorted(str(value).lower() for value in (features.get("semantic_fields") or []))
+    ) or "none"
+    leg_count = str(features.get("leg_count") or 1)
+    return "|".join(
+        [
+            asset,
+            action,
+            direction or "na",
+            strategy,
+            order_type,
+            contract_status,
+            f"legs:{leg_count}",
+            semantic_fields,
+            keywords,
+            dte_bucket,
+        ]
+    )
 
 
 @_state_mutation
@@ -164,6 +216,11 @@ def record_learning_event(features: Dict[str, Any], outcome: Dict[str, Any], lim
             "direction": str(features.get("direction") or "").upper(),
             "keywords": list(features.get("keywords") or []),
             "dte_bucket": str(features.get("dte_bucket") or "na"),
+            "strategy": str(features.get("strategy") or "plain"),
+            "order_type": str(features.get("order_type") or "na").upper(),
+            "contract_status": str(features.get("contract_status") or "na").upper(),
+            "semantic_fields": list(features.get("semantic_fields") or []),
+            "leg_count": int(features.get("leg_count") or 1),
             "seen": 0,
             "approved": 0,
             "blocked": 0,
@@ -328,17 +385,40 @@ def get_option_validation_summary(limit: int = 250) -> Dict[str, Any]:
 
 
 @_state_mutation
-def add_pending_buy(symbol: str, qty: float, order_id: str) -> None:
+def add_pending_buy(
+    symbol: str,
+    qty: float,
+    order_id: str,
+    stop_loss_pct: float = 1.0,
+    protected_qty: float = 0.0,
+    take_profit_pct: float = 10.0,
+) -> None:
     if not order_id:
         return
     state = load_state()
     pending = state.setdefault("pending_buy_orders", {})
+    previous = pending.get(order_id) or {}
     pending[order_id] = {
         "symbol": symbol.upper(),
         "qty": float(qty),
         "order_id": order_id,
+        "stop_loss_pct": max(0.0, float(stop_loss_pct)),
+        "take_profit_pct": max(0.0, float(take_profit_pct)),
+        "protected_qty": max(
+            float(previous.get("protected_qty") or 0), float(protected_qty)
+        ),
         "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
+    save_state(state)
+
+
+@_state_mutation
+def update_pending_buy_protected_qty(order_id: str, protected_qty: float) -> None:
+    state = load_state()
+    item = state.setdefault("pending_buy_orders", {}).get(str(order_id or ""))
+    if not item:
+        return
+    item["protected_qty"] = max(0.0, float(protected_qty))
     save_state(state)
 
 
@@ -439,12 +519,141 @@ def list_pending_option_orders() -> List[Dict[str, Any]]:
 
 
 @_state_mutation
+def add_pending_exit_order(order: Dict[str, Any]) -> None:
+    """Persist a submitted broker exit until its actual fills are reconciled."""
+    order_id = str(order.get("order_id") or "")
+    if not order_id:
+        return
+    state = load_state()
+    pending = state.setdefault("pending_exit_orders", {})
+    previous = pending.get(order_id) or {}
+    item = dict(previous)
+    item.update(order)
+    item["order_id"] = order_id
+    item["asset_type"] = str(item.get("asset_type") or "equity").lower()
+    raw_symbol = str(item.get("symbol") or "")
+    item["symbol"] = (
+        raw_symbol if item["asset_type"] == "option_mleg" else raw_symbol.upper()
+    )
+    item["requested_qty"] = max(0.0, float(item.get("requested_qty") or 0))
+    item["reconciled_qty"] = max(0.0, float(previous.get("reconciled_qty") or 0))
+    item.setdefault("created_at", _utcstamp())
+    pending[order_id] = item
+    save_state(state)
+
+
+@_state_mutation
+def update_pending_exit_order(order_id: str, **updates: Any) -> None:
+    state = load_state()
+    item = state.setdefault("pending_exit_orders", {}).get(str(order_id or ""))
+    if not item:
+        return
+    item.update(updates)
+    item["updated_at"] = _utcstamp()
+    save_state(state)
+
+
+@_state_mutation
+def remove_pending_exit_order(order_id: str) -> None:
+    state = load_state()
+    state.setdefault("pending_exit_orders", {}).pop(str(order_id or ""), None)
+    save_state(state)
+
+
+def list_pending_exit_orders() -> List[Dict[str, Any]]:
+    return list((load_state().get("pending_exit_orders") or {}).values())
+
+
+@_state_mutation
+def add_pending_option_entry_order(order: Dict[str, Any]) -> None:
+    order_id = str(order.get("order_id") or "")
+    if not order_id:
+        return
+    state = load_state()
+    pending = state.setdefault("pending_option_entry_orders", {})
+    previous = pending.get(order_id) or {}
+    item = dict(previous)
+    item.update(order)
+    item["order_id"] = order_id
+    item["occ_symbol"] = str(item.get("occ_symbol") or "").upper()
+    item["requested_qty"] = max(0.0, float(item.get("requested_qty") or 0))
+    item["reconciled_qty"] = max(0.0, float(previous.get("reconciled_qty") or 0))
+    item.setdefault("created_at", _utcstamp())
+    pending[order_id] = item
+    save_state(state)
+
+
+@_state_mutation
+def update_pending_option_entry_order(order_id: str, **updates: Any) -> None:
+    state = load_state()
+    item = state.setdefault("pending_option_entry_orders", {}).get(str(order_id or ""))
+    if not item:
+        return
+    item.update(updates)
+    item["updated_at"] = _utcstamp()
+    save_state(state)
+
+
+@_state_mutation
+def remove_pending_option_entry_order(order_id: str) -> None:
+    state = load_state()
+    state.setdefault("pending_option_entry_orders", {}).pop(str(order_id or ""), None)
+    save_state(state)
+
+
+def list_pending_option_entry_orders() -> List[Dict[str, Any]]:
+    return list((load_state().get("pending_option_entry_orders") or {}).values())
+
+
+@_state_mutation
+def add_pending_multi_leg_entry_order(order: Dict[str, Any]) -> None:
+    order_id = str(order.get("order_id") or "")
+    if not order_id:
+        return
+    state = load_state()
+    pending = state.setdefault("pending_multi_leg_entry_orders", {})
+    previous = pending.get(order_id) or {}
+    item = dict(previous)
+    item.update(order)
+    item["order_id"] = order_id
+    item["requested_qty"] = max(0.0, float(item.get("requested_qty") or 0))
+    item["reconciled_qty"] = max(0.0, float(previous.get("reconciled_qty") or 0))
+    item.setdefault("created_at", _utcstamp())
+    pending[order_id] = item
+    save_state(state)
+
+
+@_state_mutation
+def update_pending_multi_leg_entry_order(order_id: str, **updates: Any) -> None:
+    state = load_state()
+    item = state.setdefault("pending_multi_leg_entry_orders", {}).get(str(order_id or ""))
+    if not item:
+        return
+    item.update(updates)
+    item["updated_at"] = _utcstamp()
+    save_state(state)
+
+
+@_state_mutation
+def remove_pending_multi_leg_entry_order(order_id: str) -> None:
+    state = load_state()
+    state.setdefault("pending_multi_leg_entry_orders", {}).pop(str(order_id or ""), None)
+    save_state(state)
+
+
+def list_pending_multi_leg_entry_orders() -> List[Dict[str, Any]]:
+    return list((load_state().get("pending_multi_leg_entry_orders") or {}).values())
+
+
+@_state_mutation
 def upsert_position(
     symbol: str,
     qty: float,
     entry_price: float,
     order_id: str = "",
-    stop_loss_pct: float = 0.5,
+    stop_loss_pct: float = 1.0,
+    take_profit_pct: float = 10.0,
+    side: str = "long",
 ) -> None:
     state = load_state()
     positions = state.setdefault("agent_positions", {})
@@ -452,17 +661,27 @@ def upsert_position(
     previous = positions.get(sym) or {}
     previous_qty = float(previous.get("qty") or 0)
     previous_entry = float(previous.get("entry_price") or 0)
+    # A symbol can only be long or short at once at the broker, so a repeat
+    # upsert always shares the previous entry's side; the side argument only
+    # matters for the very first fill.
+    normalized_side = str(previous.get("side") or side or "long").lower()
+    short_position = normalized_side == "short"
     combined_qty = previous_qty + float(qty)
     if previous_qty > 0 and previous_entry > 0:
         combined_entry = ((previous_entry * previous_qty) + (entry_price * float(qty))) / combined_qty
     else:
         combined_entry = float(entry_price)
-    stop_multiplier = 1 - max(0.0, float(stop_loss_pct)) / 100.0
+    stop_multiplier = 1 + max(0.0, float(stop_loss_pct)) / 100.0 if short_position else 1 - max(0.0, float(stop_loss_pct)) / 100.0
+    target_multiplier = 1 - max(0.0, float(take_profit_pct)) / 100.0 if short_position else 1 + max(0.0, float(take_profit_pct)) / 100.0
     positions[sym] = {
         "symbol": sym,
+        "side": normalized_side,
         "qty": round(combined_qty, 6),
         "entry_price": round(combined_entry, 6),
         "stop_price": round(combined_entry * stop_multiplier, 6),
+        "target_price": round(combined_entry * target_multiplier, 6),
+        "stop_loss_pct": max(0.0, float(stop_loss_pct)),
+        "take_profit_pct": max(0.0, float(take_profit_pct)),
         "last_order_id": order_id,
         "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
@@ -509,11 +728,16 @@ def close_position_with_outcome(
         save_state(state)
         return {}
 
-    pnl_pct = (exit_price - entry_price) / entry_price * 100
-    pnl_value = (exit_price - entry_price) * close_qty
+    short_position = str(current.get("side") or "long").lower() == "short"
+    pnl_pct = (
+        (entry_price - exit_price) if short_position else (exit_price - entry_price)
+    ) / entry_price * 100
+    pnl_value = (
+        (entry_price - exit_price) if short_position else (exit_price - entry_price)
+    ) * close_qty
     outcome = {
         "symbol": sym,
-        "side": "sell_to_close_long",
+        "side": "buy_to_close_short" if short_position else "sell_to_close_long",
         "qty": round(close_qty, 6),
         "entry_price": round(entry_price, 6),
         "exit_price": round(exit_price, 6),
@@ -584,13 +808,6 @@ def _utcstamp() -> str:
     return _utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def _parse_utc(value: str) -> datetime:
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", ""))
-    except Exception:
-        return datetime.min
-
-
 def _today_prefix() -> str:
     return _utcnow().date().isoformat()
 
@@ -627,17 +844,6 @@ def record_signal_event(
         state["signal_events"] = events[-limit:]
     save_state(state)
     return event
-
-
-def is_duplicate_signal(raw_text: str, ttl_minutes: int) -> bool:
-    cutoff = _utcnow() - timedelta(minutes=max(1, int(ttl_minutes)))
-    sig_hash = _signal_hash(raw_text)
-    for event in reversed(load_state().get("signal_events") or []):
-        if event.get("hash") != sig_hash:
-            continue
-        if _parse_utc(event.get("created_at", "")) >= cutoff:
-            return True
-    return False
 
 
 @_state_mutation
@@ -748,6 +954,17 @@ def upsert_option_position(
     target_prices: list[float] | tuple[float, ...] | None = None,
     trailing_stop_pct: float | None = None,
     exit_before_market_close: bool = False,
+    exit_minutes_before_close: int | None = None,
+    exit_if_target_not_hit: bool = False,
+    risk_stop_pct: float | None = None,
+    position_type: str | None = None,
+    maximum_loss_amount: float | None = None,
+    exit_underlying_direction: str | None = None,
+    exit_underlying_price: float | None = None,
+    time_in_force: str | None = None,
+    stop_scope: str | None = None,
+    default_stop_loss_pct: float = 5.0,
+    default_take_profit_pct: float = 10.0,
 ) -> None:
     state = load_state()
     positions = state.setdefault("option_positions", {})
@@ -759,6 +976,39 @@ def upsert_option_position(
         combined_entry = ((previous_entry * previous_qty) + (entry_price * float(qty))) / combined_qty
     else:
         combined_entry = float(entry_price)
+    intent = str(position_intent or previous.get("position_intent") or "buy_to_open")
+    is_short = intent == "sell_to_open"
+    stop_is_explicit = stop_loss is not None or previous.get("stop_loss_source") == "signal"
+    target_is_explicit = target_price is not None or previous.get("target_price_source") == "signal"
+    effective_stop_loss_pct = (
+        float(risk_stop_pct)
+        if risk_stop_pct is not None and float(risk_stop_pct) > 0
+        else float(default_stop_loss_pct)
+    )
+    if stop_loss is not None:
+        resolved_stop = float(stop_loss)
+    elif stop_is_explicit and previous.get("stop_loss") is not None:
+        resolved_stop = float(previous["stop_loss"])
+    else:
+        resolved_stop = combined_entry * (
+            1 + max(0.0, effective_stop_loss_pct) / 100.0
+            if is_short else
+            1 - max(0.0, effective_stop_loss_pct) / 100.0
+        )
+    provided_targets = list(target_prices or [])
+    has_tiered_targets = bool(provided_targets or previous.get("target_prices"))
+    if target_price is not None:
+        resolved_target = float(target_price)
+    elif target_is_explicit and previous.get("target_price") is not None:
+        resolved_target = float(previous["target_price"])
+    elif has_tiered_targets:
+        resolved_target = None
+    else:
+        resolved_target = combined_entry * (
+            1 - max(0.0, float(default_take_profit_pct)) / 100.0
+            if is_short else
+            1 + max(0.0, float(default_take_profit_pct)) / 100.0
+        )
     positions[occ_symbol] = {
         "occ_symbol": occ_symbol,
         "root": root.upper(),
@@ -767,8 +1017,13 @@ def upsert_option_position(
         "expiry_date": expiry_date,
         "qty": round(combined_qty, 6),
         "entry_price": round(combined_entry, 6),
-        "stop_loss": round(float(stop_loss), 6) if stop_loss is not None else previous.get("stop_loss"),
-        "target_price": round(float(target_price), 6) if target_price is not None else previous.get("target_price"),
+        "stop_loss": round(resolved_stop, 6),
+        "stop_loss_source": (
+            "signal" if stop_is_explicit else "signal_percent" if risk_stop_pct else "default_5pct"
+        ),
+        "stop_loss_pct": round(effective_stop_loss_pct, 6),
+        "target_price": round(resolved_target, 6) if resolved_target is not None else None,
+        "target_price_source": "signal" if target_is_explicit else ("tiered" if has_tiered_targets else "default_10pct"),
         "target_prices": [round(float(value), 6) for value in (target_prices or previous.get("target_prices") or [])],
         "target_index": int(previous.get("target_index") or 0),
         "trailing_stop_pct": (
@@ -777,8 +1032,28 @@ def upsert_option_position(
         ),
         "peak_price": max(float(previous.get("peak_price") or 0), float(entry_price or 0)),
         "exit_before_market_close": bool(exit_before_market_close or previous.get("exit_before_market_close")),
+        "exit_minutes_before_close": int(
+            exit_minutes_before_close
+            or previous.get("exit_minutes_before_close")
+            or 15
+        ),
+        "exit_if_target_not_hit": bool(
+            exit_if_target_not_hit or previous.get("exit_if_target_not_hit")
+        ),
+        "position_type": position_type or previous.get("position_type"),
+        "maximum_loss_amount": (
+            round(float(maximum_loss_amount), 2)
+            if maximum_loss_amount is not None else previous.get("maximum_loss_amount")
+        ),
+        "exit_underlying_direction": exit_underlying_direction or previous.get("exit_underlying_direction"),
+        "exit_underlying_price": (
+            round(float(exit_underlying_price), 6)
+            if exit_underlying_price is not None else previous.get("exit_underlying_price")
+        ),
+        "time_in_force": time_in_force or previous.get("time_in_force") or "DAY",
+        "stop_scope": stop_scope or previous.get("stop_scope"),
         "signal_quality": round(float(signal_quality), 2) if signal_quality is not None else previous.get("signal_quality"),
-        "position_intent": str(position_intent or previous.get("position_intent") or "buy_to_open"),
+        "position_intent": intent,
         "last_order_id": order_id,
         "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
@@ -812,60 +1087,115 @@ def list_option_journal(limit: int = 200) -> List[Dict[str, Any]]:
     journal = load_state().get("option_journal") or []
     return list(reversed(journal))[:limit]
 
+
 @_state_mutation
-def enqueue_signal(raw_text: str, user_id: str, channel_id: str, message_id: str, limit: int = 5000) -> Dict[str, Any]:
+def upsert_multi_leg_position(
+    strategy_id: str,
+    root: str,
+    structure: str,
+    legs: list[Dict[str, Any]],
+    qty: float,
+    entry_net_price: float,
+    price_effect: str,
+    order_id: str,
+    stop_loss: float | None = None,
+    target_price: float | None = None,
+    default_stop_loss_pct: float = 5.0,
+    default_take_profit_pct: float = 10.0,
+    maximum_loss_amount: float | None = None,
+) -> None:
     state = load_state()
-    queue = state.setdefault("signal_queue", [])
-    created_at = _utcstamp()
-    item = {
-        "id": hashlib.sha256(
-            f"{channel_id}:{message_id}:{time.time_ns()}:{raw_text}".encode("utf-8")
-        ).hexdigest()[:20],
-        "raw_text": raw_text,
-        "user_id": str(user_id or ""),
-        "channel_id": str(channel_id or ""),
-        "message_id": str(message_id or ""),
-        "created_at": created_at,
+    positions = state.setdefault("multi_leg_positions", {})
+    key = str(strategy_id or order_id or "")
+    if not key:
+        return
+    previous = positions.get(key) or {}
+    previous_qty = float(previous.get("qty") or 0)
+    previous_entry = float(previous.get("entry_net_price") or 0)
+    added_qty = max(0.0, float(qty))
+    combined_qty = previous_qty + added_qty
+    if combined_qty <= 0:
+        return
+    if previous_qty > 0 and previous_entry > 0:
+        combined_entry = (
+            (previous_entry * previous_qty) + (float(entry_net_price) * added_qty)
+        ) / combined_qty
+    else:
+        combined_entry = abs(float(entry_net_price))
+    effect = str(price_effect or previous.get("price_effect") or "debit").lower()
+    short_strategy = effect == "credit"
+    stop = (
+        float(stop_loss)
+        if stop_loss is not None and float(stop_loss) > 0
+        else combined_entry * (
+            1 + max(0.0, float(default_stop_loss_pct)) / 100.0
+            if short_strategy else
+            1 - max(0.0, float(default_stop_loss_pct)) / 100.0
+        )
+    )
+    target = (
+        float(target_price)
+        if target_price is not None and float(target_price) > 0
+        else combined_entry * (
+            1 - max(0.0, float(default_take_profit_pct)) / 100.0
+            if short_strategy else
+            1 + max(0.0, float(default_take_profit_pct)) / 100.0
+        )
+    )
+    positions[key] = {
+        "strategy_id": key,
+        "root": str(root or "").upper(),
+        "structure": str(structure or "multi_leg"),
+        "legs": list(legs or previous.get("legs") or []),
+        "qty": round(combined_qty, 6),
+        "entry_net_price": round(combined_entry, 6),
+        "price_effect": effect,
+        "stop_loss": round(stop, 6),
+        "target_price": round(target, 6),
+        "maximum_loss_amount": (
+            float(maximum_loss_amount)
+            if maximum_loss_amount is not None and float(maximum_loss_amount) > 0
+            else previous.get("maximum_loss_amount")
+        ),
+        "last_order_id": str(order_id or ""),
+        "updated_at": _utcstamp(),
     }
-    queue.append(item)
-    if len(queue) > limit:
-        state["signal_queue"] = queue[-limit:]
     save_state(state)
-    return item
 
 
 @_state_mutation
-def claim_next_signal() -> Dict[str, Any]:
+def reduce_or_remove_multi_leg_position(strategy_id: str, qty: float) -> None:
     state = load_state()
-    processing = state.get("processing_signal")
-    if processing:
-        started = _parse_utc(processing.get("started_at", ""))
-        if started >= _utcnow() - timedelta(minutes=10):
-            return {}
-        state["processing_signal"] = None
-    queue = state.setdefault("signal_queue", [])
-    if not queue:
-        save_state(state)
-        return {}
-    item = dict(queue.pop(0))
-    item["started_at"] = _utcstamp()
-    state["processing_signal"] = item
+    positions = state.setdefault("multi_leg_positions", {})
+    key = str(strategy_id or "")
+    current = positions.get(key)
+    if not current:
+        return
+    remaining = float(current.get("qty") or 0) - max(0.0, float(qty))
+    if remaining <= 0:
+        positions.pop(key, None)
+    else:
+        current["qty"] = round(remaining, 6)
+        current["updated_at"] = _utcstamp()
     save_state(state)
-    return item
 
 
 @_state_mutation
-def complete_signal(signal_id: str) -> None:
+def remove_multi_leg_position(strategy_id: str) -> None:
     state = load_state()
-    processing = state.get("processing_signal") or {}
-    if not signal_id or str(processing.get("id")) == str(signal_id):
-        state["processing_signal"] = None
+    state.setdefault("multi_leg_positions", {}).pop(str(strategy_id or ""), None)
     save_state(state)
 
 
-def queue_depth() -> int:
-    state = load_state()
-    return len(state.get("signal_queue") or []) + (1 if state.get("processing_signal") else 0)
+def list_multi_leg_positions() -> List[Dict[str, Any]]:
+    return list((load_state().get("multi_leg_positions") or {}).values())
+
+
+# NOTE: the incoming-signal queue itself lives in durable_signal_queue.py (SQLite,
+# WAL mode, retry/backoff/dead-letter). This module intentionally has no
+# enqueue/claim/complete-signal functions -- an earlier JSON-based version of
+# that queue was removed from here since discord_agent.py and whatsapp_webhook.py
+# only ever imported the SQLite one.
 
 
 @_state_mutation

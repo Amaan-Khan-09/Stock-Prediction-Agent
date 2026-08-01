@@ -42,7 +42,6 @@ def _equity_cases() -> list[Expected]:
         ),
         "SELL": (
             "SELL {s} QTY {q}",
-            "Short ${s} {q} shares",
             "🔴 SELL **{s}** quantity: {q}",
             "Exit {s} position, {q} shares",
             "Reduce #{s} qty={q}",
@@ -77,6 +76,7 @@ def _equity_cases() -> list[Expected]:
         )
         cases.extend(
             (
+                Expected(f"Short ${symbol} {qty} shares", "EQUITY", symbol, "SELL_SHORT"),
                 Expected(f"\U0001f7e2 {symbol} qty {qty}", "EQUITY", symbol, "BUY"),
                 Expected(f"\U0001f534 {symbol} qty {qty}", "EQUITY", symbol, "SELL"),
                 Expected(f"\U0001f7e1 {symbol}", "EQUITY", symbol, "HOLD"),

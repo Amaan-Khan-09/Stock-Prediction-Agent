@@ -68,3 +68,55 @@ class TestBuildShortPutPayload:
         for leg in payload.legs:
             assert leg.days_until_expiration == 30
             assert leg.delta == 20
+
+
+class TestBuildCustomLegsPayloadNoneSafety:
+    """Regression tests: a caller passing a key with an explicit None/"" value
+    (not omitting the key) previously raised TypeError/ValueError from a bare
+    int(leg_dict.get("delta", 30))-style cast, since dict.get()'s default only
+    applies when the key is absent, not when its value is None.
+    """
+
+    def test_explicit_none_delta_does_not_raise(self):
+        payload = build_custom_legs_payload(
+            "SPY", "2021-01-01", "2024-01-01",
+            [{"type": "equity-option", "direction": "short", "side": "put", "delta": None}],
+        )
+        assert payload.legs[0].delta == 30  # falls back to default
+
+    def test_explicit_none_strike_does_not_raise(self):
+        payload = build_custom_legs_payload(
+            "SPY", "2021-01-01", "2024-01-01",
+            [{"type": "equity-option", "direction": "short", "side": "put",
+              "strikeSelection": "strike", "strike": None}],
+        )
+        assert payload.legs[0].strike_price is None
+
+    def test_empty_string_quantity_and_dte_do_not_raise(self):
+        payload = build_custom_legs_payload(
+            "SPY", "2021-01-01", "2024-01-01",
+            [{"type": "equity-option", "direction": "short", "side": "put",
+              "quantity": "", "daysUntilExpiration": ""}],
+        )
+        assert payload.legs[0].quantity == 1
+        assert payload.legs[0].days_until_expiration == 45
+
+    def test_explicit_none_type_and_direction_fall_back_to_defaults(self):
+        payload = build_custom_legs_payload(
+            "SPY", "2021-01-01", "2024-01-01",
+            [{"type": None, "direction": None, "side": None}],
+        )
+        leg = payload.legs[0]
+        assert leg.type == "equity-option"
+        assert leg.direction == "short"
+        assert leg.side == "put"
+
+    def test_valid_values_still_pass_through_unchanged(self):
+        payload = build_custom_legs_payload(
+            "SPY", "2021-01-01", "2024-01-01",
+            [{"type": "equity-option", "direction": "long", "side": "call",
+              "quantity": 3, "daysUntilExpiration": 60, "delta": 45}],
+        )
+        leg = payload.legs[0]
+        assert leg.direction == "long" and leg.side == "call"
+        assert leg.quantity == 3 and leg.days_until_expiration == 60 and leg.delta == 45

@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
+from jsonl_store import append_jsonl
 from recommendation_accuracy_engine import evaluate_feature_versions, evaluate_recommendation_accuracy
 
 
@@ -60,8 +61,7 @@ class UnifiedEvaluationObject:
 
 
 def _append_jsonl(path: str, payload: Dict[str, Any]) -> None:
-    with open(path, "a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    append_jsonl(path, payload)
 
 
 def load_decision_memory(limit: Optional[int] = None, *, as_of_date: Optional[Any] = None) -> List[Dict[str, Any]]:
@@ -1988,13 +1988,12 @@ def run_multi_horizon_backtest(
 def store_evaluation_results(rows: Iterable[Dict[str, Any]], *, metadata: Optional[Dict[str, Any]] = None) -> None:
     os.makedirs(os.path.dirname(EVALUATION_RUNS_PATH), exist_ok=True)
     stamp = datetime.now(timezone.utc).isoformat()
-    with open(EVALUATION_RUNS_PATH, "a", encoding="utf-8") as file:
-        for row in rows:
-            obj = dict(row)
-            obj["logged_at"] = stamp
-            if metadata:
-                obj["metadata"] = metadata
-            file.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    for row in rows:
+        obj = dict(row)
+        obj["logged_at"] = stamp
+        if metadata:
+            obj["metadata"] = metadata
+        append_jsonl(EVALUATION_RUNS_PATH, obj)
 
 
 def load_evaluation_runs(path: str = EVALUATION_RUNS_PATH, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -4294,8 +4293,7 @@ def store_institutional_run(result: Dict[str, Any]) -> None:
         "performance_audit": result.get("performance_audit"),
         "institutional_report": result.get("institutional_report"),
     }
-    with open(INSTITUTIONAL_RUNS_PATH, "a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    append_jsonl(INSTITUTIONAL_RUNS_PATH, payload)
 
 
 def run_factor_research(

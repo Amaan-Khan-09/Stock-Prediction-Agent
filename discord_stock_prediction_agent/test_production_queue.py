@@ -114,6 +114,27 @@ def test_atomic_state_and_duplicate_trade_queues() -> None:
             state_store.STATE_PATH = original_path
 
 
+def test_state_recovers_from_backup_and_never_silently_resets() -> None:
+    with TemporaryDirectory() as tmp:
+        original_path = state_store.STATE_PATH
+        state_store.STATE_PATH = Path(tmp) / "agent_state.json"
+        try:
+            state_store.record_order_event({"symbol": "AAPL", "status": "filled"})
+            state_store.STATE_PATH.write_text("{broken", encoding="utf-8")
+            recovered = state_store.load_state()
+            _check(len(recovered.get("order_events") or []) == 1, "backup state recovered")
+
+            state_store._state_backup_path().write_text("{also-broken", encoding="utf-8")
+            try:
+                state_store.load_state()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("corrupt primary and backup must stop instead of resetting state")
+        finally:
+            state_store.STATE_PATH = original_path
+
+
 def run_all() -> None:
     test_durable_queue_concurrency()
     print("PASS durable queue: 500 concurrent signals, unique claims, cleanup")
@@ -121,6 +142,8 @@ def run_all() -> None:
     print("PASS retry/dead-letter and restart recovery")
     test_atomic_state_and_duplicate_trade_queues()
     print("PASS atomic JSON state and duplicate queued equity trades")
+    test_state_recovers_from_backup_and_never_silently_resets()
+    print("PASS agent-state backup recovery and fail-closed corruption handling")
     print("PRODUCTION QUEUE TESTS PASSED")
 
 

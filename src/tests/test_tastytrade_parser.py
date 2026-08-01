@@ -35,12 +35,15 @@ def _make_stats(total_pl: str = "1500") -> dict:
 
 class TestParseBacktestResult:
     def test_valid_response_parsed_correctly(self):
+        # Tastytrade API nests trials/statistics under "results" key — top level holds metadata
         raw = {
             "status": "complete",
             "symbol": "SPY",
             "legs": [{"type": "equity-option"}],
-            "trials": [_make_trial("250.00"), _make_trial("-80.00")],
-            "statistics": _make_stats("170"),
+            "results": {
+                "trials": [_make_trial("250.00"), _make_trial("-80.00")],
+                "statistics": _make_stats("170"),
+            },
         }
         result = parse_backtest_result("abc123", raw)
         assert result.backtest_id == "abc123"
@@ -52,8 +55,10 @@ class TestParseBacktestResult:
         raw = {
             "status": "complete",
             "legs": [{"type": "unknown"}],
-            "trials": [_make_trial("0")],
-            "statistics": _make_stats("0"),
+            "results": {
+                "trials": [_make_trial("0")],
+                "statistics": _make_stats("0"),
+            },
         }
         result = parse_backtest_result("bad1", raw)
         assert result.leg_type == "unknown"
@@ -62,10 +67,12 @@ class TestParseBacktestResult:
         raw = {
             "status": "complete",
             "legs": [{"type": "equity-option"}],
-            "trials": [_make_trial("100"), _make_trial("-50")],
+            "results": {
+                "trials": [_make_trial("100"), _make_trial("-50")],
+            },
         }
         result = parse_backtest_result("xyz", raw)
-        # Should either compute from trials or return None
+        # No statistics in results → should compute from trials
         assert result.statistics is None or result.statistics.num_trades == 2
 
 

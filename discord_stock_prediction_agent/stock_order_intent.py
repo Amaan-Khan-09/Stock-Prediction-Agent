@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
+from .symbol_directory import resolve_cached_symbol
+
 
 _NUMBER = r"(\d+(?:\.\d+)?)"
 _MONEY = r"\$?\s*([\d,]+(?:\.\d+)?)"
@@ -43,9 +45,22 @@ def _search(pattern: str, text: str) -> Optional[re.Match[str]]:
 
 def _symbol(text: str) -> str:
     tokens = re.findall(r"\b[A-Z][A-Z0-9.]{0,11}\b", text.upper())
+    # Check the small hardcoded list first (works even with an empty/stale
+    # Alpaca symbol cache).
     for token in tokens:
         if token in _KNOWN_SYMBOLS:
             return token
+    # Then the live ~14k-symbol Alpaca directory, so any actively tradable
+    # ticker resolves correctly, not just the ~30 names above -- but only for
+    # tokens outside the blocklist. Some blocklisted words (ALL, NOW, ON,
+    # OPEN, GO, ...) are themselves real single/short tickers; in a trading
+    # signal they're overwhelmingly ordinary English syntax ("sell ALL my
+    # shares"), so the blocklist must still win over an incidental symbol hit.
+    for token in tokens:
+        if token not in _NON_SYMBOL_WORDS:
+            resolved = resolve_cached_symbol(token)
+            if resolved:
+                return resolved
     for token in tokens:
         if token not in _NON_SYMBOL_WORDS and 1 <= len(token) <= 5:
             return token
@@ -345,21 +360,39 @@ def _parse_post_fill_oco(text: str) -> Optional[dict[str, Any]]:
     }
 
 
+_ACTION_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("BUY TO COVER ", "BUY_TO_COVER"),
+    ("COVER ", "BUY_TO_COVER"),
+    ("SHORT SELL ", "SELL_SHORT"),
+    ("SELL SHORT ", "SELL_SHORT"),
+    ("GO SHORT ", "SELL_SHORT"),
+    ("SHORT ", "SELL_SHORT"),
+    ("ENTER LONG ", "BUY"),
+    ("PURCHASE ", "BUY"),
+    ("BUY ", "BUY"),
+    ("SELL ", "SELL"),
+)
+
+
 def _parse_generic(text: str) -> Optional[dict[str, Any]]:
     upper = re.sub(r"\s+", " ", text.upper().replace(",", "")).strip()
-    symbol = _symbol(upper)
-    if not symbol:
+
+    action = ""
+    remainder = upper
+    for prefix, mapped in _ACTION_PREFIXES:
+        if upper.startswith(prefix):
+            action = mapped
+            remainder = upper[len(prefix):]
+            break
+    if not action:
         return None
 
-    if upper.startswith("BUY TO COVER ") or upper.startswith("COVER "):
-        action = "BUY_TO_COVER"
-    elif upper.startswith("SHORT ") or upper.startswith("GO SHORT "):
-        action = "SELL_SHORT"
-    elif upper.startswith(("BUY ", "PURCHASE ", "ENTER LONG ")):
-        action = "BUY"
-    elif upper.startswith("SELL "):
-        action = "SELL"
-    else:
+    # Scan the text *after* the action phrase first, so a real ticker never
+    # loses to an action keyword like GO/ENTER/LONG/SHORT (e.g. "GO SHORT
+    # RIVN..." must resolve to RIVN, not the literal word "GO", which happens
+    # to also be a real ticker).
+    symbol = _symbol(remainder) or _symbol(upper)
+    if not symbol:
         return None
 
     result: dict[str, Any] = {"asset_type": "STOCK", "action": action, "symbol": symbol}

@@ -48,8 +48,10 @@ _RETURN_CLAMP_MIN  = -20.0
 def _get_horizon_thresholds(horizon_days: int) -> Tuple[float, float]:
     """Return (buy_threshold, sell_threshold) calibrated to prediction horizon."""
     if horizon_days <= 10:
-        return 1.25, -1.25
+        return 1.0, -1.0
     elif horizon_days <= 30:
+        return 1.5, -1.5
+    elif horizon_days <= 60:
         return 2.0, -2.0
     else:
         return 2.5, -2.5
@@ -195,6 +197,14 @@ def build_stock_feature_packet(
     ctx_start    = str(normalized_input.get("historical_context_start_date", "") or "")
     origin_str   = str(normalized_input.get("prediction_origin_date", "") or "")
 
+    # Effective context start = first bar actually present (may be later than requested)
+    _first_bar_date = ""
+    for _b in ai_visible_bars:
+        _bd = str(_b.get("date") or _b.get("datetime") or "")
+        if _bd:
+            _first_bar_date = _bd[:10]
+            break
+
     # Returns
     r1d   = _period_return(closes, 1)
     r5d   = _period_return(closes, 5)
@@ -283,8 +293,12 @@ def build_stock_feature_packet(
     reversal_risk = "low"
     if oversold_signal and near_support and r60d is not None and r60d < -20:
         reversal_risk = "high"
+    elif overbought_signal and near_resistance and r20d is not None and r20d > 10:
+        reversal_risk = "high"   # extreme overbought surge near resistance → high reversal risk
     elif oversold_signal or (near_support and r20d is not None and r20d < -10):
         reversal_risk = "medium"
+    elif overbought_signal and near_resistance:
+        reversal_risk = "medium"  # overbought + at resistance → medium reversal risk
 
     dq = 100
     if n < 20:   dq -= 40
@@ -299,7 +313,9 @@ def build_stock_feature_packet(
         "benchmark":           normalized_input.get("benchmark", ""),
         "price_basis":         price_basis,
         "origin_price":        round(origin_price, 4),
-        "ctx_start":           ctx_start,
+        "requested_ctx_start": ctx_start,
+        "effective_ctx_start": _first_bar_date or ctx_start,
+        "ctx_start":           _first_bar_date or ctx_start,
         "origin_date":         origin_str,
         "horizon_days":        normalized_input.get("decision_horizon_days", 30),
         "returns": {
@@ -429,23 +445,112 @@ def build_calibration_summary(symbol: str = "", horizon_days: int = 0) -> dict:
     ][-5:]
 
     if overpred > underpred * 1.5:
-        bias_note = "Model has SELL bias — overpredicts downside. Consider adjusting toward neutral/BUY."
+        _dir_bias = "Model has SELL bias — overpredicts downside. Consider adjusting toward neutral/BUY."
     elif underpred > overpred * 1.5:
-        bias_note = "Model has BUY bias — underpredicts downside."
+        _dir_bias = "Model has BUY bias — underpredicts downside."
     else:
-        bias_note = "No strong directional bias detected."
+        _dir_bias = "No strong BUY/SELL directional bias detected."
 
-    return {
+    # ── Failure category analysis ─────────────────────────────────────────
+    hold_count  = sum(1 for r in records
+                      if (r.get("ai_prediction", {}).get("decision") or "").upper() == "HOLD")
+    hold_rate   = round(hold_count / total * 100, 1)
+
+    # bias_note now includes HOLD bias if applicable
+    if hold_rate > 55:
+        bias_note = f"{_dir_bias} HOLD bias CRITICAL: {hold_rate}% HOLD rate — model over-selects neutral."
+    elif hold_rate > 45:
+        bias_note = f"{_dir_bias} HOLD bias WARNING: {hold_rate}% HOLD rate — above ideal range."
+    else:
+        bias_note = _dir_bias
+
+    false_buy_count  = 0
+    false_sell_count = 0
+    over_hold_count  = 0
+    wrong_magnitude  = 0
+    trend_reversal   = 0
+
+    for r in records:
+        ai_dec  = (r.get("ai_prediction", {}).get("decision") or "").upper()
+        act_dec = (r.get("actual_validation", {}).get("actual_decision") or "").upper()
+        if ai_dec == act_dec:
+            continue
+        if ai_dec == "HOLD" and act_dec in ("BUY", "SELL"):
+            over_hold_count += 1
+        elif ai_dec == "BUY" and act_dec == "SELL":
+            actual_ret = r.get("actual_validation", {}).get("actual_return_pct")
+            if actual_ret is not None and float(actual_ret) < -5:
+                trend_reversal += 1
+            else:
+                false_buy_count += 1
+        elif ai_dec == "SELL" and act_dec == "BUY":
+            false_sell_count += 1
+
+    top_failure = "NONE"
+    failure_counts = {
+        "OVER_HOLD":      over_hold_count,
+        "FALSE_BUY":      false_buy_count,
+        "FALSE_SELL":     false_sell_count,
+        "WRONG_MAGNITUDE":wrong_magnitude,
+        "TREND_REVERSAL_MISSED": trend_reversal,
+    }
+    if any(v > 0 for v in failure_counts.values()):
+        top_failure = max(failure_counts, key=failure_counts.get)
+
+    hold_warning = ""
+    if hold_rate > 55:
+        hold_warning = (
+            f"CRITICAL: HOLD rate is {hold_rate}% — you are severely over-selecting HOLD. "
+            "Commit to BUY or SELL when indicators clearly agree."
+        )
+    elif hold_rate > 45:
+        hold_warning = (
+            f"CAUTION: HOLD rate is {hold_rate}% — you are over-selecting HOLD. "
+            "Commit to BUY or SELL when indicators clearly agree."
+        )
+
+    cal_summary = {
         "total_validated_records": total,
         "decision_match_pct":     round(dec_ok / total * 100, 1),
         "direction_match_pct":    round(dir_ok / total * 100, 1),
         "avg_return_error_pp":    avg_ret_err,
         "overprediction_rate":    round(overpred / total * 100, 1),
         "underprediction_rate":   round(underpred / total * 100, 1),
+        "hold_rate_pct":          hold_rate,
+        "false_buy_count":        false_buy_count,
+        "false_sell_count":       false_sell_count,
+        "over_hold_count":        over_hold_count,
+        "trend_reversal_missed":  trend_reversal,
+        "top_failure_reason":     top_failure,
         "symbol_record_count":    len(sym_records),
         "recent_conflicts":       recent_conflicts,
         "bias_note":              bias_note,
+        "hold_rate_warning":      hold_warning,
     }
+    # Enrich with per-symbol calibration profile if available
+    cal_profile_path = ROOT / "data" / "calibration_profiles.json"
+    if cal_profile_path.exists() and symbol:
+        try:
+            cal_profiles = json.loads(cal_profile_path.read_text(encoding="utf-8"))
+            sym_profile  = cal_profiles.get("profiles", {}).get(symbol, {})
+            if sym_profile.get("calibration_available"):
+                cal_summary["symbol_calibration"] = {
+                    "match_pct":            sym_profile.get("match_pct"),
+                    "hold_rate_pct":        sym_profile.get("hold_rate_pct"),
+                    "false_buy_rate_pct":   sym_profile.get("false_buy_rate_pct"),
+                    "false_sell_rate_pct":  sym_profile.get("false_sell_rate_pct"),
+                    "avg_return_error_pp":  sym_profile.get("avg_return_error_pp"),
+                    "top_failure_categories": sym_profile.get("top_failure_categories", []),
+                    "volatility_warning":   sym_profile.get("volatility_warning"),
+                    "news_earnings_warning":sym_profile.get("news_earnings_warning"),
+                    "calibration_summary":  sym_profile.get("calibration_summary", ""),
+                }
+        except Exception as exc:
+            # Degrade gracefully (a malformed calibration file must never break
+            # prediction) but don't hide that this enrichment was skipped --
+            # callers can surface it instead of silently looking complete.
+            cal_summary["symbol_calibration_error"] = f"{type(exc).__name__}: {exc}"
+    return cal_summary
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -488,8 +593,12 @@ def _compute_signal_scores(feature_packet: dict) -> dict:
             signals.append((1.0, 0.0, 0.0))
         elif 30 < rsi <= 45:
             signals.append((0.0, 1.0, 0.0))
+        elif rsi >= 78:
+            signals.append((0.0, 0.5, 0.5))   # extreme overbought → bearish lean + high uncertainty
         elif rsi >= 70:
-            signals.append((0.5, 0.0, 0.5))   # overbought → uncertain
+            signals.append((0.3, 0.0, 0.7))   # overbought → mostly uncertain, mild bull caution
+        elif rsi <= 22:
+            signals.append((0.5, 0.0, 0.5))   # extreme oversold → bullish lean + high uncertainty
         elif rsi <= 30:
             signals.append((0.0, 0.4, 0.6))   # oversold → uncertain (reversal risk)
         else:
@@ -510,12 +619,18 @@ def _compute_signal_scores(feature_packet: dict) -> dict:
         else:
             signals.append((0.0, 0.0, 1.0))
 
-    # 4. Recent returns (20d + 60d)
+    # 4. Recent returns (20d + 60d) — stronger conviction when both agree strongly
     r20 = returns.get("return_20d")
     r60 = returns.get("return_60d")
     if r20 is not None and r60 is not None:
-        if r20 > 3 and r60 > 5:
+        if r20 > 5 and r60 > 8:          # very strong uptrend
             signals.append((1.0, 0.0, 0.0))
+            signals.append((1.0, 0.0, 0.0))  # double weight for strong consensus
+        elif r20 > 3 and r60 > 5:
+            signals.append((1.0, 0.0, 0.0))
+        elif r20 < -5 and r60 < -8:      # very strong downtrend
+            signals.append((0.0, 1.0, 0.0))
+            signals.append((0.0, 1.0, 0.0))  # double weight for strong consensus
         elif r20 < -3 and r60 < -5:
             signals.append((0.0, 1.0, 0.0))
         elif r20 > 1:
@@ -585,55 +700,113 @@ def _apply_guardrails(
     data_quality_score: int,
     horizon_days: int = 30,
     signal_scores: Optional[dict] = None,
+    reversal_risk: str = "low",
+    rsi: Optional[float] = None,
 ) -> Tuple[str, str]:
-    """Deterministic post-Gemini guardrails with horizon-calibrated thresholds.
-    Risk score NEVER creates SELL. HOLD can be overridden by strong signal consensus.
-    """
+    """Deterministic post-Gemini guardrails — signal scores now gate BUY/SELL."""
+    # Gate 1: data quality
     if data_quality_score < 60:
         return "REVIEW", f"Data quality too low ({data_quality_score}/100) — insufficient data."
-    if confidence_score < 50:
+
+    # Gate 2: confidence
+    if confidence_score < 45:   # was 55
         return "REVIEW", f"Confidence too low ({confidence_score}/100) — mixed signals."
 
+    # Gate 3: high uncertainty blocks directional decisions
+    uncert_s = (signal_scores or {}).get("uncertainty_score", 50)
+    if uncert_s > 80 and confidence_score < 50:   # was >70 and <65
+        return "REVIEW", f"Uncertainty too high ({uncert_s}/100) — needs human review."
+
     buy_thr, sell_thr = _get_horizon_thresholds(horizon_days)
+    bull_s = (signal_scores or {}).get("bullish_score", 50)
+    bear_s = (signal_scores or {}).get("bearish_score", 50)
+
+    # Strong consensus override: when bear/bull score is overwhelming (>=70),
+    # lower the uncertainty barrier so clear trending markets don't get stuck in HOLD.
+    _strong_bear = signal_scores and bear_s >= 70 and (bear_s - bull_s) >= 25
+    _strong_bull = signal_scores and bull_s >= 70 and (bull_s - bear_s) >= 25
+    _uncert_limit = 55 if (_strong_bear or _strong_bull) else 75
 
     if predicted_return_pct >= buy_thr:
-        decision, reason = "BUY",  (
-            f"Predicted return {predicted_return_pct:+.2f}% >= +{buy_thr}% BUY threshold "
-            f"({horizon_days}d horizon)."
-        )
-    elif predicted_return_pct <= sell_thr:
-        decision, reason = "SELL", (
-            f"Predicted return {predicted_return_pct:+.2f}% <= {sell_thr}% SELL threshold "
-            f"({horizon_days}d horizon)."
-        )
-    else:
-        decision, reason = "HOLD", (
-            f"Return {predicted_return_pct:+.2f}% in HOLD band (±{abs(sell_thr):.2f}% "
-            f"for {horizon_days}d horizon)."
-        )
-
-    # Post-Gemini HOLD override: strong signal consensus + confidence overrides weak HOLD
-    if decision == "HOLD" and signal_scores and confidence_score >= 60:
-        dominant   = signal_scores.get("dominant", "uncertain")
-        dom_score  = signal_scores.get("dominant_score", 0)
-        near_thr   = abs(predicted_return_pct) >= abs(sell_thr) * 0.75
-        if dominant == "bullish" and dom_score >= 65 and near_thr:
-            decision = "BUY"
+        # BUY requires signal confirmation
+        if signal_scores and bull_s >= 45 and (bull_s - bear_s) >= 5 and uncert_s <= _uncert_limit:
+            # Gate 4: overbought reversal block — only for SHORT horizons (≤ 45 days)
+            # For horizons > 45 days overbought conditions in strong trends continue more often than reverse.
+            _rsi_str = f"{round(rsi, 1)}" if rsi is not None else "N/A"
+            if reversal_risk == "high" and horizon_days <= 45:
+                decision = "REVIEW"
+                reason   = (
+                    f"BUY blocked → REVIEW: reversal_risk=high "
+                    f"(RSI={_rsi_str}, overbought+near_resistance, horizon={horizon_days}d ≤ 45). "
+                    f"Short-horizon overbought reversal risk overrides bullish signals. Needs human review."
+                )
+            elif reversal_risk == "medium" and rsi is not None and rsi >= 75 and horizon_days <= 45:
+                decision = "HOLD"
+                reason   = (
+                    f"BUY→HOLD: reversal_risk=medium, RSI={_rsi_str} (>=75). "
+                    f"Overbought conditions near resistance require caution."
+                )
+            else:
+                decision = "BUY"
+                reason   = (
+                    f"Predicted return {predicted_return_pct:+.2f}% >= +{buy_thr}% BUY threshold "
+                    f"({horizon_days}d). Bullish score {bull_s}/100 confirms."
+                )
+        else:
+            decision = "HOLD"
             reason   = (
-                f"HOLD→BUY override: bullish signals {dom_score}/100, "
-                f"return {predicted_return_pct:+.2f}% near threshold. "
-                f"[was: {reason}]"
+                f"Return {predicted_return_pct:+.2f}% above buy threshold but signal scores "
+                f"insufficient (bull={bull_s}, bear={bear_s}, uncert={uncert_s})."
             )
-        elif dominant == "bearish" and dom_score >= 65 and near_thr:
+    elif predicted_return_pct <= sell_thr:
+        # SELL requires signal confirmation; strong consensus lowers uncertainty requirement.
+        if signal_scores and bear_s >= 45 and (bear_s - bull_s) >= 5 and uncert_s <= _uncert_limit:
             decision = "SELL"
             reason   = (
-                f"HOLD→SELL override: bearish signals {dom_score}/100, "
-                f"return {predicted_return_pct:+.2f}% near threshold. "
-                f"[was: {reason}]"
+                f"Predicted return {predicted_return_pct:+.2f}% <= {sell_thr}% SELL threshold "
+                f"({horizon_days}d). Bearish score {bear_s}/100 confirms."
+                + (" [STRONG CONSENSUS]" if _strong_bear else "")
             )
+        else:
+            decision = "HOLD"
+            reason   = (
+                f"Return {predicted_return_pct:+.2f}% below sell threshold but signal scores "
+                f"insufficient (bull={bull_s}, bear={bear_s}, uncert={uncert_s})."
+            )
+    else:
+        decision = "HOLD"
+        reason   = (
+            f"Return {predicted_return_pct:+.2f}% in HOLD band "
+            f"(±{abs(sell_thr):.2f}% for {horizon_days}d horizon)."
+        )
 
+    # HOLD override: strong signal consensus overrides neutral return (reversal risk must be low).
+    # For overwhelming consensus (>=70 score, >=25 gap), apply slightly relaxed thresholds;
+    # otherwise keep original thresholds (confidence>=60, dom_score>=45, near_thr factor 0.50).
+    if decision == "HOLD" and signal_scores and reversal_risk == "low":
+        dominant   = signal_scores.get("dominant", "uncertain")
+        dom_score  = signal_scores.get("dominant_score", 0)
+        _conf_thr  = 55 if (_strong_bear or _strong_bull) else 60
+        _dom_thr   = 42 if (_strong_bear or _strong_bull) else 45
+        _nthr_fac  = 0.40 if (_strong_bear or _strong_bull) else 0.50
+        near_thr   = abs(predicted_return_pct) >= abs(sell_thr) * _nthr_fac
+        if confidence_score >= _conf_thr and near_thr:
+            if dominant == "bullish" and dom_score >= _dom_thr:
+                decision = "BUY"
+                reason   = (
+                    f"HOLD→BUY override: bullish {dom_score}/100, "
+                    f"return {predicted_return_pct:+.2f}% near threshold. [{reason}]"
+                )
+            elif dominant == "bearish" and dom_score >= _dom_thr:
+                decision = "SELL"
+                reason   = (
+                    f"HOLD→SELL override: bearish {dom_score}/100, "
+                    f"return {predicted_return_pct:+.2f}% near threshold. [{reason}]"
+                )
+
+    # Risk gates (risk alone never creates SELL)
     if risk_score >= _HIGH_RISK_CUTOFF and decision == "BUY":
-        return "HOLD",   f"BUY downgraded to HOLD: high risk ({risk_score}/100) despite positive return."
+        return "HOLD", f"BUY downgraded to HOLD: high risk ({risk_score}/100) despite positive return."
     if risk_score >= _HIGH_RISK_CUTOFF and decision == "SELL":
         return "REVIEW", f"SELL → REVIEW: high uncertainty ({risk_score}/100) — needs human review."
 
@@ -644,21 +817,62 @@ def _apply_guardrails(
 # GEMINI PROMPT BUILDER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _build_symbol_calibration_section(calibration_summary: dict) -> str:
+    """Build per-symbol calibration section for Gemini prompt if available."""
+    sym_cal = calibration_summary.get("symbol_calibration", {})
+    if not sym_cal:
+        return ""
+    lines = [
+        "SYMBOL-SPECIFIC CALIBRATION PROFILE (highest priority — this symbol's known failure patterns):",
+        f"  Decision match rate:    {sym_cal.get('match_pct', 'N/A')}%",
+        f"  Hold rate:              {sym_cal.get('hold_rate_pct', 'N/A')}%",
+        f"  False BUY rate:         {sym_cal.get('false_buy_rate_pct', 'N/A')}%",
+        f"  False SELL rate:        {sym_cal.get('false_sell_rate_pct', 'N/A')}%",
+        f"  Avg return error:       {sym_cal.get('avg_return_error_pp', 'N/A')} pp",
+        f"  Top failure categories: {', '.join(sym_cal.get('top_failure_categories', [])) or 'NONE'}",
+    ]
+    if sym_cal.get("volatility_warning"):
+        lines.append("  WARNING: Volatility shifts frequently missed on this symbol — weight ATR/BB heavily.")
+    if sym_cal.get("news_earnings_warning"):
+        lines.append("  WARNING: Earnings/news events caused AI errors — check calendar context.")
+    if sym_cal.get("calibration_summary"):
+        lines.append(f"  Summary: {sym_cal['calibration_summary']}")
+    # Specific guidance from hold rate
+    hold_r = sym_cal.get("hold_rate_pct") or 0
+    if hold_r > 50:
+        lines.append(
+            f"  CRITICAL: This symbol has a {hold_r}% HOLD rate — you over-hold on it. "
+            "When trend + momentum agree, COMMIT to BUY or SELL. Do NOT default to HOLD."
+        )
+    return "\n".join(lines) + "\n\n"
+
+
 def _build_gemini_prompt(
     normalized_input: dict,
     feature_packet: dict,
     calibration_summary: dict,
+    signal_scores: dict = None,
+    earnings_warning: str = "",
+    market_movers_context: str = "",
 ) -> str:
     fp_json  = json.dumps(feature_packet, indent=2, default=str)
     cal_json = json.dumps(calibration_summary, indent=2, default=str)
+    signal_scores_for_prompt = signal_scores or {}
     horizon_days = int(normalized_input.get("decision_horizon_days") or 30)
+
+    # Compute actual data window description from feature packet (never hardcode)
+    _n_bars_fp    = int(feature_packet.get("n_bars", 0) or 0)
+    _ctx_start_fp = feature_packet.get("effective_ctx_start") or feature_packet.get("ctx_start") or "unknown"
+    _years_fp     = round(_n_bars_fp / 252, 1) if _n_bars_fp else 0
+    _data_window  = f"{_n_bars_fp} bars (~{_years_fp} years, from {_ctx_start_fp})"
     buy_thr, sell_thr = _get_horizon_thresholds(horizon_days)
     inp_json = json.dumps({
         "symbol":                        normalized_input.get("symbol"),
         "benchmark":                     normalized_input.get("benchmark"),
         "price_basis":                   normalized_input.get("price_basis"),
         "initial_capital":               normalized_input.get("initial_capital"),
-        "historical_context_start_date": normalized_input.get("historical_context_start_date"),
+        "requested_ctx_start":           normalized_input.get("historical_context_start_date"),
+        "effective_ctx_start":           feature_packet.get("effective_ctx_start") or normalized_input.get("historical_context_start_date"),
         "effective_origin_date":         normalized_input.get("prediction_origin_date"),
         "target_date":                   normalized_input.get("target_date"),
         "horizon_days":                  horizon_days,
@@ -666,36 +880,132 @@ def _build_gemini_prompt(
         "sell_threshold_pct":            sell_thr,
     }, indent=2)
 
+    # Build failure category note for prompt
+    hold_rate    = calibration_summary.get("hold_rate_pct", 0) or 0
+    top_failure  = calibration_summary.get("top_failure_reason", "NONE") or "NONE"
+    hold_warning = calibration_summary.get("hold_rate_warning", "") or ""
+    over_hold_n  = calibration_summary.get("over_hold_count", 0) or 0
+    false_buy_n  = calibration_summary.get("false_buy_count", 0) or 0
+    false_sell_n = calibration_summary.get("false_sell_count", 0) or 0
+    match_pct    = calibration_summary.get("decision_match_pct", 0) or 0
+
+    failure_guidance = ""
+    if top_failure == "OVER_HOLD":
+        failure_guidance = (
+            f"CRITICAL — OVER_HOLD is the top failure ({over_hold_n} cases). "
+            "You have been refusing to commit to BUY/SELL when indicators were clear. "
+            "When trend + RSI + MACD all agree, COMMIT to BUY or SELL — do not hide in HOLD."
+        )
+    elif top_failure == "FALSE_BUY":
+        failure_guidance = (
+            f"CAUTION — FALSE_BUY occurred {false_buy_n} times. "
+            "You predicted BUY but market fell. Add reversal_risk check before committing BUY. "
+            "If price is near resistance AND RSI>70, use REVIEW instead of BUY."
+        )
+    elif top_failure == "FALSE_SELL":
+        failure_guidance = (
+            f"CAUTION — FALSE_SELL occurred {false_sell_n} times. "
+            "You predicted SELL but market rose. When RSI<35 and price near support, avoid SELL. "
+            "Use REVIEW or HOLD when oversold signals conflict with bearish trend."
+        )
+    elif top_failure == "TREND_REVERSAL_MISSED":
+        failure_guidance = (
+            "CAUTION — Trend reversals were missed. When RSI diverges from price trend direction, "
+            "this often signals an impending reversal. Weight reversal_signals heavily."
+        )
+
     return f"""You are a financial decision-support reasoning agent for a walk-forward backtesting system.
 
 STRICT RULES:
-1. You must analyze ONLY the structured data provided below.
-2. You must NOT invent prices, news events, earnings, or external facts not in the data.
-3. You are NOT giving investment advice. This is a model prediction for validation/research only.
-4. You must return ONLY valid JSON — no text before or after the JSON.
+1. Analyze ONLY the structured data provided below.
+2. Do NOT invent prices, news events, earnings, or external facts not in the data.
+3. NOT investment advice — this is a model prediction for validation/research only.
+4. Return ONLY valid JSON — no text before or after the JSON.
 5. The target_date price is UNKNOWN to you — do NOT reference any price after the origin date.
 6. Do NOT use calibration accuracy stats to fake a better prediction. Use them to avoid known failure patterns.
 
-IMPORTANT — SELL BIAS WARNING:
-The calibration summary below may show a SELL bias in past predictions.
-If momentum looks negative but RSI is oversold (< 35), price is near support, and reversal_risk is medium/high,
-do NOT blindly predict SELL. Consider HOLD or even a muted negative return with REVIEW decision.
-Strong downside momentum followed by extreme oversold RSI historically precedes reversals.
+IMPORTANT — SELL BIAS WARNING (NARROW SCOPE):
+This warning applies ONLY when ALL THREE are simultaneously true:
+  1. RSI is EXTREME oversold (< 28, not just < 35)
+  2. Price is explicitly near a major support level (near_support = true)
+  3. reversal_risk = "high"
+In that specific case, use HOLD or REVIEW instead of SELL.
+In ALL OTHER bearish cases — commit to SELL if indicators agree.
 
-DECISION QUALITY — AVOID HOLD OVERUSE:
-Use HOLD ONLY when ALL of the following are true:
-- Expected price movement is genuinely near zero (predicted_return_pct within 0.5% of 0)
-- Bullish and bearish signals are nearly equal and balanced (no dominant direction)
-- Confidence is genuinely weak (< 55) with no clear trend
+STRONG BEARISH MANDATE — when ALL of these are true, you MUST predict SELL with large negative return:
+- trend_regime = "bearish"
+- price below SMA20 AND SMA50
+- MACD < 0 AND MACD_histogram < 0
+- 20d return < -3% AND 60d return < -5%
+In this case, predict return between -8% and -18% (proportional to ATR and return momentum).
+Do NOT default to HOLD when all four bearish conditions are met.
 
-Use REVIEW (not HOLD) when:
-- Uncertainty is high but there IS a directional lean — flag for human review, not neutral
+STRONG BULLISH MANDATE — when ALL of these are true, you MUST predict BUY with large positive return:
+- trend_regime = "bullish"
+- price above SMA20 AND SMA50
+- MACD > 0 AND MACD_histogram > 0
+- 20d return > +3% AND 60d return > +5%
+In this case, predict return between +8% and +18% (proportional to ATR and return momentum).
+Do NOT default to HOLD when all four bullish conditions are met.
+
+LONG HORIZON GUIDANCE — when horizon_days > 60:
+- Predicting ±1-2% return for a 60-90 day window is almost certainly wrong. Markets move 5-25% over 3 months.
+- If ANY directional bias exists (bullish OR bearish trend), predict at least ±5% minimum.
+- For strong trend + positive MACD + RSI > 55: predict +8% to +18% (bullish).
+- For strong trend + negative MACD + RSI < 45: predict -8% to -18% (bearish).
+- Only predict ±2-5% if signals are genuinely split 50/50 with no clear winner.
+- A horizon of 72 days with a bullish stock going up consistently = at minimum +8% prediction, not HOLD.
+
+DECISION QUALITY — COMMIT TO BUY OR SELL:
+HOLD is only correct when signals genuinely cancel out. It is NOT a safe default.
+The system currently has a {hold_rate:.0f}% HOLD rate — this is a critical failure. You MUST be more decisive.
+
+Use HOLD ONLY when ALL of these are true simultaneously:
+- Predicted return is within ±1.5% of zero (genuinely flat)
+- Bull and bear signals are nearly balanced (neither side > 10pp advantage)
+- RSI is between 42-58 (genuinely neutral zone)
+
+OVERBOUGHT REVERSAL GATE (applies only for horizon_days ≤ 45):
+If RSI_14 > 75 AND near_resistance = true AND reversal_risk = "medium" or "high" AND horizon_days ≤ 45:
+- Do NOT predict BUY. Output REVIEW.
+- These exact conditions (RSI > 75 + at resistance) historically precede short-term reversals (1-3 weeks).
+- For SHORT horizons (≤ 45 days) this gate applies firmly.
+
+OVERBOUGHT FOR LONG HORIZONS (horizon_days > 45):
+If RSI_14 > 75 AND near_resistance = true AND reversal_risk = "high" AND horizon_days > 45:
+- RSI overbought is a SHORT-TERM signal only. Over 60-90 days, overbought stocks continue higher more often than they reverse.
+- Do NOT output HOLD or REVIEW just because RSI is high. The gate does NOT apply for long horizons.
+- If trend_regime = "bullish" AND MACD > 0 AND 60d return > +5%: predict BUY with return +8% to +15%.
+- You may note the overbought condition as a risk factor in the rationale, but still commit to BUY if underlying trend is strong.
+- A stock that is RSI=79, bullish trend, positive MACD, +22% actual return over 72 days is a BUY — not a HOLD.
+
+USE BUY when ALL of these hold (not just ANY):
+- Trend regime = bullish AND RSI > 55 AND RSI < 75 AND MACD histogram > 0
+- reversal_risk is "low" (not "medium" or "high")
+- NOT (near_resistance = true AND RSI > 70)
+- 20d return > 0 AND price above SMA50
+
+USE SELL when ANY of these combinations exist:
+- Trend regime = bearish AND RSI < 45 AND MACD histogram < 0
+- 20d return < -3% AND 60d return < -5% AND price below SMA50 (COMMIT — do not HOLD)
+- RSI crossed below 50 from above AND MACD histogram turning negative AND trend = bearish
+
+RETURN MAGNITUDE GUIDANCE (critical — calibrate your predicted_return_pct to volatility):
+- If ATR/price > 1.5% per day AND trend = bearish: predict return between -10% and -18%
+- If ATR/price 0.8%-1.5% per day AND trend = bearish: predict return between -5% and -12%
+- If ATR/price < 0.8% per day AND trend = bearish: predict return between -2% and -7%
+- If ATR/price > 1.5% per day AND trend = bullish: predict return between +10% and +18%
+- If ATR/price 0.8%-1.5% per day AND trend = bullish: predict return between +5% and +12%
+- If ATR/price < 0.8% per day AND trend = bullish: predict return between +2% and +7%
+- NEVER predict 0% when strong directional trend exists
+- For horizon > 60 days: NEVER predict less than ±5% if trend is directional
 
 Do NOT default to HOLD when:
-- Trend regime + SMA position agree on a direction
-- RSI clearly signals momentum (>60 bullish, <40 bearish)
-- MACD line AND histogram both point the same direction
-- 20d and 60d returns consistently agree on direction
+- Trend regime is clearly bullish or bearish
+- RSI signals momentum (>58 = bullish, <42 = bearish)
+- MACD line AND histogram agree on direction
+- 20d and 60d returns consistently agree
+- reversal_risk is "low" (no overbought/oversold near S/R)
 
 Horizon-calibrated thresholds for this prediction:
 - BUY if predicted_return_pct >= +{buy_thr}%
@@ -705,20 +1015,34 @@ Horizon-calibrated thresholds for this prediction:
 If meaningful positive return ({buy_thr}%+) is predicted WITH bullish trend AND positive MACD → commit to BUY.
 If meaningful negative return ({sell_thr}% or worse) WITH bearish trend AND negative MACD → commit to SELL.
 
+CALIBRATION FAILURE CONTEXT (learn from these to avoid repeating the same mistakes):
+- Current decision match rate: {match_pct}%
+- Hold rate: {hold_rate}% {('(TOO HIGH — commit more)' if hold_rate > 45 else '')}
+- Top failure reason: {top_failure}
+- Over-hold cases: {over_hold_n} | False-buy cases: {false_buy_n} | False-sell cases: {false_sell_n}
+{f'- {hold_warning}' if hold_warning else ''}
+{f'- {failure_guidance}' if failure_guidance else ''}
+
 NORMALIZED INPUT:
 {inp_json}
 
 FEATURE PACKET (computed from real historical bars — no future data):
 {fp_json}
 
-CALIBRATION SUMMARY (past model performance — use to avoid known failure patterns):
+CALIBRATION SUMMARY (full past performance — use to avoid known failure patterns):
 {cal_json}
 
+{_build_symbol_calibration_section(calibration_summary)}
 DATA LIMITATIONS:
-- Historical bars come from external_historical_provider (NASDAQ public API)
-- Approximately 16 months of history available
-- No real-time news, earnings, or macro data
-- RapidAPI market movers data NOT available for historical origins (would be future leakage)
+- Historical bars come from open-source market data provider (primary) → NASDAQ external → RapidAPI TradingView (plan-dependent)
+- {_data_window} of price history available
+- No real-time news or macro data
+- Options chain live data: NOT available in historical context (would be future leakage for past dates)
+{f'EARNINGS ALERT: {earnings_warning}' if earnings_warning else '- Earnings calendar: checked — no events detected in prediction window.'}
+{market_movers_context if market_movers_context else '- Market movers: NOT included (historical prediction — live snapshot would be future leakage).'}
+
+SIGNAL SCORES (deterministic, computed from feature packet — these are the objective indicators):
+{json.dumps(signal_scores_for_prompt, indent=2)}
 
 REQUIRED JSON RESPONSE (return ONLY this JSON, no other text):
 {{
@@ -727,16 +1051,23 @@ REQUIRED JSON RESPONSE (return ONLY this JSON, no other text):
   "predicted_return_pct": <float, clamped to -20.0 to +20.0>,
   "confidence_score": <integer 0-100>,
   "risk_score": <integer 0-100>,
-  "trend_assessment": "<1-2 sentences on trend regime>",
-  "momentum_assessment": "<1-2 sentences on RSI/MACD/momentum>",
-  "volatility_assessment": "<1-2 sentences on ATR/BB/vol regime>",
-  "benchmark_assessment": "<1 sentence on relative strength vs benchmark>",
-  "bull_case": "<1 sentence on best-case scenario>",
-  "bear_case": "<1 sentence on worst-case scenario>",
-  "main_reason": "<2-3 sentences explaining the prediction direction>",
-  "why_not_opposite_decision": "<1-2 sentences on why opposite direction was rejected>",
-  "key_features_used": ["list of top 3-5 features that most influenced this prediction"],
-  "data_limitations": ["list of 1-3 known data gaps that could affect accuracy"],
+  "decision_threshold_used": {{"buy_threshold": {buy_thr}, "sell_threshold": {sell_thr}}},
+  "bullish_score_assessment": <integer 0-100, your assessment of bullish evidence>,
+  "bearish_score_assessment": <integer 0-100, your assessment of bearish evidence>,
+  "primary_signal": "<single most important indicator driving your prediction>",
+  "trend_assessment": "<3-4 sentences: What is the current trend regime (bullish/bearish/sideways)? Where is price relative to SMA20, SMA50, SMA200? How long has this trend been in place? Is the trend strengthening or weakening based on the last 20-60 days of price action?>",
+  "momentum_assessment": "<3-4 sentences: What is the exact RSI value and what does it signal (overbought/oversold/neutral)? What direction is MACD histogram pointing and is it accelerating or decelerating? How does the Rate of Change (ROC) confirm or conflict with RSI? Is momentum building or exhausting?>",
+  "volatility_assessment": "<2-3 sentences: What does ATR tell us about current volatility relative to its average? Are Bollinger Bands expanding or contracting? Does current volatility support or argue against a directional move in the prediction window?>",
+  "benchmark_assessment": "<2-3 sentences: How has this stock performed relative to its benchmark over the past 20 and 60 days? Is it outperforming or underperforming? What does relative strength tell us about market sentiment toward this stock?>",
+  "bull_case": "<2-3 sentences: What is the specific price target and catalyst for a bullish outcome? Which combination of indicators most strongly supports upside? What must hold true for this scenario to play out?>",
+  "bear_case": "<2-3 sentences: What is the specific price level and catalyst for a bearish outcome? Which indicators signal downside risk? What would trigger further selling pressure?>",
+  "main_reason": "<6-8 sentences: Start with WHAT decision was made and WHY that specific decision was reached. Explain WHERE price is positioned (support/resistance/trend levels). Explain HOW the key indicators (RSI, MACD, trend) combine to support this call. State WHEN this analysis is most likely to play out (early, mid, or late in the prediction window). Explain WHAT RISK factors exist. State what CONFIRMATION signal would strengthen conviction. End with the overall confidence level and what would change the call.>",
+  "hold_reason": "<only if decision is HOLD — 3-4 sentences explaining exactly which bullish signals cancel which bearish signals and why neither side has sufficient edge to commit>",
+  "why_not_opposite_decision": "<3-4 sentences: Explain specifically why the opposite direction was rejected. Which indicators argued for the opposite? Why were those signals overruled? What would need to change for the opposite call to be valid?>",
+  "invalidating_conditions": ["<specific price level or indicator reading that would invalidate this call>", "<second invalidating condition>", "<third invalidating condition>"],
+  "calibration_notes": "<2 sentences on what past failure patterns you avoided in this prediction and how calibration history influenced your confidence level>",
+  "key_features_used": ["list of top 5 features that most influenced this prediction — be specific, e.g. 'RSI_14=67.3 (bullish momentum zone)' not just 'RSI'"],
+  "data_limitations": ["list of 1-3 specific data gaps that could affect accuracy — be specific about what is missing and how it matters"],
   "needs_human_review": <true if confidence < 60 or strong reversal risk, else false>
 }}"""
 
@@ -772,6 +1103,8 @@ def _call_gemini(
     calibration_summary: dict,
     origin_price: float,
     initial_capital: float,
+    earnings_warning: str = "",
+    market_movers_context: str = "",
 ) -> dict:
     """Call Gemini, validate response, recalculate numerics. Returns result dict."""
     t0 = time.time()
@@ -784,40 +1117,28 @@ def _call_gemini(
             "gemini_latency_ms": 0,
         }
 
-    prompt_content = _build_gemini_prompt(normalized_input, feature_packet, calibration_summary)
+    sig_scores     = _compute_signal_scores(feature_packet)
+    prompt_content = _build_gemini_prompt(normalized_input, feature_packet, calibration_summary, signal_scores=sig_scores, earnings_warning=earnings_warning, market_movers_context=market_movers_context)
     prompt_hash    = hashlib.sha256(prompt_content.encode()).hexdigest()[:16]
 
     try:
-        try:
-            from google import genai
-            from google.genai import types as genai_types
+        from google import genai
+        from google.genai import types as genai_types
 
-            client = genai.Client(api_key=_GEMINI_KEY)
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt_content,
-                config=genai_types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=2048,
-                    thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-                ),
-            )
-            raw_text = (response.text or "").strip()
-        except ImportError:
-            import google.generativeai as legacy_genai
+        client = genai.Client(api_key=_GEMINI_KEY)
 
-            legacy_genai.configure(api_key=_GEMINI_KEY)
-            model = legacy_genai.GenerativeModel(GEMINI_MODEL)
-            response = model.generate_content(
-                prompt_content,
-                generation_config={
-                    "temperature": 0.1,
-                    "max_output_tokens": 2048,
-                },
-            )
-            raw_text = (getattr(response, "text", "") or "").strip()
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt_content,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=2048,
+                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
 
         gemini_latency_ms = round((time.time() - t0) * 1000, 0)
+        raw_text = (response.text or "").strip()
 
         # Extract JSON from response (handles thinking tags, markdown fences, plain JSON)
         json_text = _extract_json(raw_text)
@@ -844,14 +1165,17 @@ def _call_gemini(
 
         conf  = max(0, min(100, int(gemini_json.get("confidence_score") or 50)))
         risk  = max(0, min(100, int(gemini_json.get("risk_score") or 50)))
-        dq    = feature_packet.get("data_quality_score", 70)
+        dq    = min(100, int(feature_packet.get("data_quality_score", 70) or 70))
         h_days = int(normalized_input.get("decision_horizon_days") or 30)
 
-        sig_scores = _compute_signal_scores(feature_packet)
+        _rev_risk = feature_packet.get("reversal_signals", {}).get("reversal_risk", "low")
+        _rsi_val  = feature_packet.get("momentum", {}).get("RSI_14")
         decision, decision_reason = _apply_guardrails(
             pred_return, conf, risk, dq,
             horizon_days=h_days,
             signal_scores=sig_scores,
+            reversal_risk=_rev_risk,
+            rsi=_rsi_val,
         )
 
         output_hash = hashlib.sha256(raw_text.encode()).hexdigest()[:16]
@@ -959,21 +1283,92 @@ def run_gemini_stock_prediction(spi: dict, price_history_context: List[dict]) ->
     if leakage["status"] == "LEAKAGE_DETECTED":
         return _error_result(spi, input_hash, f"Leakage detected: {leakage}")
 
-    # Origin price
-    origin_price, eff_origin_date, price_err = get_price_on_date(history, origin_str)
+    # Pre-flight assertion: block if any bar date is after origin date
+    _target_in_history = any(b["date"] > origin_str for b in history)
+    if _target_in_history:
+        return _error_result(spi, input_hash, "LEAKAGE_BLOCKED: bars after origin date detected in history.")
+
+    # Origin price — respect price_basis setting (high/low/open/close)
+    _price_basis = str(spi.get("price_basis", "close") or "close")
+    origin_price, eff_origin_date, price_err = get_price_on_date(history, origin_str, price_basis=_price_basis)
     if origin_price is None:
         return _error_result(spi, input_hash, f"Cannot get origin price on {origin_str}: {price_err}")
 
+    # Optional context enrichments (benchmark bars, earnings calendar, market
+    # movers) must never break a prediction if they fail -- but a silently
+    # swallowed failure here previously looked identical to "this symbol
+    # simply has no earnings/no benchmark data," when the real cause could be
+    # a flaky API, missing key, or bad response. Track failures explicitly so
+    # they can be surfaced instead of just disappearing.
+    _context_enrichment_warnings: Dict[str, str] = {}
+
+    # Fetch benchmark bars so relative strength is computed for Gemini
+    benchmark_sym = str(spi.get("benchmark", "") or "").strip().upper()
+    _benchmark_bars: Optional[List[dict]] = None
+    if benchmark_sym and benchmark_sym != symbol:
+        try:
+            from historical_price_service import fetch_price_history_for_range as _fpr
+            _bm_bars, _bm_err, _bm_cov = _fpr(benchmark_sym, ctx_start, origin_str)
+            if _bm_bars:
+                _benchmark_bars = [b for b in _bm_bars if b["date"] <= origin_str]
+            else:
+                _context_enrichment_warnings["benchmark_bars"] = _bm_err or "No benchmark bars returned."
+        except Exception as exc:
+            _benchmark_bars = None
+            _context_enrichment_warnings["benchmark_bars"] = f"{type(exc).__name__}: {exc}"
+
     # Build feature packet
-    feature_packet = build_stock_feature_packet(spi, history)
+    feature_packet = build_stock_feature_packet(spi, history, benchmark_bars=_benchmark_bars)
     if feature_packet.get("status") != "OK":
         return _error_result(spi, input_hash, f"Feature packet failed: {feature_packet.get('error')}")
 
     # Calibration summary
     calibration_summary = build_calibration_summary(symbol=symbol, horizon_days=horizon_days)
+    if calibration_summary.get("symbol_calibration_error"):
+        _context_enrichment_warnings["symbol_calibration"] = calibration_summary["symbol_calibration_error"]
+
+    # Fetch earnings calendar for prediction window
+    _earnings_warning = ""
+    try:
+        from tools.tradingview_calendar import get_earnings_calendar
+        from datetime import datetime as _dt
+        _origin_ts = int(_dt.strptime(origin_str[:10], "%Y-%m-%d").timestamp())
+        _target_ts = int(_dt.strptime(target_str[:10], "%Y-%m-%d").timestamp()) if target_str else _origin_ts + 90*86400
+        _earn_data = get_earnings_calendar(_origin_ts, _target_ts)
+        if _earn_data.get("status") == "SUCCESS":
+            _earn_events = _earn_data.get("data", []) or []
+            if isinstance(_earn_events, list):
+                _sym_earnings = [e for e in _earn_events if str(e.get("ticker","") or "").upper() == symbol]
+                if _sym_earnings:
+                    _earn_dates = [str(e.get("date","") or e.get("time",""))[:10] for e in _sym_earnings]
+                    _earnings_warning = f"EARNINGS WARNING: {symbol} has earnings in prediction window on {', '.join(_earn_dates)}. Earnings events cause high volatility and often invalidate technical predictions. Raise risk_score by 15-20 and lower confidence_score accordingly."
+        else:
+            _context_enrichment_warnings["earnings_calendar"] = str(_earn_data.get("message") or _earn_data.get("status") or "unavailable")
+    except Exception as exc:
+        _context_enrichment_warnings["earnings_calendar"] = f"{type(exc).__name__}: {exc}"
+
+    # Fetch live market movers for LIVE predictions only (leakage-safe: origin within last 7 days)
+    _market_movers_context = ""
+    try:
+        from datetime import date as _date_cls
+        _origin_date_obj = _parse_ymd(origin_str)
+        _days_ago = (_date_cls.today() - _origin_date_obj).days if _origin_date_obj else 999
+        if _days_ago <= 7:
+            from rapidapi_market_service import fetch_top_movers_for_gemini
+            _movers_result = fetch_top_movers_for_gemini()
+            if _movers_result.get("status") == "SUCCESS":
+                _market_movers_context = _movers_result.get("context_text", "")
+            else:
+                _context_enrichment_warnings["market_movers"] = str(_movers_result.get("message") or _movers_result.get("status") or "unavailable")
+    except Exception as exc:
+        _context_enrichment_warnings["market_movers"] = f"{type(exc).__name__}: {exc}"
 
     # Call Gemini
-    gemini_result = _call_gemini(spi, feature_packet, calibration_summary, origin_price, initial_cap)
+    gemini_result = _call_gemini(
+        spi, feature_packet, calibration_summary, origin_price, initial_cap,
+        earnings_warning=_earnings_warning,
+        market_movers_context=_market_movers_context,
+    )
 
     if gemini_result.get("status") != "SUCCESS":
         return _error_result(
@@ -1014,7 +1409,9 @@ def run_gemini_stock_prediction(spi: dict, price_history_context: List[dict]) ->
         "gemini_output_hash":           gemini_result.get("gemini_output_hash", ""),
         "stock_prediction_input_hash":  input_hash,
         "symbol":                       symbol,
-        "historical_context_start_date": spi.get("historical_context_start_date"),
+        "requested_ctx_start":          spi.get("historical_context_start_date"),
+        "effective_ctx_start":          feature_packet.get("effective_ctx_start") or spi.get("historical_context_start_date"),
+        "historical_context_start_date": feature_packet.get("effective_ctx_start") or spi.get("historical_context_start_date"),
         "prediction_origin_date":       origin_str,
         "effective_origin_date":        eff_origin_date,
         "target_date":                  target_str,
@@ -1046,6 +1443,8 @@ def run_gemini_stock_prediction(spi: dict, price_history_context: List[dict]) ->
         "key_features_used":            gemini_result.get("key_features_used", []),
         "data_limitations":             gemini_result.get("data_limitations", []),
         "needs_human_review":           gemini_result.get("needs_human_review", False),
+        "market_movers_used":           bool(_market_movers_context),
+        "context_enrichment_warnings":  _context_enrichment_warnings,
         "_feature_packet":              feature_packet,
         "_calibration_summary":         calibration_summary,
         "_gemini_raw_json":             gemini_result.get("gemini_raw_json", {}),

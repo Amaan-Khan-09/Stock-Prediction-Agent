@@ -32,7 +32,7 @@ Bloomberg charges $25,000/year for terminal access. Institutional quant desks em
 
 4. **The AI improves itself** — A Calibration Engine (v3) runs mini-backtests on similar historical windows and uses them to pull the AI prediction toward empirical ground truth — without ever seeing the current backtest result (no data leakage).
 
-**No fake data. No hardcoded values. No random numbers. No Yahoo Finance. Every number is either computed or verified.**
+**No fake market values, hardcoded predictions, or random decision outputs. Market data is provider-attributed; the historical service can use TradingView, NASDAQ, or yfinance according to availability.**
 
 ---
 
@@ -470,8 +470,8 @@ Every rule below is enforced in both code and tests. None of them are aspiration
 | **No silent failures** | Invalid inputs block the entire pipeline. Backtest failures return explicit objects. Silent date-override retries do not exist. |
 | **No stale outputs** | Session state is cleared before every new run. A failed validation shows an error — not the previous run's results. |
 | **No symbol-independent values** | Formula output depends on RapidAPI market context, which is symbol-specific and time-stamped. |
-| **No Yahoo Finance** | All market data comes from TradingView via `trading-view.p.rapidapi.com`. Enforced by a dedicated test. |
-| **No real trades** | The system is a prediction and analysis tool. No order endpoints are called under any circumstance. |
+| **Provider transparency** | Historical data records the provider used. TradingView and NASDAQ are preferred; yfinance is a free last-resort historical provider. |
+| **Paper trading only** | The Discord extension can submit orders only to Alpaca's paper endpoint. Production configuration rejects a live Alpaca base URL. |
 
 ---
 

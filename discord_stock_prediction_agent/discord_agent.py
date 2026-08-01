@@ -4,11 +4,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import uuid
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 try:
     import discord
@@ -26,14 +28,26 @@ from .durable_signal_queue import (
     complete_signal,
     enqueue_signal,
     fail_signal,
+    list_dead_signals,
     queue_stats,
     recover_inflight_signals,
+    retry_dead_signals,
 )
 from .market_context import get_market_context, refresh_market_context_async
+from .multi_leg_validation import infer_multi_leg_price_effect, validate_multi_leg_strategy
 from .options_parser import ParsedOptionLeg, ParsedOptionSignal, classify_and_parse
 from .options_strategy_bridge import run_options_strategy_validation
 from .options_symbol import likely_unsupported_by_alpaca, listed_expiry_fallbacks, resolve_underlying_for_prediction
+from .pending_market_orders import (
+    enqueue_market_order,
+    list_queued_market_orders,
+    mark_attempt as mark_market_order_attempt,
+    mark_failed as mark_market_order_failed,
+    queue_summary as market_order_queue_summary,
+    remove_queued_market_order,
+)
 from .prediction_bridge import run_project_prediction
+from .protection_policy import build_protection_levels, evaluate_protection
 from .runtime_lock import acquire_runtime_lock
 from .signal_parser import ParsedSignal
 from .stock_order_intent import (
@@ -42,20 +56,28 @@ from .stock_order_intent import (
     stock_review_chunks,
 )
 from .symbol_directory import refresh_symbol_cache_from_alpaca
+from .whatsapp_client import output_text, send_whatsapp_text
+from .whatsapp_webhook import start_whatsapp_webhook_server
 from .state_store import (
     add_decision_history,
     add_pending_buy,
-    add_pending_market_buy,
+    add_pending_exit_order,
+    add_pending_multi_leg_entry_order,
+    add_pending_option_entry_order,
     add_pending_option_order,
-    add_pending_sell,
     add_conditional_equity_order,
     list_conditional_equity_orders,
+    list_multi_leg_positions,
     list_option_positions,
     list_pending_buys,
+    list_pending_exit_orders,
+    list_pending_multi_leg_entry_orders,
+    list_pending_option_entry_orders,
     list_pending_option_orders,
     list_positions,
     list_pending_sells,
     reduce_or_remove_position,
+    reduce_or_remove_multi_leg_position,
     record_order_event,
     record_option_journal_entry,
     record_option_validation_event,
@@ -63,8 +85,12 @@ from .state_store import (
     record_safety_block,
     record_signal_event,
     remove_pending_buy,
+    remove_pending_exit_order,
+    remove_pending_multi_leg_entry_order,
+    remove_pending_option_entry_order,
     remove_pending_option_order,
     remove_option_position,
+    remove_multi_leg_position,
     remove_position,
     remove_pending_sell,
     remove_conditional_equity_order,
@@ -82,14 +108,52 @@ from .state_store import (
     set_agent_mode,
     upsert_option_position,
     update_option_position,
+    update_pending_exit_order,
+    update_pending_multi_leg_entry_order,
+    update_pending_option_entry_order,
+    update_pending_buy_protected_qty,
     upsert_position,
+    upsert_multi_leg_position,
 )
 
 
 alpaca = AlpacaPaperClient()
 _SIGNAL_TASKS: set[asyncio.Task] = set()
 _QUEUE_RECOVERED = False
+_STARTUP_ORDER_RECOVERY_DONE = False
 _PENDING_CURSORS: dict[str, int] = {}
+
+
+@dataclass(frozen=True)
+class _QueuedIdentity:
+    id: object
+    bot: bool = False
+    transport: str = "discord"
+    reply_target: str = ""
+    is_group: bool = False
+
+
+class _QueuedMessage:
+    """Minimal Discord message interface reconstructed from durable queue data."""
+
+    def __init__(self, item: dict):
+        self.content = str(item.get("raw_text") or "")
+        self.id = str(item.get("message_id") or "")
+        self.transport = str(item.get("transport") or "discord").lower()
+        self.reply_target = str(item.get("reply_target") or item.get("channel_id") or "")
+        self.is_group = bool(item.get("is_group"))
+        self.author = _QueuedIdentity(
+            str(item.get("user_id") or ""), transport=self.transport
+        )
+        self.channel = _QueuedIdentity(
+            str(item.get("channel_id") or ""),
+            transport=self.transport,
+            reply_target=self.reply_target,
+            is_group=self.is_group,
+        )
+
+    async def add_reaction(self, _reaction: str) -> None:
+        return None
 
 
 class _DiscordReconnectNoiseFilter(logging.Filter):
@@ -128,12 +192,17 @@ def _configure_runtime_logging() -> None:
         and getattr(handler, "baseFilename", "") == str(log_path)
         for handler in logger.handlers
     ):
-        handler = RotatingFileHandler(
-            log_path,
-            maxBytes=max(100_000, config.runtime_log_max_bytes),
-            backupCount=max(1, min(20, config.runtime_log_backup_count)),
-            encoding="utf-8",
-        )
+        try:
+            handler = RotatingFileHandler(
+                log_path,
+                maxBytes=max(100_000, config.runtime_log_max_bytes),
+                backupCount=max(1, min(20, config.runtime_log_backup_count)),
+                encoding="utf-8",
+            )
+        except OSError:
+            # A running Windows process may hold the rotating log file open.
+            # Imports and auxiliary workers must remain available in that case.
+            handler = logging.StreamHandler()
         handler.setFormatter(
             logging.Formatter(
                 "%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -404,8 +473,26 @@ def _queue_option_order(
             "target_prices": list(option.target_prices),
             "trailing_stop_pct": option.trailing_stop_pct,
             "exit_before_market_close": option.exit_before_market_close,
+            "exit_minutes_before_close": option.exit_minutes_before_close,
+            "exit_if_target_not_hit": option.exit_if_target_not_hit,
+            "risk_stop_pct": option.risk_stop_pct,
+            "maximum_loss_amount": option.maximum_loss_amount,
+            "position_type": option.position_type,
+            "add_quantity": option.add_quantity,
+            "add_trigger_premium": option.add_trigger_premium,
+            "add_trigger_underlying_direction": option.add_trigger_underlying_direction,
+            "add_trigger_underlying_price": option.add_trigger_underlying_price,
             "underlying_trigger_direction": option.underlying_trigger_direction,
             "underlying_trigger_price": option.underlying_trigger_price,
+            "entry_premium_direction": option.entry_premium_direction,
+            "entry_premium_price": option.entry_premium_price,
+            "exit_underlying_direction": option.exit_underlying_direction,
+            "exit_underlying_price": option.exit_underlying_price,
+            "time_in_force": option.time_in_force,
+            "remaining_instruction": option.remaining_instruction,
+            "stop_scope": option.stop_scope,
+            "entry_price_type": option.entry_price_type,
+            "semantic_contract": option.semantic_contract,
             "signal_quality": quality.get("score"),
             "risk_reward": quality.get("risk_reward"),
             "raw_input": option.raw_text,
@@ -418,6 +505,58 @@ def _queue_option_order(
             "move_stop_to_breakeven": bool(move_stop_to_breakeven),
         }
     )
+
+
+def _queue_conditional_option_scale_in(metadata: dict) -> bool:
+    """Persist a second entry that waits for the base fill and its trigger."""
+    premium_trigger = _as_float(metadata.get("add_trigger_premium"))
+    underlying_trigger = _as_float(metadata.get("add_trigger_underlying_price"))
+    trigger_direction = str(metadata.get("add_trigger_underlying_direction") or "").lower()
+    if premium_trigger <= 0 and not (
+        underlying_trigger > 0 and trigger_direction in {"above", "below"}
+    ):
+        return False
+    qty = _as_float(metadata.get("add_quantity")) or _as_float(metadata.get("qty")) or 1.0
+    add_pending_option_order(
+        {
+            "pending_key": f"option:{uuid.uuid4().hex}",
+            "occ_symbol": str(metadata.get("occ_symbol") or "").upper(),
+            "root": str(metadata.get("root") or "").upper(),
+            "side": metadata.get("side"),
+            "strike": metadata.get("strike"),
+            "expiry_date": metadata.get("expiry_date") or "",
+            "qty": float(qty),
+            "order_type": "limit" if premium_trigger > 0 else "market",
+            "limit_price": premium_trigger or None,
+            "stop_loss": metadata.get("stop_loss"),
+            "target_price": metadata.get("target_price"),
+            "target_prices": list(metadata.get("target_prices") or []),
+            "trailing_stop_pct": metadata.get("trailing_stop_pct"),
+            "exit_before_market_close": bool(metadata.get("exit_before_market_close")),
+            "exit_minutes_before_close": metadata.get("exit_minutes_before_close"),
+            "exit_if_target_not_hit": bool(metadata.get("exit_if_target_not_hit")),
+            "risk_stop_pct": metadata.get("risk_stop_pct"),
+            "maximum_loss_amount": metadata.get("maximum_loss_amount"),
+            "position_type": metadata.get("position_type"),
+            "exit_underlying_direction": metadata.get("exit_underlying_direction"),
+            "exit_underlying_price": metadata.get("exit_underlying_price"),
+            "time_in_force": metadata.get("time_in_force"),
+            "stop_scope": metadata.get("stop_scope"),
+            "semantic_contract": metadata.get("semantic_contract") or {},
+            "underlying_trigger_direction": trigger_direction or None,
+            "underlying_trigger_price": underlying_trigger or None,
+            "signal_quality": metadata.get("signal_quality"),
+            "raw_input": metadata.get("raw_input"),
+            "reason": "conditional_scale_in",
+            "order_side": "buy",
+            "position_intent": "buy_to_open",
+            "requires_position": True,
+            "scale_in_order": True,
+            "base_order_id": str(metadata.get("base_order_id") or ""),
+            "contract_pending": not bool(metadata.get("occ_symbol")),
+        }
+    )
+    return True
 
 
 def _option_leg_route(leg: ParsedOptionLeg | dict) -> tuple[str, str, bool]:
@@ -451,7 +590,7 @@ def _multi_leg_limit_price(option: ParsedOptionSignal) -> Optional[float]:
     if option.fill_price is None:
         return None
     price = abs(float(option.fill_price))
-    return -price if option.price_effect == "credit" else price
+    return -price if infer_multi_leg_price_effect(option) == "credit" else price
 
 
 def _queue_multi_leg_option_order(
@@ -474,7 +613,13 @@ def _queue_multi_leg_option_order(
             "qty": float(qty),
             "order_type": _option_requested_order_type(option),
             "limit_price": _multi_leg_limit_price(option),
-            "price_effect": option.price_effect,
+            "price_effect": infer_multi_leg_price_effect(option),
+            "stop_loss": option.stop_loss,
+            "target_price": option.target_price,
+            "target_prices": list(option.target_prices),
+            "maximum_loss_amount": option.maximum_loss_amount,
+            "underlying_trigger_direction": option.underlying_trigger_direction,
+            "underlying_trigger_price": option.underlying_trigger_price,
             "legs": resolved_legs or _multi_leg_specs(option),
             "contract_pending": not bool(resolved_legs),
             "signal_quality": quality.get("score"),
@@ -500,6 +645,7 @@ def _queue_option_exit(position: dict, qty: float, reason: str, trigger_price: f
     occ_symbol = str(position.get("occ_symbol") or "").upper()
     if not occ_symbol:
         return
+    short_position = str(position.get("position_intent") or "").lower() == "sell_to_open"
     add_pending_option_order(
         {
             "pending_key": f"option-exit:{uuid.uuid4().hex}",
@@ -516,8 +662,8 @@ def _queue_option_exit(position: dict, qty: float, reason: str, trigger_price: f
             "signal_quality": position.get("signal_quality"),
             "raw_input": f"Protective option exit for {occ_symbol}",
             "reason": reason,
-            "order_side": "sell",
-            "position_intent": "sell_to_close",
+            "order_side": "buy" if short_position else "sell",
+            "position_intent": "buy_to_close" if short_position else "sell_to_close",
             "requires_position": True,
             "trigger_price": float(trigger_price),
             "observed_price": float(current_price),
@@ -554,14 +700,7 @@ def _option_order_route(option: ParsedOptionSignal) -> tuple[str, str, bool]:
 
 
 def _multi_leg_mapped_action(option: ParsedOptionSignal) -> str:
-    actions = {leg.order_action for leg in option.legs}
-    if actions and actions <= {"open_long", "open_short"}:
-        return "BUY"
-    if actions and actions <= {"close_long", "close_short"}:
-        return "SELL"
-    if option.structure == "roll" and actions & {"close_long", "close_short"} and actions & {"open_long", "open_short"}:
-        return "SELL" if option.price_effect == "credit" else "BUY"
-    return "REVIEW"
+    return str(validate_multi_leg_strategy(option).get("decision") or "REVIEW")
 
 
 def _multi_leg_contract_lookup(
@@ -873,13 +1012,14 @@ def _learning_features(
     action: str,
     symbol: str,
     option: Optional[ParsedOptionSignal] = None,
+    equity: Optional[ParsedSignal] = None,
 ) -> dict:
-    direction = ""
+    direction = _equity_decision_action(action) if equity else ""
     dte = "na"
     if option:
         direction = option.side or ""
         dte = _dte_bucket(option.expiry_date or "")
-    return {
+    features = {
         "asset_type": asset_type,
         "action": str(action or "").upper(),
         "symbol": str(symbol or "").upper(),
@@ -887,6 +1027,27 @@ def _learning_features(
         "keywords": _signal_keywords(raw_text),
         "dte_bucket": dte,
     }
+    contract: dict = {}
+    if option and option.semantic_contract:
+        contract = option.semantic_contract
+    elif equity:
+        contract = _equity_contract(equity)
+    if contract:
+        status = str(contract.get("status") or "VALID").upper()
+        features.update({
+            "semantic_fields": sorted(contract.keys()),
+            "contract_status": status,
+            "conditional": "CONDITIONAL" in status,
+            "position_management": "POSITION" in status or status.startswith("VALID_IF_"),
+            "order_type": contract.get("order_type", "MANAGEMENT"),
+            "strategy": (
+                contract.get("strategy")
+                or (option.structure if option else None)
+                or ("stock_order" if equity else "single_leg")
+            ),
+            "leg_count": len(option.legs) if option and option.legs else 1,
+        })
+    return features
 
 
 def _apply_learning_overlay(decision: DecisionResult, features: dict) -> DecisionResult:
@@ -986,19 +1147,29 @@ def _option_signal_quality(option: ParsedOptionSignal) -> dict:
         score -= 20
         issues.append("entry premium missing; market order may be less precise")
 
+    price_effect = infer_multi_leg_price_effect(option) if option.is_multi_leg else "debit"
+    short_credit = option.is_multi_leg and price_effect == "credit"
     if option.fill_price and option.stop_loss is not None:
-        if option.stop_loss >= option.fill_price:
+        invalid_stop = option.stop_loss <= option.fill_price if short_credit else option.stop_loss >= option.fill_price
+        if invalid_stop:
             score -= 100
-            critical.append("option SL must be below entry premium for a long option")
+            critical.append(
+                "credit strategy SL must be above entry credit"
+                if short_credit else "option SL must be below entry premium"
+            )
 
     if option.fill_price and option.target_price is not None:
-        if option.target_price <= option.fill_price:
+        invalid_target = option.target_price >= option.fill_price if short_credit else option.target_price <= option.fill_price
+        if invalid_target:
             score -= 100
-            critical.append("option target must be above entry premium for a long option")
+            critical.append(
+                "credit strategy target must be below entry credit"
+                if short_credit else "option target must be above entry premium"
+            )
 
     if option.fill_price and option.stop_loss is not None and option.target_price is not None:
-        risk = option.fill_price - option.stop_loss
-        reward = option.target_price - option.fill_price
+        risk = (option.stop_loss - option.fill_price) if short_credit else (option.fill_price - option.stop_loss)
+        reward = (option.fill_price - option.target_price) if short_credit else (option.target_price - option.fill_price)
         if risk > 0:
             risk_reward = reward / risk
             if risk_reward < config.min_option_risk_reward:
@@ -1006,6 +1177,13 @@ def _option_signal_quality(option: ParsedOptionSignal) -> dict:
                 critical.append(
                     f"risk/reward {risk_reward:.2f} is below minimum {config.min_option_risk_reward:.2f}"
                 )
+
+    if option.is_multi_leg:
+        structural = validate_multi_leg_strategy(option)
+        if not structural["passed"]:
+            critical.extend(structural["issues"])
+            score = 0.0
+        issues.extend(structural["warnings"])
 
     score = max(0.0, min(100.0, score))
     return {
@@ -1085,22 +1263,39 @@ def _option_final_decision(strategy_validation: Optional[dict], quality: Optiona
 
 
 async def _send_channel(channel_id: int, content: str = "", embed: Optional[discord.Embed] = None) -> None:
-    if not channel_id:
-        return
-    channel = bot.get_channel(channel_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(channel_id)
-        except Exception:
-            return
-    try:
-        await channel.send(content=content, embed=embed)
-    except Exception as exc:
-        logging.getLogger("discord_stock_prediction_agent").warning(
-            "Discord send failed; queue will continue. %s: %s",
-            type(exc).__name__,
-            exc,
-        )
+    """Send a proactive/background alert (not a reply to any incoming message).
+
+    Called from the periodic monitor loop -- protection triggers, a queued
+    order finally filling, a contract becoming tradable, etc. There is no
+    message object here to derive a WhatsApp destination from the way a reply
+    does, so WHATSAPP_ALERT_TARGET is the explicit, always-on destination for
+    this whole class of alert, mirroring the Discord channel id.
+    """
+    if channel_id:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except Exception:
+                channel = None
+        if channel is not None:
+            try:
+                await channel.send(content=content, embed=embed)
+            except Exception as exc:
+                logging.getLogger("discord_stock_prediction_agent").warning(
+                    "Discord send failed; queue will continue. %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+    if config.whatsapp_alert_target:
+        text = output_text(content, embed)
+        if text:
+            await asyncio.to_thread(
+                send_whatsapp_text,
+                config.whatsapp_alert_target,
+                text,
+                is_group=config.whatsapp_alert_is_group,
+            )
 
 
 async def _send_optional_channel(
@@ -1110,6 +1305,16 @@ async def _send_optional_channel(
     embed: Optional[discord.Embed] = None,
 ) -> None:
     """Send only to a configured channel. Never fall back into the input channel."""
+    if str(getattr(fallback_channel, "transport", "discord")) == "whatsapp":
+        text = output_text(content, embed)
+        if text:
+            await asyncio.to_thread(
+                send_whatsapp_text,
+                str(getattr(fallback_channel, "reply_target", "")),
+                text,
+                is_group=bool(getattr(fallback_channel, "is_group", False)),
+            )
+        return
     if channel_id:
         await _send_channel(channel_id, content=content, embed=embed)
 
@@ -1120,6 +1325,20 @@ async def _send_review_or_reply(
     embed: Optional[discord.Embed] = None,
 ) -> None:
     """Send bot output to signal-review. Never reply in the raw input channel."""
+    if str(getattr(message, "transport", "discord")) == "whatsapp":
+        text = output_text(content, embed)
+        if text:
+            ok, error = await asyncio.to_thread(
+                send_whatsapp_text,
+                str(getattr(message, "reply_target", "")),
+                text,
+                is_group=bool(getattr(message, "is_group", False)),
+            )
+            if not ok:
+                logging.getLogger("discord_stock_prediction_agent").warning(
+                    "WhatsApp response failed: %s", error
+                )
+        return
     if config.discord_review_channel_id:
         await _send_channel(config.discord_review_channel_id, content=content, embed=embed)
 
@@ -1173,7 +1392,7 @@ def _prediction_embed(parsed: ParsedSignal, prediction: dict, decision: Optional
     ai_prediction = prediction.get("ai_prediction") or {}
     ai_decision = str(ai_prediction.get("decision") or "REVIEW").upper()
     predicted_return, confidence, risk = _ai_decision_inputs(ai_prediction)
-    decision = decision or _evaluate_final_action(parsed.action, ai_prediction)
+    decision = decision or _evaluate_final_action(_equity_decision_action(parsed.action), ai_prediction)
     final_action = decision.action
     embed = discord.Embed(
         title=f"{parsed.symbol} Stock Prediction Review",
@@ -1184,6 +1403,7 @@ def _prediction_embed(parsed: ParsedSignal, prediction: dict, decision: Optional
     embed.add_field(name="User Action", value=parsed.action, inline=True)
     embed.add_field(name="Final Agent Output", value=final_action, inline=True)
     embed.add_field(name="Qty", value=str(parsed.quantity or "Default"), inline=True)
+    embed.add_field(name="Parsed Signal", value=_parsed_equity_summary(parsed), inline=False)
     embed.add_field(
         name="AI Stock Prediction",
         value=(
@@ -1230,6 +1450,47 @@ def _prediction_embed(parsed: ParsedSignal, prediction: dict, decision: Optional
     return embed
 
 
+def _equity_contract(parsed: ParsedSignal) -> dict:
+    if isinstance(parsed.order_intent, dict):
+        return dict(parsed.order_intent)
+    contract = {
+        "asset_type": "STOCK",
+        "action": parsed.action,
+        "symbol": parsed.symbol,
+        "quantity": parsed.quantity,
+        "order_type": parsed.order_type.upper(),
+        "time_in_force": parsed.time_in_force.upper(),
+        "limit_price": parsed.limit_price,
+        "stop_price": parsed.stop_price,
+        "status": "VALID",
+    }
+    if parsed.condition_type:
+        contract["entry_condition"] = {
+            "type": parsed.condition_type,
+            "price": parsed.condition_price,
+        }
+        contract["status"] = "CONDITIONAL"
+    return {key: value for key, value in contract.items() if value is not None}
+
+
+def _parsed_equity_summary(parsed: ParsedSignal) -> str:
+    limit_price = f"${parsed.limit_price:.2f}" if parsed.limit_price is not None else "-"
+    stop_price = f"${parsed.stop_price:.2f}" if parsed.stop_price is not None else "-"
+    lines = [
+        "Asset Type: STOCK | Status: VALID",
+        f"Action: {parsed.action} | Symbol: {parsed.symbol}",
+        f"Quantity: {parsed.quantity if parsed.quantity is not None else 'Default'}",
+        f"Order Type: {parsed.order_type.upper()} | Time In Force: {parsed.time_in_force.upper()}",
+        f"Limit Price: {limit_price} | Stop Price: {stop_price}",
+    ]
+    if parsed.condition_type:
+        condition_price = (
+            f"${parsed.condition_price:.2f}" if parsed.condition_price is not None else "-"
+        )
+        lines.append(f"Condition: {parsed.condition_type} {condition_price}")
+    return "\n".join(lines)
+
+
 def _direct_equity_embed(parsed: ParsedSignal, decision: DecisionResult) -> discord.Embed:
     embed = discord.Embed(
         title=f"{parsed.symbol} Direct Signal Review",
@@ -1239,6 +1500,7 @@ def _direct_equity_embed(parsed: ParsedSignal, decision: DecisionResult) -> disc
     embed.add_field(name="Signal Action", value=parsed.action, inline=True)
     embed.add_field(name="Execution Output", value=decision.action, inline=True)
     embed.add_field(name="Qty", value=str(parsed.quantity or "Default"), inline=True)
+    embed.add_field(name="Parsed Signal", value=_parsed_equity_summary(parsed), inline=False)
     embed.add_field(name="Agent Mode", value="OFF", inline=True)
     embed.add_field(name="Decision Source", value="Incoming signal", inline=True)
     embed.add_field(
@@ -1250,6 +1512,53 @@ def _direct_equity_embed(parsed: ParsedSignal, decision: DecisionResult) -> disc
         embed.add_field(name="Signal Note", value=parsed.reason[:500], inline=False)
     embed.set_footer(text="Paper trading only. No live-money orders are placed by this agent.")
     return embed
+
+
+def _equity_decision_action(action: str) -> str:
+    return {
+        "SELL_SHORT": "SELL",
+        "BUY_TO_COVER": "BUY",
+    }.get(str(action or "").upper(), str(action or "").upper())
+
+
+async def _enqueue_parsed_equity(parsed: ParsedSignal, side: str, qty: float, reason: str) -> None:
+    await asyncio.to_thread(
+        enqueue_market_order,
+        parsed.symbol,
+        side,
+        qty,
+        reason,
+        config.stop_loss_pct,
+        "",
+        parsed.action,
+        parsed.order_type,
+        parsed.limit_price,
+        parsed.stop_price,
+        parsed.time_in_force,
+    )
+
+
+async def _submit_parsed_equity(
+    parsed: ParsedSignal, side: str, qty: float, client_order_id: str
+) -> tuple[Optional[dict], str]:
+    submitter = getattr(alpaca, "submit_equity_order", None)
+    if submitter is None and parsed.order_type == "market":
+        return await asyncio.to_thread(
+            alpaca.submit_market_order, parsed.symbol, side, qty, client_order_id
+        )
+    if submitter is None:
+        return None, f"Broker adapter does not support {parsed.order_type} equity orders."
+    return await asyncio.to_thread(
+        submitter,
+        parsed.symbol,
+        side,
+        qty,
+        parsed.order_type,
+        parsed.limit_price,
+        parsed.stop_price,
+        parsed.time_in_force,
+        client_order_id,
+    )
 
 
 def _evaluate_final_action(user_action: str, ai_prediction: dict) -> DecisionResult:
@@ -1399,13 +1708,24 @@ def _final_action(user_action: str, ai_prediction: dict) -> str:
 
 
 async def _handle_buy(message: discord.Message, parsed: ParsedSignal, prediction: dict) -> None:
-    quantity = parsed.quantity or 1.0
+    is_cover = parsed.action == "BUY_TO_COVER"
+    quantity = parsed.quantity
+    if is_cover:
+        position, _ = await asyncio.to_thread(alpaca.get_position, parsed.symbol)
+        held = _as_float((position or {}).get("qty"))
+        if held >= 0:
+            await _send_review_or_reply(
+                message, f"{parsed.symbol}: no short position exists to buy to cover."
+            )
+            return
+        quantity = min(quantity or abs(held), abs(held))
+    quantity = quantity or 1.0
     if not await _trade_guard(message, parsed.symbol, "buy", quantity, "equity"):
         return
 
     market_open, market_err = await asyncio.to_thread(alpaca.is_market_open)
     if not market_open:
-        await asyncio.to_thread(add_pending_market_buy, parsed.symbol, quantity, market_err or "market_closed")
+        await _enqueue_parsed_equity(parsed, "buy", quantity, market_err or "market_closed")
         await asyncio.to_thread(_record_order, parsed.symbol, "buy", quantity, "queued", "", "equity", "market_closed")
         await _send_review_or_reply(
             message,
@@ -1414,16 +1734,12 @@ async def _handle_buy(message: discord.Message, parsed: ParsedSignal, prediction
         )
         return
 
-    order, err = await asyncio.to_thread(
-        alpaca.submit_market_order,
-        parsed.symbol,
-        "buy",
-        quantity,
-        _client_order_id("equitybuy", message.id),
+    order, err = await _submit_parsed_equity(
+        parsed, "buy", quantity, _client_order_id("equitybuy", message.id)
     )
     if not order:
         if _is_market_closed_order_error(err) or _is_transient_broker_error(err):
-            await asyncio.to_thread(add_pending_market_buy, parsed.symbol, quantity, err)
+            await _enqueue_parsed_equity(parsed, "buy", quantity, err)
             await asyncio.to_thread(_record_order, parsed.symbol, "buy", quantity, "queued", "", "equity", "broker_retry")
             await _send_review_or_reply(
                 message,
@@ -1436,6 +1752,14 @@ async def _handle_buy(message: discord.Message, parsed: ParsedSignal, prediction
 
     order_id = str(order.get("id") or "")
     await asyncio.to_thread(_record_order, parsed.symbol, "buy", quantity, "submitted", order_id, "equity")
+    if is_cover:
+        await _track_submitted_exit(order, parsed.symbol, quantity, "equity", "buy_to_cover")
+        await _send_review_or_reply(
+            message,
+            f"{parsed.symbol}: BUY TO COVER submitted for {quantity:g} share(s). "
+            f"Order type {parsed.order_type.upper()}, Alpaca order ID `{order_id or '-'}`.",
+        )
+        return
     checked = order
     if order_id:
         checked, _ = await asyncio.to_thread(alpaca.wait_for_order, order_id, 8)
@@ -1460,18 +1784,42 @@ async def _handle_buy(message: discord.Message, parsed: ParsedSignal, prediction
             filled_qty,
             entry_price,
             order_id,
-            config.stop_loss_pct,
+            config.equity_stop_loss_pct,
+            config.equity_take_profit_pct,
         )
-        stop_price = entry_price * (1 - config.stop_loss_pct / 100)
+        levels = build_protection_levels(
+            entry_price,
+            stop_loss_pct=config.equity_stop_loss_pct,
+            take_profit_pct=config.equity_take_profit_pct,
+        )
         await _send_review_or_reply(
             message,
             f"{parsed.symbol}: paper BUY placed for {filled_qty:g} share(s). "
-            f"Entry approx ${entry_price:.2f}. Protection sell triggers near ${stop_price:.2f} "
-            f"({config.stop_loss_pct:.1f}% below entry)."
+            f"Entry approx ${entry_price:.2f}. Loss protection ${levels.stop_price:.2f} "
+            f"(-{config.equity_stop_loss_pct:.1f}%); profit protection "
+            f"${levels.target_price:.2f} (+{config.equity_take_profit_pct:.1f}%)."
         )
+        if order_status == "partially_filled" and order_id:
+            await asyncio.to_thread(
+                add_pending_buy,
+                parsed.symbol,
+                quantity,
+                order_id,
+                config.equity_stop_loss_pct,
+                filled_qty,
+                config.equity_take_profit_pct,
+            )
     else:
         if order_id:
-            await asyncio.to_thread(add_pending_buy, parsed.symbol, quantity, order_id)
+            await asyncio.to_thread(
+                add_pending_buy,
+                parsed.symbol,
+                quantity,
+                order_id,
+                config.equity_stop_loss_pct,
+                0.0,
+                config.equity_take_profit_pct,
+            )
         await _send_review_or_reply(
             message,
             f"{parsed.symbol}: paper BUY order submitted. Status: "
@@ -1487,7 +1835,10 @@ async def _handle_buy(message: discord.Message, parsed: ParsedSignal, prediction
 
 
 async def _handle_sell(message: discord.Message, parsed: ParsedSignal, prediction: dict) -> None:
+    is_short = parsed.action == "SELL_SHORT"
     quantity = parsed.quantity
+    if is_short and quantity is None:
+        quantity = 1.0
     if quantity is None:
         position, pos_err = await asyncio.to_thread(alpaca.get_position, parsed.symbol)
         if not position:
@@ -1515,7 +1866,7 @@ async def _handle_sell(message: discord.Message, parsed: ParsedSignal, predictio
 
     market_open, clock_err = await asyncio.to_thread(alpaca.is_market_open)
     if not market_open:
-        await asyncio.to_thread(add_pending_sell, parsed.symbol, quantity, "manual_sell_market_closed")
+        await _enqueue_parsed_equity(parsed, "sell", quantity, "manual_sell_market_closed")
         await _send_review_or_reply(
             message,
             f"{parsed.symbol}: market is closed, so the SELL is queued. "
@@ -1531,28 +1882,21 @@ async def _handle_sell(message: discord.Message, parsed: ParsedSignal, predictio
         )
         return
 
-    ok, held, reason = await asyncio.to_thread(
-        alpaca.has_sellable_quantity, parsed.symbol, quantity
-    )
-    if not ok:
-        await _send_review_or_reply(message, f"{parsed.symbol}: paper SELL skipped. {reason}")
-        return
+    held = 0.0
+    if not is_short:
+        ok, held, reason = await asyncio.to_thread(
+            alpaca.has_sellable_quantity, parsed.symbol, quantity
+        )
+        if not ok:
+            await _send_review_or_reply(message, f"{parsed.symbol}: paper SELL skipped. {reason}")
+            return
 
-    order, err = await asyncio.to_thread(
-        alpaca.submit_market_order,
-        parsed.symbol,
-        "sell",
-        quantity,
-        _client_order_id("equitysell", message.id),
+    order, err = await _submit_parsed_equity(
+        parsed, "sell", quantity, _client_order_id("equitysell", message.id)
     )
     if not order:
         if _is_market_closed_order_error(err) or _is_transient_broker_error(err):
-            await asyncio.to_thread(
-                add_pending_sell,
-                parsed.symbol,
-                quantity,
-                err or "broker_retry",
-            )
+            await _enqueue_parsed_equity(parsed, "sell", quantity, err or "broker_retry")
             await asyncio.to_thread(
                 _record_order,
                 parsed.symbol,
@@ -1573,31 +1917,50 @@ async def _handle_sell(message: discord.Message, parsed: ParsedSignal, predictio
 
     order_id = str(order.get("id") or "")
     await asyncio.to_thread(_record_order, parsed.symbol, "sell", quantity, "submitted", order_id, "equity")
-    checked, _ = await asyncio.to_thread(alpaca.wait_for_order, order_id, 8)
-    checked = checked or order
-    exit_price = _as_float(checked.get("filled_avg_price"))
-    if exit_price <= 0:
-        exit_price, _ = await asyncio.to_thread(alpaca.get_latest_price, parsed.symbol)
-        exit_price = _as_float(exit_price)
-    outcome = {}
-    if exit_price > 0:
-        outcome = await asyncio.to_thread(
-            close_position_with_outcome,
-            parsed.symbol,
-            quantity,
-            exit_price,
-            "manual_sell",
+    if not is_short:
+        await _track_submitted_exit(
+            order, parsed.symbol, quantity, "equity", "manual_sell"
         )
-    if not outcome:
-        await asyncio.to_thread(reduce_or_remove_position, parsed.symbol, quantity)
+    checked = order
+    if order_id:
+        checked, _ = await asyncio.to_thread(alpaca.wait_for_order, order_id, 8)
+        checked = checked or order
+        await _reconcile_pending_exit_orders()
+
+    short_protection_note = ""
+    if is_short:
+        entry_price = _as_float(checked.get("filled_avg_price"))
+        filled_qty = _as_float(checked.get("filled_qty"))
+        if entry_price > 0 and filled_qty > 0:
+            await asyncio.to_thread(
+                upsert_position,
+                parsed.symbol,
+                filled_qty,
+                entry_price,
+                order_id,
+                config.equity_stop_loss_pct,
+                config.equity_take_profit_pct,
+                "short",
+            )
+            levels = build_protection_levels(
+                entry_price,
+                stop_loss_pct=config.equity_stop_loss_pct,
+                take_profit_pct=config.equity_take_profit_pct,
+                short_position=True,
+            )
+            short_protection_note = (
+                f" Entry approx ${entry_price:.2f}. Loss protection ${levels.stop_price:.2f} "
+                f"(+{config.equity_stop_loss_pct:.1f}%); profit protection "
+                f"${levels.target_price:.2f} (-{config.equity_take_profit_pct:.1f}%)."
+            )
+        else:
+            short_protection_note = " Short position state will be confirmed by Alpaca."
+
     await _send_review_or_reply(
         message,
-        f"{parsed.symbol}: paper SELL placed for {quantity:g} share(s). "
-        f"Alpaca position before order: {held:g} share(s)."
-        + (
-            f" Learned outcome: {outcome.get('pnl_pct'):+.2f}%."
-            if outcome else ""
-        )
+        f"{parsed.symbol}: paper {'SHORT SELL' if is_short else 'SELL'} submitted for {quantity:g} share(s). "
+        + (short_protection_note.strip()
+           if is_short else f"Alpaca position before order: {held:g} share(s). Position state changes only after Alpaca confirms fills.")
     )
     await _send_optional_channel(
         config.discord_paper_log_channel_id,
@@ -1647,6 +2010,9 @@ async def _process_rich_stock_order(message: discord.Message, parsed: ParsedSign
         return False
 
     direction = _rich_intent_direction(intent)
+    features = _learning_features(
+        message.content, "equity", parsed.action, parsed.symbol, equity=parsed
+    )
     prediction: dict = {}
     if mode == "ON":
         prediction = await asyncio.to_thread(run_project_prediction, parsed.symbol)
@@ -1658,7 +2024,10 @@ async def _process_rich_stock_order(message: discord.Message, parsed: ParsedSign
                 "rich_stock_prediction",
             )
             return True
-        decision = _evaluate_final_action(direction, prediction.get("ai_prediction") or {})
+        decision = _apply_learning_overlay(
+            _evaluate_final_action(direction, prediction.get("ai_prediction") or {}),
+            features,
+        )
         agent_decision = decision.action
         await _send_optional_channel(
             config.discord_review_channel_id,
@@ -1667,11 +2036,33 @@ async def _process_rich_stock_order(message: discord.Message, parsed: ParsedSign
         )
     else:
         agent_decision = direction
+        decision = _direct_signal_decision(direction)
         await _send_optional_channel(
             config.discord_review_channel_id,
             message.channel,
-            embed=_direct_equity_embed(parsed, _direct_signal_decision(direction)),
+            embed=_direct_equity_embed(parsed, decision),
         )
+
+    await asyncio.to_thread(_learn_from_decision, features, decision)
+    await asyncio.to_thread(
+        add_decision_history,
+        {
+            "symbol": parsed.symbol,
+            "kind": "EQUITY",
+            "user_action": parsed.action,
+            "ai_decision": str((prediction.get("ai_prediction") or {}).get("decision") or "BYPASSED").upper(),
+            "final_action": decision.action,
+            "predicted_return_pct": round(decision.predicted_return, 4),
+            "confidence": round(decision.confidence, 4),
+            "risk": round(decision.risk, 4),
+            "score": round(decision.score, 4),
+            "market_regime": decision.market_regime,
+            "reason": decision.reason,
+            "raw_input": parsed.raw_text or message.content,
+            "parsed_contract": _equity_contract(parsed),
+            "agent_mode": mode,
+        },
+    )
 
     needs_position = (
         str(intent.get("status") or "").startswith("VALID_IF_")
@@ -1787,7 +2178,8 @@ async def _process_rich_stock_order(message: discord.Message, parsed: ParsedSign
 async def _process_signal(message: discord.Message, parsed: ParsedSignal) -> None:
     if await _process_rich_stock_order(message, parsed):
         return
-    if parsed.action in {"BUY", "SELL"} and parsed.condition_type and parsed.condition_price:
+    decision_action = _equity_decision_action(parsed.action)
+    if parsed.action in {"BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"} and parsed.condition_type and parsed.condition_price:
         await asyncio.to_thread(
             add_conditional_equity_order,
             {
@@ -1797,6 +2189,9 @@ async def _process_signal(message: discord.Message, parsed: ParsedSignal) -> Non
                 "condition_type": parsed.condition_type,
                 "condition_price": parsed.condition_price,
                 "order_type": parsed.order_type,
+                "limit_price": parsed.limit_price,
+                "stop_price": parsed.stop_price,
+                "time_in_force": parsed.time_in_force,
                 "raw_input": parsed.raw_text or getattr(message, "content", ""),
                 "user_id": str(getattr(message.author, "id", "")),
                 "channel_id": str(getattr(message.channel, "id", "")),
@@ -1813,8 +2208,10 @@ async def _process_signal(message: discord.Message, parsed: ParsedSignal) -> Non
         return
 
     if not _agent_is_enabled():
-        decision = _direct_signal_decision(parsed.action)
-        features = _learning_features(message.content, "equity", parsed.action, parsed.symbol)
+        decision = _direct_signal_decision(decision_action)
+        features = _learning_features(
+            message.content, "equity", parsed.action, parsed.symbol, equity=parsed
+        )
         await _send_optional_channel(
             config.discord_review_channel_id,
             message.channel,
@@ -1831,6 +2228,8 @@ async def _process_signal(message: discord.Message, parsed: ParsedSignal) -> Non
                 "score": decision.score,
                 "market_regime": decision.market_regime,
                 "reason": decision.reason,
+                "raw_input": parsed.raw_text or message.content,
+                "parsed_contract": _equity_contract(parsed),
                 "agent_mode": "OFF",
             },
         )
@@ -1840,9 +2239,9 @@ async def _process_signal(message: discord.Message, parsed: ParsedSignal) -> Non
                 f"{parsed.symbol}: HOLD signal received in Agent OFF mode. No paper order is required.",
             )
             return
-        if decision.action == "BUY":
+        if parsed.action in {"BUY", "BUY_TO_COVER"} and decision.action == "BUY":
             await _handle_buy(message, parsed, {})
-        elif decision.action == "SELL":
+        elif parsed.action in {"SELL", "SELL_SHORT"} and decision.action == "SELL":
             await _handle_sell(message, parsed, {})
         return
 
@@ -1862,8 +2261,10 @@ async def _process_signal(message: discord.Message, parsed: ParsedSignal) -> Non
 
     ai_prediction = prediction.get("ai_prediction") or {}
     ai_decision = str(ai_prediction.get("decision") or "REVIEW").upper()
-    features = _learning_features(message.content, "equity", parsed.action, parsed.symbol)
-    decision = _apply_learning_overlay(_evaluate_final_action(parsed.action, ai_prediction), features)
+    features = _learning_features(
+        message.content, "equity", parsed.action, parsed.symbol, equity=parsed
+    )
+    decision = _apply_learning_overlay(_evaluate_final_action(decision_action, ai_prediction), features)
     final_action = decision.action
     await _send_optional_channel(
         config.discord_review_channel_id,
@@ -1884,6 +2285,8 @@ async def _process_signal(message: discord.Message, parsed: ParsedSignal) -> Non
             "score": round(decision.score, 4),
             "market_regime": decision.market_regime,
             "reason": decision.reason,
+            "raw_input": parsed.raw_text or message.content,
+            "parsed_contract": _equity_contract(parsed),
             "agent_mode": "ON",
         },
     )
@@ -1912,9 +2315,9 @@ async def _process_signal(message: discord.Message, parsed: ParsedSignal) -> Non
         )
         return
 
-    if final_action == "BUY":
+    if parsed.action in {"BUY", "BUY_TO_COVER"} and final_action == "BUY":
         await _handle_buy(message, parsed, prediction)
-    elif final_action == "SELL":
+    elif parsed.action in {"SELL", "SELL_SHORT"} and final_action == "SELL":
         await _handle_sell(message, parsed, prediction)
 
 
@@ -2048,6 +2451,157 @@ def _agent_response_label(decision: "DecisionResult") -> str:
     return "HOLD"
 
 
+def _option_action_code(option: ParsedOptionSignal) -> str:
+    if option.is_multi_leg:
+        return _option_signal_action_label(option).replace(" ", "_")
+    return {
+        "open_long": "BUY_TO_OPEN",
+        "close_long": "SELL_TO_CLOSE",
+        "open_short": "SELL_TO_OPEN",
+        "close_short": "BUY_TO_CLOSE",
+        "manage": "MANAGE_POSITION",
+    }.get(str(option.order_action or "").lower(), "REVIEW")
+
+
+def _option_targets(option: ParsedOptionSignal) -> list[float]:
+    targets: list[float] = []
+    for value in list(option.target_prices or ()) + [option.target_price]:
+        price = _as_float(value)
+        if price > 0 and price not in targets:
+            targets.append(price)
+    return targets
+
+
+def _parsed_option_summary(option: ParsedOptionSignal) -> str:
+    strike = f"{option.strike:g}" if option.strike is not None else "-"
+    entry = f"${option.fill_price:.2f}" if option.fill_price is not None else "Market"
+    stop = f"${option.stop_loss:.2f}" if option.stop_loss is not None else "Not provided"
+    targets = _option_targets(option)
+    target_text = (
+        " | ".join(f"TP{index} ${price:.2f}" for index, price in enumerate(targets, start=1))
+        if targets else "Not provided"
+    )
+    details = [
+        f"Asset Type: OPTION | Status: {'VALID' if option.valid else 'INVALID'}\n"
+        f"Action: {_option_action_code(option)} | Symbol: {option.root or '-'}\n"
+        f"Option Type: {option.side or '-'} | Strike: {strike}\n"
+        f"Expiration: {option.expiry_date or '-'} | Qty: {_resolved_option_qty(option):g}\n"
+        f"Order Type: {_option_requested_order_type(option).upper()} | Entry: {entry}\n"
+        f"Take Profit: {target_text}\n"
+        f"Stop Loss: {stop}"
+    ]
+    if option.position_type:
+        details.append(f"Position Type: {option.position_type.title()}")
+    if option.entry_price_type:
+        details.append(f"Entry Price Type: {option.entry_price_type.title()}")
+    if option.time_in_force:
+        details.append(f"Requested Time In Force: {option.time_in_force}")
+    if option.underlying_trigger_price is not None:
+        operator = ">" if option.underlying_trigger_direction == "above" else "<"
+        details.append(
+            f"Entry Condition: {option.root} underlying price {operator} "
+            f"${option.underlying_trigger_price:g}"
+        )
+    if option.entry_premium_price is not None:
+        operator = ">" if option.entry_premium_direction == "above" else "<"
+        details.append(f"Entry Condition: option premium {operator} ${option.entry_premium_price:.2f}")
+    if option.close_percent is not None:
+        details.append(
+            f"Position Close: {option.close_percent:g}%"
+            + ("; keep remaining contracts open" if option.remaining_instruction == "KEEP_OPEN" else "")
+        )
+    if option.risk_stop_pct is not None:
+        details.append(f"Risk Stop: {option.risk_stop_pct:g}% below the filled option premium")
+    if option.add_trigger_premium is not None:
+        add_qty = option.add_quantity or _resolved_option_qty(option)
+        details.append(
+            f"Scale In: add {add_qty:g} contract(s) if option premium falls to "
+            f"${option.add_trigger_premium:.2f}"
+        )
+    if option.add_trigger_underlying_price is not None:
+        add_qty = option.add_quantity or _resolved_option_qty(option)
+        symbol = ">" if option.add_trigger_underlying_direction == "above" else "<"
+        details.append(
+            f"Scale In: add {add_qty:g} contract(s) when {option.root} {symbol} "
+            f"${option.add_trigger_underlying_price:g}"
+        )
+    if option.exit_before_market_close:
+        minutes = option.exit_minutes_before_close or 15
+        qualifier = " if target has not been hit" if option.exit_if_target_not_hit else ""
+        details.append(f"Time Exit: close remaining contracts {minutes} minutes before market close{qualifier}")
+    if option.exit_underlying_price is not None:
+        operator = ">" if option.exit_underlying_direction == "above" else "<"
+        details.append(
+            f"Planned Exit: close position when {option.root} underlying price {operator} "
+            f"${option.exit_underlying_price:g}"
+        )
+    if option.maximum_loss_amount is not None:
+        details.append(f"Maximum Position Loss: ${option.maximum_loss_amount:,.2f}")
+    if option.stop_scope:
+        details.append(f"Stop Scope: {option.stop_scope.replace('_', ' ').title()}")
+    return "\n".join(details)
+
+
+def _flatten_contract(value: object, prefix: str = "") -> list[str]:
+    lines: list[str] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            label = str(key).replace("_", " ").title()
+            path = f"{prefix} / {label}" if prefix else label
+            if isinstance(nested, (dict, list)):
+                lines.extend(_flatten_contract(nested, path))
+            else:
+                lines.append(f"{path}: {nested}")
+    elif isinstance(value, list):
+        for index, nested in enumerate(value, start=1):
+            path = f"{prefix} {index}".strip()
+            lines.extend(_flatten_contract(nested, path))
+    else:
+        lines.append(f"{prefix}: {value}")
+    return lines
+
+
+def _contract_chunks(option: ParsedOptionSignal, max_chars: int = 950) -> list[str]:
+    if not option.semantic_contract:
+        return []
+    chunks: list[str] = []
+    current = ""
+    for line in _flatten_contract(option.semantic_contract):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > max_chars and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _option_cancel_deadline_passed(contract: object, created_at: object = None) -> bool:
+    if not isinstance(contract, dict):
+        return False
+    deadline = contract.get("cancel_if_not_triggered_by")
+    if not isinstance(deadline, dict):
+        return False
+    match = re.fullmatch(r"(\d{2}):(\d{2})", str(deadline.get("time") or ""))
+    if not match:
+        return False
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    created_text = str(created_at or "")
+    if created_text:
+        try:
+            created = datetime.fromisoformat(created_text.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=ZoneInfo("UTC"))
+            if created.astimezone(ZoneInfo("America/New_York")).date() < now_et.date():
+                return True
+        except ValueError:
+            pass
+    hour, minute = (int(value) for value in match.groups())
+    return (now_et.hour, now_et.minute) >= (hour, minute)
+
+
 def _option_embed(
     option: ParsedOptionSignal,
     ai_prediction: dict,
@@ -2082,6 +2636,10 @@ def _option_embed(
         inline=True,
     )
     embed.add_field(name="Quality Score", value=f"{decision.score:.0f}/100", inline=True)
+    embed.add_field(name="Parsed Signal", value=_parsed_option_summary(option), inline=False)
+    for index, chunk in enumerate(_contract_chunks(option), start=1):
+        label = "Parsed Field Contract" if index == 1 else f"Parsed Field Contract ({index})"
+        embed.add_field(name=label, value=chunk, inline=False)
     if strategy_validation:
         bt = strategy_validation.get("backtest") or {}
         si = strategy_validation.get("strategy_input") or {}
@@ -2173,25 +2731,31 @@ def _option_embed(
             trade_setup = (
                 "\n".join(leg_lines)
                 + f"\nStrategy Qty: {_resolved_option_qty(option):g} | "
-                + f"Net {str(option.price_effect or 'price').title()}: "
+                + f"Net {str(infer_multi_leg_price_effect(option) or 'price').title()}: "
                 + (f"${option.fill_price:.2f}" if option.fill_price else "market")
                 + f"\nWindow: {si.get('options_backtest_start_date', '-')} to {si.get('options_backtest_end_date', '-')}"
             )
         else:
+            resolved_validation_strike = validation_strike
+            if resolved_validation_strike in (None, "", "-"):
+                resolved_validation_strike = requested_strike if requested_strike is not None else "-"
             trade_setup = (
-                f"{si.get('symbol', option.root)} | {si.get('direction_label', si.get('direction', '-'))} "
-                f"{si.get('opt_type', si.get('side', '-'))} | Qty {si.get('quantity', '-')}\n"
+                f"{si.get('symbol') or option.root} | "
+                f"{si.get('direction_label') or _option_action_code(option)} | "
+                f"{si.get('opt_type') or si.get('side') or option.side or '-'} | "
+                f"Qty {_as_float(si.get('quantity'), _resolved_option_qty(option)):g}\n"
                 f"Requested Strike: {requested_strike if requested_strike is not None else '-'} | "
-                f"Validation Strike: {validation_strike} | "
-                f"Delta {si.get('delta', '-')} | DTE {si.get('dte', '-')}\n"
-                f"Entry: {si.get('entry_frequency', '-')} | Exit: {si.get('exit_rule', '-')}\n"
-                f"Window: {si.get('options_backtest_start_date', si.get('prediction_origin_date', '-'))} "
-                f"to {si.get('options_backtest_end_date', si.get('target_date', '-'))}"
+                f"Validation Strike: {resolved_validation_strike} | "
+                f"Delta {si.get('delta', option.delta_target if option.delta_target is not None else '-')} | "
+                f"DTE {si.get('dte', '-')}\n"
+                f"Order: {_option_requested_order_type(option).upper()} | "
+                f"Requested Expiry: {option.expiry_date or '-'}"
             )
-        embed.add_field(name="Trade Setup", value=trade_setup[:1000], inline=not option.is_multi_leg)
+        if option.is_multi_leg or not direct_mode:
+            embed.add_field(name="Trade Setup", value=trade_setup[:1000], inline=not option.is_multi_leg)
     if option.fill_price:
         embed.add_field(name="Signal Fill Price", value=f"${option.fill_price:.2f}", inline=True)
-    if option.stop_loss is not None or option.target_price is not None or quality:
+    if option.stop_loss is not None or option.target_price is not None or option.target_prices or quality:
         q = quality or {}
         rr = q.get("risk_reward")
         rr_text = f"{rr:.2f}" if isinstance(rr, (int, float)) else "-"
@@ -2201,7 +2765,7 @@ def _option_embed(
             value=(
                 f"Score: {float(q.get('score', 0)):.0f}/100\n"
                 f"SL: {option.stop_loss if option.stop_loss is not None else '-'} | "
-                f"TP: {option.target_price if option.target_price is not None else '-'} | "
+                f"TPs: {' / '.join(f'{price:g}' for price in _option_targets(option)) or '-'} | "
                 f"R/R: {rr_text}\n"
                 + (f"Notes: {'; '.join(issues)[:450]}" if issues else "Notes: clean")
             ),
@@ -2274,6 +2838,8 @@ async def _process_multi_leg_option_signal(
             float(quality.get("score") or 0),
             "options_validation",
         )
+    if agent_enabled:
+        decision = _apply_learning_overlay(decision, features)
 
     contract_check = await asyncio.to_thread(
         _multi_leg_contract_lookup,
@@ -2302,6 +2868,7 @@ async def _process_multi_leg_option_signal(
             "raw_input": option.raw_text,
             "structure": option.structure,
             "legs": _multi_leg_specs(option),
+            "parsed_contract": option.semantic_contract,
             "options_strategy_status": strategy_status,
             "options_strategy_decision": strategy_decision,
             "agent_mode": "ON" if agent_enabled else "OFF",
@@ -2393,6 +2960,32 @@ async def _process_multi_leg_option_signal(
             )
             return
 
+    if option.underlying_trigger_direction and option.underlying_trigger_price:
+        underlying_price, _ = await asyncio.to_thread(alpaca.get_latest_price, option.root)
+        observed = _as_float(underlying_price)
+        trigger = float(option.underlying_trigger_price)
+        condition_met = (
+            observed > trigger
+            if option.underlying_trigger_direction == "above"
+            else observed < trigger
+        )
+        if observed <= 0 or not condition_met:
+            await asyncio.to_thread(
+                _queue_multi_leg_option_order,
+                option,
+                qty,
+                quality,
+                "waiting_for_underlying_price_condition",
+                resolved_legs,
+                str(contract_check.get("expiration_date") or option.expiry_date or ""),
+            )
+            await _send_review_or_reply(
+                message,
+                f"{_option_label(option)}: strategy approved. Watching for {option.root} "
+                f"to trade {option.underlying_trigger_direction} ${trigger:.2f} before submitting the paper order.",
+            )
+            return
+
     order_type = _option_requested_order_type(option)
     limit_price = _multi_leg_limit_price(option) if order_type == "limit" else None
     market_open, market_err = await asyncio.to_thread(alpaca.is_market_open)
@@ -2447,6 +3040,25 @@ async def _process_multi_leg_option_signal(
         return
 
     order_id = str(order.get("id") or "")
+    await _track_submitted_multi_leg_entry(
+        order,
+        qty,
+        {
+            "root": option.root,
+            "structure": option.structure,
+            "legs": resolved_legs,
+            "price_effect": infer_multi_leg_price_effect(option) or "debit",
+            "stop_loss": option.stop_loss,
+            "target_price": option.target_price,
+            "target_prices": list(option.target_prices),
+            "maximum_loss_amount": option.maximum_loss_amount,
+            "protectable": all(
+                str(leg.get("position_intent") or "")
+                in {"buy_to_open", "sell_to_open"}
+                for leg in resolved_legs
+            ),
+        },
+    )
     await asyncio.to_thread(
         _record_order,
         option.root,
@@ -2562,6 +3174,8 @@ async def _process_option_signal(message: discord.Message, option: ParsedOptionS
         decision = _option_final_decision(strategy_validation, quality)
     if agent_enabled and strategy_decision == "SELL" and mapped_action == "SELL" and str(strategy_validation.get("status") or "").upper() in _allowed_option_strategy_statuses() and quality.get("passed"):
         decision = DecisionResult("SELL", "Option sell-side signal approved for paper-order preparation.", 0.0, 0.0, 0.0, float(quality.get("score") or 0), "options_validation")
+    if agent_enabled:
+        decision = _apply_learning_overlay(decision, features)
     contract_check = await asyncio.to_thread(_verify_exact_option_contract, option)
     strategy_validation = {
         **strategy_validation,
@@ -2580,6 +3194,7 @@ async def _process_option_signal(message: discord.Message, option: ParsedOptionS
             "confidence": round(decision.confidence, 4), "risk": round(decision.risk, 4),
             "score": round(decision.score, 4), "market_regime": decision.market_regime,
             "reason": decision.reason, "raw_input": option.raw_text,
+            "parsed_contract": option.semantic_contract,
             "option_signal_quality": round(float(quality.get("score") or 0), 2),
             "option_risk_reward": quality.get("risk_reward"),
             "options_strategy_status": strategy_validation.get("status"),
@@ -2710,12 +3325,38 @@ async def _process_option_signal(message: discord.Message, option: ParsedOptionS
             await _send_review_or_reply(message, f"{occ_symbol}: {_option_order_label(option)} accepted, but no matching Alpaca option position is available yet. The agent will keep monitoring and place it when possible.")
             return
         if option.close_percent is not None:
-            percentage_qty = max(1, int(held_qty * min(100.0, max(0.0, option.close_percent)) / 100.0))
+            requested_percent = min(100.0, max(0.0, option.close_percent))
+            percentage_qty = int(held_qty * requested_percent / 100.0)
+            if percentage_qty < 1:
+                await _send_review_or_reply(
+                    message,
+                    f"{occ_symbol}: cannot close {requested_percent:g}% of {held_qty:g} contract(s) "
+                    "without closing the entire position. No close order was submitted.",
+                )
+                return
             qty = min(float(percentage_qty), held_qty)
         else:
             qty = min(qty, held_qty)
 
     if option.underlying_trigger_direction and option.underlying_trigger_price:
+        if _option_cancel_deadline_passed(option.semantic_contract):
+            await asyncio.to_thread(
+                record_option_journal_entry,
+                {
+                    "root": option.root,
+                    "side": option.side,
+                    "strike": option.strike,
+                    "expiry_date": contract_expiration,
+                    "raw_input": option.raw_text,
+                    "semantic_contract": option.semantic_contract,
+                    "status": "conditional_entry_expired",
+                },
+            )
+            await _send_review_or_reply(
+                message,
+                f"{occ_symbol}: conditional entry deadline has passed. The signal was canceled and no paper order was submitted.",
+            )
+            return
         underlying_price, _ = await asyncio.to_thread(alpaca.get_latest_price, option.root)
         observed = _as_float(underlying_price)
         trigger = float(option.underlying_trigger_price)
@@ -2826,29 +3467,43 @@ async def _process_option_signal(message: discord.Message, option: ParsedOptionS
     entry_price = option.fill_price or 0.0
     await asyncio.to_thread(_record_order, occ_symbol, order_side, qty, "submitted", str(order.get("id") or ""), "option")
     if position_intent in {"buy_to_open", "sell_to_open"}:
-        await asyncio.to_thread(
-            upsert_option_position,
-            occ_symbol, option.root, option.side, option.strike,
-            contract_expiration,
-            qty, entry_price, str(order.get("id") or ""),
-            option.stop_loss, option.target_price, float(quality.get("score") or 0), position_intent,
-            option.target_prices, option.trailing_stop_pct, option.exit_before_market_close,
+        await _track_submitted_option_entry(
+            order,
+            occ_symbol,
+            qty,
+            {
+                "root": option.root,
+                "side": option.side,
+                "strike": option.strike,
+                "expiry_date": contract_expiration,
+                "stop_loss": option.stop_loss,
+                "target_price": option.target_price,
+                "target_prices": list(option.target_prices),
+                "trailing_stop_pct": option.trailing_stop_pct,
+                "exit_before_market_close": option.exit_before_market_close,
+                "exit_minutes_before_close": option.exit_minutes_before_close,
+                "exit_if_target_not_hit": option.exit_if_target_not_hit,
+                "risk_stop_pct": option.risk_stop_pct,
+                "maximum_loss_amount": option.maximum_loss_amount,
+                "position_type": option.position_type,
+                "exit_underlying_direction": option.exit_underlying_direction,
+                "exit_underlying_price": option.exit_underlying_price,
+                "time_in_force": option.time_in_force,
+                "stop_scope": option.stop_scope,
+                "semantic_contract": option.semantic_contract,
+                "signal_quality": float(quality.get("score") or 0),
+                "position_intent": position_intent,
+            },
         )
     elif position_intent in {"sell_to_close", "buy_to_close"}:
-        remaining_qty = max(0.0, held_qty - qty)
-        if remaining_qty > 0:
-            updates = {"qty": round(remaining_qty, 6)}
-            if "BREAKEVEN" in str(option.raw_text or "").upper():
-                tracked = next(
-                    (item for item in list_option_positions() if str(item.get("occ_symbol") or "").upper() == occ_symbol.upper()),
-                    {},
-                )
-                entry = _as_float(tracked.get("entry_price"))
-                if entry > 0:
-                    updates["stop_loss"] = entry
-            await asyncio.to_thread(update_option_position, occ_symbol, **updates)
-        else:
-            await asyncio.to_thread(remove_option_position, occ_symbol)
+        await _track_submitted_exit(
+            order,
+            occ_symbol,
+            qty,
+            "option",
+            "manual_option_exit",
+            move_stop_to_breakeven=("BREAKEVEN" in str(option.raw_text or "").upper()),
+        )
     await asyncio.to_thread(
         record_option_journal_entry,
         {
@@ -2856,57 +3511,76 @@ async def _process_option_signal(message: discord.Message, option: ParsedOptionS
             "strike": option.strike, "quantity": qty, "order_type": order_type,
             "stop_loss": option.stop_loss, "target_price": option.target_price,
             "signal_quality": quality.get("score"), "risk_reward": quality.get("risk_reward"),
-            "raw_input": option.raw_text, "status": "order_placed", "position_intent": position_intent,
+            "raw_input": option.raw_text, "status": "order_submitted", "position_intent": position_intent,
         },
     )
     fallback_note = " (nearest available expiry used — 0DTE not listed)" if used_fallback_expiry else ""
     await _send_review_or_reply(
         message,
-        f"{occ_symbol}: paper option {order_side.upper()} order placed successfully. "
+        f"{occ_symbol}: paper option {order_side.upper()} order submitted successfully. "
         f"Qty {qty:g} contract(s), type={order_type}"
         f"{' @ $' + f'{option.fill_price:.2f}' if option.fill_price else ''}. "
         f"Order ID `{order.get('id') or '-'}`.{fallback_note}",
     )
     await _send_optional_channel(
         config.discord_paper_log_channel_id, message.channel,
-        f"{occ_symbol}: paper option {order_side.upper()} placed successfully. Qty {qty:g}. Intent {position_intent}. Order ID `{order.get('id') or '-'}`.",
+        f"{occ_symbol}: paper option {order_side.upper()} submitted successfully. Qty {qty:g}. Intent {position_intent}. Order ID `{order.get('id') or '-'}`. Position state updates after Alpaca confirms fills.",
     )
 
-    if option.add_quantity and option.add_trigger_premium and position_intent == "buy_to_open":
-        await asyncio.to_thread(
-            add_pending_option_order,
+    if position_intent == "buy_to_open" and (
+        option.add_trigger_premium or option.add_trigger_underlying_price
+    ):
+        add_qty = option.add_quantity or _resolved_option_qty(option)
+        queued_scale_in = await asyncio.to_thread(
+            _queue_conditional_option_scale_in,
             {
-                "pending_key": f"option:{uuid.uuid4().hex}",
                 "occ_symbol": occ_symbol,
                 "root": option.root,
                 "side": option.side,
                 "strike": option.strike,
                 "expiry_date": contract_expiration,
-                "qty": float(option.add_quantity),
-                "order_type": "limit",
-                "limit_price": float(option.add_trigger_premium),
+                "qty": add_qty,
+                "add_quantity": add_qty,
+                "add_trigger_premium": option.add_trigger_premium,
+                "add_trigger_underlying_direction": option.add_trigger_underlying_direction,
+                "add_trigger_underlying_price": option.add_trigger_underlying_price,
                 "stop_loss": option.stop_loss,
                 "target_price": option.target_price,
                 "target_prices": list(option.target_prices),
                 "trailing_stop_pct": option.trailing_stop_pct,
                 "exit_before_market_close": option.exit_before_market_close,
+                "exit_minutes_before_close": option.exit_minutes_before_close,
+                "exit_if_target_not_hit": option.exit_if_target_not_hit,
+                "risk_stop_pct": option.risk_stop_pct,
+                "maximum_loss_amount": option.maximum_loss_amount,
+                "position_type": option.position_type,
+                "exit_underlying_direction": option.exit_underlying_direction,
+                "exit_underlying_price": option.exit_underlying_price,
+                "time_in_force": option.time_in_force,
+                "stop_scope": option.stop_scope,
                 "signal_quality": quality.get("score"),
                 "raw_input": option.raw_text,
-                "reason": "conditional_scale_in",
-                "order_side": "buy",
-                "position_intent": "buy_to_open",
-                "requires_position": False,
-                "contract_pending": False,
+                "base_order_id": str(order.get("id") or ""),
             },
+        )
+        if not queued_scale_in:
+            return
+        trigger_text = (
+            f"option premium reaches ${option.add_trigger_premium:.2f}"
+            if option.add_trigger_premium
+            else f"{option.root} moves {option.add_trigger_underlying_direction} "
+                 f"${option.add_trigger_underlying_price:g}"
         )
         await _send_review_or_reply(
             message,
-            f"{occ_symbol}: scale-in order queued for {option.add_quantity:g} additional contract(s) "
-            f"with a ${option.add_trigger_premium:.2f} buy limit.",
+            f"{occ_symbol}: scale-in instruction stored for {add_qty:g} additional contract(s) "
+            f"after the base position fills and {trigger_text}.",
         )
 
 
 async def _fetch_queued_message(item: dict) -> Optional[discord.Message]:
+    if str(item.get("transport") or "discord").lower() != "discord":
+        return None
     channel_id = int(str(item.get("channel_id") or "0") or 0)
     message_id = int(str(item.get("message_id") or "0") or 0)
     if not channel_id or not message_id:
@@ -2924,25 +3598,25 @@ async def _fetch_queued_message(item: dict) -> Optional[discord.Message]:
 
 
 def _condition_is_triggered(order: dict, current_price: float) -> bool:
+    """True once the watched price condition is unambiguously satisfied.
+
+    A further move past the trigger (e.g. a gap well below a "buy if below
+    $X" level) still satisfies the stated condition and must fire -- it must
+    never require price to stay within a band near the trigger, or a real
+    gap leaves the watch order silently stuck forever (it has no expiry).
+    """
     condition = str(order.get("condition_type") or "").lower()
     trigger_price = _as_float(order.get("condition_price"))
     action = str(order.get("action") or "").upper()
     if current_price <= 0 or trigger_price <= 0:
         return False
 
-    lower_band_pct = max(0.0, _as_float(config.conditional_trigger_band_pct, 5.0))
-    upper_band_pct = max(0.0, _as_float(config.conditional_trigger_upper_band_pct, 10.0))
-    upper_band = trigger_price * (1 + upper_band_pct / 100)
-    lower_band = trigger_price * (1 - lower_band_pct / 100)
-
     if condition == "limit_price":
-        if action == "BUY":
-            return lower_band <= current_price <= trigger_price
-        return trigger_price <= current_price <= upper_band
+        return current_price <= trigger_price if action == "BUY" else current_price >= trigger_price
     if condition in {"above", "close_above"}:
-        return trigger_price <= current_price <= upper_band
+        return current_price >= trigger_price
     if condition in {"below", "close_below"}:
-        return lower_band <= current_price <= trigger_price
+        return current_price <= trigger_price
     return False
 
 
@@ -2958,14 +3632,7 @@ async def _process_conditional_equity_orders() -> None:
         current_price = _as_float(current_price)
         if not _condition_is_triggered(order, current_price):
             continue
-        await asyncio.to_thread(remove_conditional_equity_order, str(order.get("id") or ""))
-        message = await _fetch_queued_message(order)
-        if not message:
-            await _send_channel(
-                config.discord_review_channel_id,
-                f"{symbol}: watched price condition triggered near ${current_price:.2f}, but the original Discord message could not be loaded. No paper trade placed.",
-            )
-            continue
+        message = await _fetch_queued_message(order) or _QueuedMessage(order)
         parsed = ParsedSignal(
             valid=True,
             action=str(order.get("action") or "").upper(),
@@ -2973,6 +3640,10 @@ async def _process_conditional_equity_orders() -> None:
             quantity=order.get("quantity"),
             raw_text=str(order.get("raw_input") or ""),
             reason=f"Watched price condition triggered at ${current_price:.2f}.",
+            order_type=str(order.get("order_type") or "market"),
+            limit_price=order.get("limit_price"),
+            stop_price=order.get("stop_price"),
+            time_in_force=str(order.get("time_in_force") or "DAY"),
         )
         await _send_review_or_reply(
             message,
@@ -2980,18 +3651,13 @@ async def _process_conditional_equity_orders() -> None:
             f"Processing with Agent {get_agent_mode()} mode.",
         )
         await _process_signal(message, parsed)
+        await asyncio.to_thread(remove_conditional_equity_order, str(order.get("id") or ""))
 
 
 async def _process_claimed_signal(item: dict) -> None:
     try:
-        message = await _fetch_queued_message(item)
-        if message:
-            await _process_queued_signal_message(message)
-        else:
-            await _send_channel(
-                config.discord_review_channel_id,
-                f"Queued signal could not be loaded, so it was skipped safely: {str(item.get('raw_text') or '')[:180]}",
-            )
+        message = await _fetch_queued_message(item) or _QueuedMessage(item)
+        await _process_queued_signal_message(message)
         await asyncio.to_thread(complete_signal, str(item.get("id") or ""))
     except Exception as exc:
         await asyncio.to_thread(
@@ -3066,7 +3732,7 @@ async def signal_queue_worker_error(error: BaseException) -> None:
 
 @bot.event
 async def on_ready() -> None:
-    global _QUEUE_RECOVERED
+    global _QUEUE_RECOVERED, _STARTUP_ORDER_RECOVERY_DONE
     if not _QUEUE_RECOVERED:
         recovered = await asyncio.to_thread(recover_inflight_signals)
         _QUEUE_RECOVERED = True
@@ -3074,10 +3740,27 @@ async def on_ready() -> None:
             logging.getLogger("discord_stock_prediction_agent").warning(
                 "Recovered %s interrupted signal(s) after restart.", recovered
             )
+    await asyncio.to_thread(_migrate_legacy_market_order_queue)
+    if not _STARTUP_ORDER_RECOVERY_DONE:
+        try:
+            await _recover_persisted_orders_on_startup()
+        except Exception:
+            logging.getLogger("discord_stock_prediction_agent").exception(
+                "Startup order recovery failed; the normal monitor will retry persisted orders."
+            )
+        finally:
+            _STARTUP_ORDER_RECOVERY_DONE = True
     if not signal_queue_worker.is_running():
         signal_queue_worker.start()
     if not stop_loss_monitor.is_running():
         stop_loss_monitor.start()
+    if config.whatsapp_webhook_enabled:
+        try:
+            start_whatsapp_webhook_server()
+        except OSError as exc:
+            logging.getLogger("discord_stock_prediction_agent").error(
+                "WhatsApp webhook could not start: %s", exc
+            )
     refresh_market_context_async()
     symbol_cache_status = await asyncio.to_thread(refresh_symbol_cache_from_alpaca)
     logging.getLogger("discord_stock_prediction_agent").info(
@@ -3088,6 +3771,10 @@ async def on_ready() -> None:
 
 
 async def _process_queued_signal_message(message: discord.Message) -> None:
+    if str(getattr(message, "transport", "discord")) == "whatsapp":
+        if await _try_dispatch_whatsapp_command(message):
+            return
+
     routed = classify_and_parse(message.content)
     symbol_for_event = ""
     action_for_event = ""
@@ -3134,10 +3821,6 @@ async def _process_queued_signal_message(message: discord.Message) -> None:
         return
 
     if routed.kind == "NO_TRADE":
-        try:
-            await message.add_reaction("💬")
-        except Exception:
-            pass
         await asyncio.to_thread(
             add_decision_history,
             {
@@ -3212,82 +3895,110 @@ async def stop_loss_monitor() -> None:
         return
     await _activate_filled_pending_buys()
     market_open, _ = await asyncio.to_thread(alpaca.is_market_open)
+    await _reconcile_pending_option_entry_orders()
+    await _reconcile_pending_multi_leg_entry_orders()
+    await _reconcile_pending_exit_orders()
     await _process_conditional_equity_orders()
     if market_open:
         await _process_pending_market_buys()
+        # Market orders normally fill immediately. Re-check now so protection
+        # can activate in the same monitor cycle instead of waiting a minute.
+        await _activate_filled_pending_buys()
         await _process_pending_sells()
         await _process_pending_option_orders()
+        await _reconcile_pending_option_entry_orders()
+        await _reconcile_pending_multi_leg_entry_orders()
     for position in list_positions():
         symbol = str(position.get("symbol") or "").upper()
         qty = _as_float(position.get("qty"))
         entry = _as_float(position.get("entry_price"))
-        stop_price = _as_float(position.get("stop_price")) or entry * (1 - config.stop_loss_pct / 100)
+        short_position = str(position.get("side") or "long").lower() == "short"
         if not symbol or qty <= 0 or entry <= 0:
             continue
+        levels = build_protection_levels(
+            entry,
+            stop_loss_pct=config.equity_stop_loss_pct,
+            take_profit_pct=config.equity_take_profit_pct,
+            short_position=short_position,
+        )
 
         alpaca_position, _ = await asyncio.to_thread(alpaca.get_position, symbol)
         if not alpaca_position:
             await asyncio.to_thread(remove_position, symbol)
             continue
 
-        held_qty = _as_float(alpaca_position.get("qty"))
+        # Alpaca reports a short position's qty as negative; abs() it or a
+        # genuinely-held short position looks like "no position" and gets its
+        # local protection tracking deleted right after opening.
+        held_qty = abs(_as_float(alpaca_position.get("qty")))
         current_price = _as_float(alpaca_position.get("current_price"))
         if held_qty <= 0:
             await asyncio.to_thread(remove_position, symbol)
             continue
-        if current_price <= 0 or current_price > stop_price:
+        trigger = evaluate_protection(current_price, levels, short_position=short_position)
+        if not trigger.triggered:
             continue
 
+        exit_reason = (
+            "protection_stop_loss"
+            if trigger.reason == "stop_loss"
+            else "protection_take_profit"
+        )
+        boundary_label = "stop" if trigger.reason == "stop_loss" else "target"
+        exit_side = "buy" if short_position else "sell"
+        exit_qty = min(qty, held_qty)
+
         if not market_open:
-            await asyncio.to_thread(add_pending_sell, symbol, min(qty, held_qty), "protection_market_closed")
+            await asyncio.to_thread(
+                enqueue_market_order,
+                symbol,
+                exit_side,
+                exit_qty,
+                exit_reason,
+                config.equity_stop_loss_pct,
+                f"protection:{symbol}:{entry:.6f}:{exit_reason}",
+                "BUY_TO_COVER" if short_position else "",
+            )
             continue
 
         open_order, _ = await asyncio.to_thread(alpaca.has_open_order, symbol)
         if open_order:
             continue
 
-        sell_qty = min(qty, held_qty)
         order, err = await asyncio.to_thread(
             alpaca.submit_market_order,
             symbol,
-            "sell",
-            sell_qty,
+            exit_side,
+            exit_qty,
             _client_order_id(
-                "equitystop",
-                f"{symbol}:{position.get('entry_price')}:{position.get('stop_price')}",
+                "equityprotect",
+                f"{symbol}:{entry}:{exit_reason}:{trigger.trigger_price}",
             ),
         )
         if order:
-            await asyncio.to_thread(_record_order, symbol, "sell", sell_qty, "submitted", str(order.get("id") or ""), "equity", "protection_stop_loss")
-            outcome = await asyncio.to_thread(
-                close_position_with_outcome,
-                symbol,
-                sell_qty,
-                current_price,
-                "protection_stop_loss",
+            await asyncio.to_thread(_record_order, symbol, exit_side, exit_qty, "submitted", str(order.get("id") or ""), "equity", exit_reason)
+            await _track_submitted_exit(
+                order, symbol, exit_qty, "equity", exit_reason
             )
-            if not outcome:
-                await asyncio.to_thread(remove_position, symbol)
             await _send_channel(
                 config.discord_paper_log_channel_id or config.discord_review_channel_id,
-                f"{symbol}: protection sell triggered. Current ${current_price:.2f} <= "
-                f"stop ${stop_price:.2f}. Sold {sell_qty:g} share(s)."
-                + (
-                    f" Learned outcome: {outcome.get('pnl_pct'):+.2f}%."
-                    if outcome else ""
-                ),
+                f"{symbol}: {boundary_label} protection triggered at ${current_price:.2f} "
+                f"(boundary ${trigger.trigger_price:.2f}). Submitted {exit_qty:g} share(s) "
+                f"to {'cover the short' if short_position else 'close the position'}; "
+                "awaiting Alpaca fill confirmation.",
             )
         else:
             await asyncio.to_thread(
                 record_safety_block,
-                {"symbol": symbol, "category": "protection_sell_failed", "reason": err},
+                {"symbol": symbol, "category": "protection_exit_failed", "reason": err},
             )
             await _send_channel(
                 config.discord_paper_log_channel_id or config.discord_review_channel_id,
-                f"{symbol}: protection sell attempted but was not placed. {_public_error(err)}",
+                f"{symbol}: protection {'cover' if short_position else 'sell'} attempted but was not placed. {_public_error(err)}",
             )
 
     await _process_option_exit_monitor(market_open)
+    await _process_multi_leg_exit_monitor(market_open)
 
 
 @stop_loss_monitor.before_loop
@@ -3310,7 +4021,8 @@ def _has_pending_option_exit(occ_symbol: str) -> bool:
     for pending in list_pending_option_orders():
         if str(pending.get("occ_symbol") or "").upper() != symbol:
             continue
-        if str(pending.get("order_side") or "buy").lower() == "sell":
+        intent = str(pending.get("position_intent") or "").lower()
+        if intent in {"sell_to_close", "buy_to_close"} or bool(pending.get("requires_position")):
             return True
     return False
 
@@ -3320,17 +4032,35 @@ async def _process_option_exit_monitor(market_open: bool) -> None:
     for position in list_option_positions():
         occ_symbol = str(position.get("occ_symbol") or "").upper()
         tracked_qty = _as_float(position.get("qty"))
-        stop_loss = _as_float(position.get("stop_loss"))
-        target_price = _as_float(position.get("target_price"))
+        entry_price = _as_float(position.get("entry_price"))
+        position_intent = str(position.get("position_intent") or "buy_to_open")
+        short_position = position_intent == "sell_to_open"
+        levels = build_protection_levels(
+            entry_price,
+            stop_loss_pct=(
+                _as_float(position.get("stop_loss_pct"))
+                or config.option_stop_loss_pct
+            ),
+            take_profit_pct=config.option_take_profit_pct,
+            short_position=short_position,
+            explicit_stop=_as_float(position.get("stop_loss")) or None,
+            explicit_target=_as_float(position.get("target_price")) or None,
+        )
+        stop_loss = levels.stop_price
+        target_price = levels.target_price
         target_prices = [
             _as_float(value) for value in (position.get("target_prices") or []) if _as_float(value) > 0
         ]
         target_index = max(0, int(_as_float(position.get("target_index"))))
         trailing_stop_pct = _as_float(position.get("trailing_stop_pct"))
         timed_exit = bool(position.get("exit_before_market_close"))
-        if not occ_symbol or tracked_qty <= 0:
-            continue
-        if stop_loss <= 0 and target_price <= 0 and not target_prices and trailing_stop_pct <= 0 and not timed_exit:
+        maximum_loss_amount = _as_float(position.get("maximum_loss_amount"))
+        underlying_exit_direction = str(position.get("exit_underlying_direction") or "").lower()
+        underlying_exit_price = _as_float(position.get("exit_underlying_price"))
+        exit_minutes_before_close = max(
+            1, int(_as_float(position.get("exit_minutes_before_close"), 15))
+        )
+        if not occ_symbol or tracked_qty <= 0 or entry_price <= 0:
             continue
 
         alpaca_position, _ = await asyncio.to_thread(alpaca.get_position, occ_symbol)
@@ -3346,7 +4076,10 @@ async def _process_option_exit_monitor(market_open: bool) -> None:
             await asyncio.to_thread(remove_option_position, occ_symbol)
             continue
 
-        held_qty = _as_float(alpaca_position.get("qty"))
+        # Alpaca reports a short (sell_to_open) position's qty as negative;
+        # abs() it or a genuinely-held short position looks like "no position"
+        # and gets its local protection tracking deleted right after opening.
+        held_qty = abs(_as_float(alpaca_position.get("qty")))
         if held_qty <= 0:
             await asyncio.to_thread(remove_option_position, occ_symbol)
             continue
@@ -3358,7 +4091,6 @@ async def _process_option_exit_monitor(market_open: bool) -> None:
         if current_price <= 0:
             continue
 
-        position_intent = str(position.get("position_intent") or "buy_to_open")
         if trailing_stop_pct > 0 and position_intent != "sell_to_open":
             peak_price = max(_as_float(position.get("peak_price")), current_price)
             if peak_price != _as_float(position.get("peak_price")):
@@ -3376,25 +4108,56 @@ async def _process_option_exit_monitor(market_open: bool) -> None:
                 clock, _ = await asyncio.to_thread(alpaca.get_clock)
             try:
                 next_close = datetime.fromisoformat(str((clock or {}).get("next_close") or "").replace("Z", "+00:00"))
-                exit_before_close_now = (next_close - datetime.now(next_close.tzinfo)).total_seconds() <= 15 * 60
+                seconds_to_close = (
+                    next_close - datetime.now(next_close.tzinfo)
+                ).total_seconds()
+                exit_before_close_now = 0 <= seconds_to_close <= exit_minutes_before_close * 60
             except (TypeError, ValueError):
                 exit_before_close_now = False
 
-        if position_intent == "sell_to_open":
-            hit_stop = stop_loss > 0 and current_price >= stop_loss
-            hit_target = active_target > 0 and current_price <= active_target
-        else:
-            hit_stop = stop_loss > 0 and current_price <= stop_loss
-            hit_target = active_target > 0 and current_price >= active_target
-        if not hit_stop and not hit_target and not exit_before_close_now:
+        active_levels = type(levels)(stop_loss, active_target)
+        protection = evaluate_protection(
+            current_price,
+            active_levels,
+            short_position=short_position,
+        )
+        hit_stop = protection.triggered and protection.reason == "stop_loss"
+        hit_target = protection.triggered and protection.reason == "take_profit"
+        if maximum_loss_amount > 0 and str(position.get("stop_loss_source") or "").startswith("default"):
+            # A signal-level dollar risk cap is the explicit stop instruction;
+            # do not let the generic percentage fallback close it first.
+            hit_stop = False
+        contract_pnl = (
+            (entry_price - current_price) if short_position else (current_price - entry_price)
+        ) * held_qty * 100.0
+        hit_max_loss = maximum_loss_amount > 0 and contract_pnl <= -maximum_loss_amount
+        hit_underlying_exit = False
+        underlying_observed = 0.0
+        if underlying_exit_direction in {"above", "below"} and underlying_exit_price > 0:
+            underlying_price, _ = await asyncio.to_thread(
+                alpaca.get_latest_price, str(position.get("root") or "")
+            )
+            underlying_observed = _as_float(underlying_price)
+            if underlying_observed > 0:
+                hit_underlying_exit = (
+                    underlying_observed > underlying_exit_price
+                    if underlying_exit_direction == "above"
+                    else underlying_observed < underlying_exit_price
+                )
+        if not hit_stop and not hit_target and not hit_max_loss and not hit_underlying_exit and not exit_before_close_now:
             continue
 
         exit_reason = (
             "option_stop_loss" if hit_stop
             else "option_target_price" if hit_target
+            else "option_maximum_loss" if hit_max_loss
+            else "option_underlying_stop" if hit_underlying_exit
             else "option_time_exit"
         )
-        trigger_price = stop_loss if hit_stop else active_target if hit_target else current_price
+        trigger_price = (
+            stop_loss if hit_stop else active_target if hit_target else
+            maximum_loss_amount if hit_max_loss else underlying_exit_price if hit_underlying_exit else current_price
+        )
         sell_qty = min(tracked_qty, held_qty)
         partial_target = bool(hit_target and target_prices and target_index < len(target_prices) - 1)
         if partial_target:
@@ -3416,14 +4179,16 @@ async def _process_option_exit_monitor(market_open: bool) -> None:
         if open_order:
             continue
 
+        exit_side = "buy" if short_position else "sell"
+        exit_intent = "buy_to_close" if short_position else "sell_to_close"
         order, err = await asyncio.to_thread(
             alpaca.submit_option_order,
             occ_symbol,
-            "sell",
+            exit_side,
             sell_qty,
             "market",
             None,
-            "sell_to_close",
+            exit_intent,
             _client_order_id(
                 "optionexit",
                 f"{occ_symbol}:{exit_reason}:{trigger_price}:{sell_qty}",
@@ -3450,17 +4215,15 @@ async def _process_option_exit_monitor(market_open: bool) -> None:
             )
             continue
 
-        await asyncio.to_thread(_record_order, occ_symbol, "sell", sell_qty, "submitted", str(order.get("id") or ""), "option", exit_reason)
-        remaining_qty = max(0.0, held_qty - sell_qty)
-        if partial_target and remaining_qty > 0:
-            await asyncio.to_thread(
-                update_option_position,
-                occ_symbol,
-                qty=round(remaining_qty, 6),
-                target_index=target_index + 1,
-            )
-        else:
-            await asyncio.to_thread(remove_option_position, occ_symbol)
+        await asyncio.to_thread(_record_order, occ_symbol, exit_side, sell_qty, "submitted", str(order.get("id") or ""), "option", exit_reason)
+        await _track_submitted_exit(
+            order,
+            occ_symbol,
+            sell_qty,
+            "option",
+            exit_reason,
+            target_index_after_fill=(target_index + 1 if partial_target else None),
+        )
         await asyncio.to_thread(
             record_option_journal_entry,
             {
@@ -3478,45 +4241,612 @@ async def _process_option_exit_monitor(market_open: bool) -> None:
         )
         await _send_channel(
             config.discord_paper_log_channel_id or config.discord_review_channel_id,
-            f"{occ_symbol}: option exit triggered at ${current_price:.2f}. Sold {sell_qty:g} contract(s).",
+            f"{occ_symbol}: option exit triggered at ${current_price:.2f}. Submitted {sell_qty:g} contract(s); awaiting Alpaca fill confirmation.",
         )
+
+
+def _multi_leg_close_specs(position: dict) -> list[dict]:
+    close_specs: list[dict] = []
+    for leg in position.get("legs") or []:
+        intent = str(leg.get("position_intent") or "").lower()
+        if intent == "buy_to_open":
+            close_side, close_intent = "sell", "sell_to_close"
+        elif intent == "sell_to_open":
+            close_side, close_intent = "buy", "buy_to_close"
+        else:
+            continue
+        close_specs.append(
+            {
+                **leg,
+                "side_order": close_side,
+                "position_intent": close_intent,
+                "requires_position": True,
+            }
+        )
+    return close_specs
+
+
+def _has_pending_multi_leg_exit(strategy_id: str) -> bool:
+    key = str(strategy_id or "")
+    if any(
+        str(item.get("strategy_id") or "") == key
+        and bool(item.get("is_multi_leg_exit"))
+        for item in list_pending_option_orders()
+    ):
+        return True
+    return any(
+        str(item.get("symbol") or "") == key
+        and str(item.get("asset_type") or "").lower() == "option_mleg"
+        for item in list_pending_exit_orders()
+    )
+
+
+def _queue_multi_leg_exit(position: dict, reason: str, current_net: float) -> None:
+    strategy_id = str(position.get("strategy_id") or "")
+    close_legs = _multi_leg_close_specs(position)
+    if not strategy_id or len(close_legs) < 2:
+        return
+    add_pending_option_order(
+        {
+            "pending_key": f"mleg-exit:{strategy_id}",
+            "order_class": "mleg",
+            "is_multi_leg_exit": True,
+            "strategy_id": strategy_id,
+            "root": position.get("root"),
+            "structure": f"exit_{position.get('structure') or 'multi_leg'}",
+            "qty": position.get("qty"),
+            "order_type": "market",
+            "limit_price": None,
+            "price_effect": position.get("price_effect"),
+            "legs": close_legs,
+            "contract_pending": False,
+            "reason": reason,
+            "observed_net_price": current_net,
+        }
+    )
+
+
+async def _process_multi_leg_exit_monitor(market_open: bool) -> None:
+    for position in list_multi_leg_positions():
+        strategy_id = str(position.get("strategy_id") or "")
+        qty = _as_float(position.get("qty"))
+        entry_net = _as_float(position.get("entry_net_price"))
+        close_legs = _multi_leg_close_specs(position)
+        if not strategy_id or qty <= 0 or entry_net <= 0 or len(close_legs) < 2:
+            continue
+        current_net_signed = 0.0
+        complete_quote = True
+        for leg in position.get("legs") or []:
+            symbol = str(leg.get("symbol") or "").upper()
+            price, _ = await asyncio.to_thread(alpaca.get_latest_option_price, symbol)
+            observed = _as_float(price)
+            if observed <= 0:
+                complete_quote = False
+                break
+            ratio = max(1, int(_as_float(leg.get("ratio_qty"), 1)))
+            sign = 1.0 if str(leg.get("side_order") or "").lower() == "buy" else -1.0
+            current_net_signed += sign * observed * ratio
+        if not complete_quote or abs(current_net_signed) <= 0:
+            continue
+        current_net = abs(current_net_signed)
+        short_strategy = str(position.get("price_effect") or "debit").lower() == "credit"
+        levels = build_protection_levels(
+            entry_net,
+            stop_loss_pct=config.option_stop_loss_pct,
+            take_profit_pct=config.option_take_profit_pct,
+            short_position=short_strategy,
+            explicit_stop=_as_float(position.get("stop_loss")) or None,
+            explicit_target=_as_float(position.get("target_price")) or None,
+        )
+        trigger = evaluate_protection(
+            current_net, levels, short_position=short_strategy
+        )
+        maximum_loss_amount = _as_float(position.get("maximum_loss_amount"))
+        strategy_pnl = (
+            (entry_net - current_net) if short_strategy else (current_net - entry_net)
+        ) * qty * 100.0
+        hit_max_loss = maximum_loss_amount > 0 and strategy_pnl <= -maximum_loss_amount
+        if (not trigger.triggered and not hit_max_loss) or _has_pending_multi_leg_exit(strategy_id):
+            continue
+        reason = (
+            "multi_leg_maximum_loss" if hit_max_loss and not trigger.triggered
+            else "multi_leg_stop_loss" if trigger.reason == "stop_loss"
+            else "multi_leg_take_profit"
+        )
+        if not market_open:
+            await asyncio.to_thread(_queue_multi_leg_exit, position, reason, current_net)
+            continue
+        enabled, _ = await asyncio.to_thread(alpaca.has_multi_leg_options_trading)
+        if not enabled:
+            continue
+        order, err = await asyncio.to_thread(
+            alpaca.submit_multi_leg_option_order,
+            _alpaca_multi_leg_payload(close_legs),
+            qty,
+            "market",
+            None,
+            _client_order_id("mlegexit", f"{strategy_id}:{reason}"),
+        )
+        if not order:
+            if _is_market_closed_order_error(err) or _is_transient_broker_error(err):
+                await asyncio.to_thread(_queue_multi_leg_exit, position, reason, current_net)
+            else:
+                await asyncio.to_thread(
+                    record_safety_block,
+                    {"symbol": position.get("root"), "category": reason, "reason": err},
+                )
+            continue
+        await _track_submitted_exit(
+            order,
+            strategy_id,
+            qty,
+            "option_mleg",
+            reason,
+        )
+        await asyncio.to_thread(
+            _record_order,
+            str(position.get("root") or ""),
+            "sell",
+            qty,
+            "submitted",
+            str(order.get("id") or ""),
+            "option_mleg",
+            reason,
+        )
+        await _send_channel(
+            config.discord_paper_log_channel_id or config.discord_review_channel_id,
+            f"{position.get('root')}: {reason.replace('multi_leg_', '').replace('_', ' ')} triggered "
+            f"at net ${current_net:.2f}. Atomic close submitted; awaiting Alpaca fill confirmation.",
+        )
+
+
+async def _submit_or_reconcile_queued_market_order(pending: dict) -> tuple[Optional[dict], str]:
+    """Submit once, or recover an order accepted before a process interruption."""
+    def usable(order: Optional[dict]) -> tuple[Optional[dict], str]:
+        if not order:
+            return None, ""
+        status = str(order.get("status") or "").lower()
+        if status in {"canceled", "expired", "rejected"}:
+            detail = str(order.get("reject_reason") or order.get("message") or status)
+            return None, f"Alpaca order is {status}: {detail}"
+        return order, ""
+
+    client_order_id = str(pending.get("client_order_id") or "")
+    if client_order_id:
+        existing, _ = await asyncio.to_thread(
+            alpaca.get_order_by_client_order_id, client_order_id
+        )
+        if existing:
+            return usable(existing)
+
+    submitter = getattr(alpaca, "submit_equity_order", None)
+    order_type = str(pending.get("order_type") or "market")
+    if submitter is None and order_type == "market":
+        order, err = await asyncio.to_thread(
+            alpaca.submit_market_order,
+            str(pending.get("symbol") or ""),
+            str(pending.get("side") or ""),
+            _as_float(pending.get("qty")),
+            client_order_id,
+        )
+    elif submitter is None:
+        return None, f"Broker adapter does not support {order_type} equity orders."
+    else:
+        order, err = await asyncio.to_thread(
+            submitter,
+            str(pending.get("symbol") or ""),
+            str(pending.get("side") or ""),
+            _as_float(pending.get("qty")),
+            order_type,
+            pending.get("limit_price"),
+            pending.get("stop_price"),
+            str(pending.get("time_in_force") or "DAY"),
+            client_order_id,
+        )
+    if order:
+        return usable(order)
+
+    # A timeout can happen after Alpaca accepted the request. Reconcile by the
+    # stable client_order_id before deciding that the submission failed.
+    if client_order_id:
+        existing, _ = await asyncio.to_thread(
+            alpaca.get_order_by_client_order_id, client_order_id
+        )
+        if existing:
+            return usable(existing)
+    return None, err
+
+
+async def _track_submitted_exit(
+    order: dict,
+    symbol: str,
+    qty: float,
+    asset_type: str,
+    reason: str,
+    **metadata: object,
+) -> None:
+    order_id = str(order.get("id") or "")
+    if not order_id:
+        return
+    await asyncio.to_thread(
+        add_pending_exit_order,
+        {
+            "order_id": order_id,
+            "symbol": symbol,
+            "requested_qty": qty,
+            "asset_type": asset_type,
+            "reason": reason,
+            **metadata,
+        },
+    )
+
+
+async def _track_submitted_option_entry(
+    order: dict,
+    occ_symbol: str,
+    qty: float,
+    metadata: dict,
+) -> None:
+    order_id = str(order.get("id") or "")
+    if not order_id:
+        return
+    await asyncio.to_thread(
+        add_pending_option_entry_order,
+        {
+            "order_id": order_id,
+            "occ_symbol": occ_symbol,
+            "requested_qty": qty,
+            **metadata,
+        },
+    )
+
+
+async def _track_submitted_multi_leg_entry(
+    order: dict,
+    qty: float,
+    metadata: dict,
+) -> None:
+    order_id = str(order.get("id") or "")
+    if not order_id:
+        return
+    await asyncio.to_thread(
+        add_pending_multi_leg_entry_order,
+        {
+            "order_id": order_id,
+            "strategy_id": order_id,
+            "requested_qty": qty,
+            **metadata,
+        },
+    )
+
+
+def _multi_leg_filled_net_price(order: dict, pending: dict) -> float:
+    top_level = abs(_as_float(order.get("filled_avg_price")))
+    if top_level > 0:
+        return top_level
+    broker_legs = {
+        str(item.get("symbol") or "").upper(): item
+        for item in (order.get("legs") or [])
+    }
+    net = 0.0
+    found = False
+    for leg in pending.get("legs") or []:
+        symbol = str(leg.get("symbol") or "").upper()
+        broker_leg = broker_legs.get(symbol) or {}
+        price = _as_float(
+            broker_leg.get("filled_avg_price") or broker_leg.get("avg_fill_price")
+        )
+        if price <= 0:
+            continue
+        ratio = max(1, int(_as_float(leg.get("ratio_qty"), 1)))
+        sign = 1.0 if str(leg.get("side_order") or "").lower() == "buy" else -1.0
+        net += sign * price * ratio
+        found = True
+    return abs(net) if found and abs(net) > 0 else 0.0
+
+
+async def _reconcile_pending_multi_leg_entry_orders() -> None:
+    """Activate strategy-level protection only after Alpaca confirms MLeg fills."""
+    for pending in _rotating_batch(
+        list_pending_multi_leg_entry_orders(), "pending_multi_leg_entries"
+    ):
+        order_id = str(pending.get("order_id") or "")
+        if not order_id:
+            await asyncio.to_thread(remove_pending_multi_leg_entry_order, order_id)
+            continue
+        order, err = await asyncio.to_thread(alpaca.get_order, order_id)
+        if not order:
+            if err:
+                logging.getLogger("discord_stock_prediction_agent").warning(
+                    "Could not reconcile multi-leg entry %s yet: %s",
+                    order_id,
+                    _public_error(err),
+                )
+            continue
+        status = str(order.get("status") or "").lower()
+        filled_qty = max(0.0, _as_float(order.get("filled_qty")))
+        reconciled_qty = max(0.0, _as_float(pending.get("reconciled_qty")))
+        newly_filled = max(0.0, filled_qty - reconciled_qty)
+        net_fill = _multi_leg_filled_net_price(order, pending)
+        if newly_filled > 0 and net_fill <= 0:
+            continue
+        if newly_filled > 0:
+            if bool(pending.get("protectable", True)):
+                await asyncio.to_thread(
+                    upsert_multi_leg_position,
+                    str(pending.get("strategy_id") or order_id),
+                    str(pending.get("root") or ""),
+                    str(pending.get("structure") or "multi_leg"),
+                    list(pending.get("legs") or []),
+                    newly_filled,
+                    net_fill,
+                    str(pending.get("price_effect") or "debit"),
+                    order_id,
+                    pending.get("stop_loss"),
+                    pending.get("target_price"),
+                    config.option_stop_loss_pct,
+                    config.option_take_profit_pct,
+                    pending.get("maximum_loss_amount"),
+                )
+            await asyncio.to_thread(
+                update_pending_multi_leg_entry_order,
+                order_id,
+                reconciled_qty=filled_qty,
+                last_status=status,
+                last_fill_price=net_fill,
+            )
+            reconciled_qty = filled_qty
+            await _send_channel(
+                config.discord_paper_log_channel_id or config.discord_review_channel_id,
+                f"{pending.get('root')}: Alpaca confirmed {newly_filled:g} multi-leg fill(s) "
+                f"at net ${net_fill:.2f}."
+                + (
+                    " Strategy protection is active."
+                    if bool(pending.get("protectable", True))
+                    else " The roll/closing strategy was reconciled without creating a new combined protection position."
+                ),
+            )
+        if status in {"filled", "canceled", "expired", "rejected"}:
+            if status == "filled" and filled_qty > reconciled_qty:
+                continue
+            if status != "filled":
+                await asyncio.to_thread(
+                    record_safety_block,
+                    {
+                        "symbol": str(pending.get("root") or ""),
+                        "category": "multi_leg_entry_not_filled",
+                        "reason": str(order.get("reject_reason") or status),
+                    },
+                )
+            await asyncio.to_thread(remove_pending_multi_leg_entry_order, order_id)
+
+
+async def _reconcile_pending_option_entry_orders() -> None:
+    """Create protected option positions only for quantities Alpaca actually filled."""
+    for pending in _rotating_batch(
+        list_pending_option_entry_orders(), "pending_option_entries"
+    ):
+        order_id = str(pending.get("order_id") or "")
+        occ_symbol = str(pending.get("occ_symbol") or "").upper()
+        if not order_id or not occ_symbol:
+            await asyncio.to_thread(remove_pending_option_entry_order, order_id)
+            continue
+        order, err = await asyncio.to_thread(alpaca.get_order, order_id)
+        if not order:
+            if err:
+                logging.getLogger("discord_stock_prediction_agent").warning(
+                    "Could not reconcile option entry %s yet: %s", order_id, _public_error(err)
+                )
+            continue
+        status = str(order.get("status") or "").lower()
+        filled_qty = max(0.0, _as_float(order.get("filled_qty")))
+        reconciled_qty = max(0.0, _as_float(pending.get("reconciled_qty")))
+        newly_filled = max(0.0, filled_qty - reconciled_qty)
+        fill_price = _as_float(order.get("filled_avg_price"))
+        if newly_filled > 0 and fill_price <= 0:
+            # Alpaca can expose the terminal status before fill pricing is
+            # populated. Keep the durable tracker and retry next cycle.
+            continue
+        if newly_filled > 0 and fill_price > 0:
+            await asyncio.to_thread(
+                upsert_option_position,
+                occ_symbol,
+                str(pending.get("root") or ""),
+                str(pending.get("side") or ""),
+                pending.get("strike"),
+                str(pending.get("expiry_date") or ""),
+                newly_filled,
+                fill_price,
+                order_id,
+                pending.get("stop_loss"),
+                pending.get("target_price"),
+                pending.get("signal_quality"),
+                str(pending.get("position_intent") or "buy_to_open"),
+                pending.get("target_prices"),
+                pending.get("trailing_stop_pct"),
+                bool(pending.get("exit_before_market_close")),
+                pending.get("exit_minutes_before_close"),
+                bool(pending.get("exit_if_target_not_hit")),
+                pending.get("risk_stop_pct"),
+                pending.get("position_type"),
+                pending.get("maximum_loss_amount"),
+                pending.get("exit_underlying_direction"),
+                pending.get("exit_underlying_price"),
+                pending.get("time_in_force"),
+                pending.get("stop_scope"),
+            )
+            await asyncio.to_thread(
+                update_pending_option_entry_order,
+                order_id,
+                reconciled_qty=filled_qty,
+                last_status=status,
+                last_fill_price=fill_price,
+            )
+            reconciled_qty = filled_qty
+            await _send_channel(
+                config.discord_paper_log_channel_id or config.discord_review_channel_id,
+                f"{occ_symbol}: Alpaca confirmed {newly_filled:g} option entry fill(s) at ${fill_price:.2f}. Protection monitoring is active.",
+            )
+
+        if status in {"filled", "canceled", "expired", "rejected"}:
+            if status == "filled" and filled_qty > reconciled_qty:
+                continue
+            if status != "filled":
+                await asyncio.to_thread(
+                    record_safety_block,
+                    {
+                        "symbol": occ_symbol,
+                        "category": "option_entry_not_filled",
+                        "reason": str(order.get("reject_reason") or status),
+                    },
+                )
+                await _send_channel(
+                    config.discord_paper_log_channel_id or config.discord_review_channel_id,
+                    f"{occ_symbol}: submitted option entry ended as {status}; no local position was created for unfilled quantity.",
+                )
+            await asyncio.to_thread(remove_pending_option_entry_order, order_id)
+
+
+async def _reconcile_pending_exit_orders() -> None:
+    """Apply position changes only after Alpaca reports actual exit fills."""
+    for pending in _rotating_batch(list_pending_exit_orders(), "pending_exits"):
+        order_id = str(pending.get("order_id") or "")
+        asset_type = str(pending.get("asset_type") or "equity").lower()
+        raw_symbol = str(pending.get("symbol") or "")
+        symbol = raw_symbol if asset_type == "option_mleg" else raw_symbol.upper()
+        if not order_id or not symbol:
+            await asyncio.to_thread(remove_pending_exit_order, order_id)
+            continue
+
+        order, err = await asyncio.to_thread(alpaca.get_order, order_id)
+        if not order:
+            if err:
+                logging.getLogger("discord_stock_prediction_agent").warning(
+                    "Could not reconcile exit order %s yet: %s", order_id, _public_error(err)
+                )
+            continue
+
+        status = str(order.get("status") or "").lower()
+        filled_qty = max(0.0, _as_float(order.get("filled_qty")))
+        reconciled_qty = max(0.0, _as_float(pending.get("reconciled_qty")))
+        newly_filled = max(0.0, filled_qty - reconciled_qty)
+        fill_price = _as_float(order.get("filled_avg_price"))
+        outcome = {}
+
+        if newly_filled > 0:
+            if asset_type not in {"option", "option_mleg"} and fill_price <= 0:
+                # Never learn or close local equity state using a quote as a
+                # substitute for the broker's real fill price.
+                continue
+            if asset_type == "option_mleg":
+                await asyncio.to_thread(
+                    reduce_or_remove_multi_leg_position, symbol, newly_filled
+                )
+            elif asset_type == "option":
+                broker_position, position_err = await asyncio.to_thread(
+                    alpaca.get_position, symbol
+                )
+                broker_qty = abs(_as_float((broker_position or {}).get("qty")))
+                if broker_position and broker_qty > 0:
+                    updates: dict[str, object] = {"qty": round(broker_qty, 6)}
+                    if status == "filled" and pending.get("target_index_after_fill") is not None:
+                        updates["target_index"] = int(pending["target_index_after_fill"])
+                    if status == "filled" and pending.get("move_stop_to_breakeven"):
+                        tracked = next(
+                            (
+                                item for item in list_option_positions()
+                                if str(item.get("occ_symbol") or "").upper() == symbol
+                            ),
+                            {},
+                        )
+                        entry_price = _as_float(tracked.get("entry_price"))
+                        if entry_price > 0:
+                            updates["stop_loss"] = entry_price
+                    await asyncio.to_thread(update_option_position, symbol, **updates)
+                elif status == "filled" and (
+                    not position_err or "no position" in position_err.lower()
+                ):
+                    await asyncio.to_thread(remove_option_position, symbol)
+            elif fill_price > 0:
+                outcome = await asyncio.to_thread(
+                    close_position_with_outcome,
+                    symbol,
+                    newly_filled,
+                    fill_price,
+                    str(pending.get("reason") or "broker_exit_fill"),
+                )
+                if not outcome:
+                    await asyncio.to_thread(reduce_or_remove_position, symbol, newly_filled)
+
+            await asyncio.to_thread(
+                update_pending_exit_order,
+                order_id,
+                reconciled_qty=filled_qty,
+                last_status=status,
+                last_fill_price=fill_price,
+            )
+            reconciled_qty = filled_qty
+            await _send_channel(
+                config.discord_paper_log_channel_id or config.discord_review_channel_id,
+                f"{symbol}: Alpaca confirmed {newly_filled:g} exit fill(s)"
+                + (f" at ${fill_price:.2f}" if fill_price > 0 else "")
+                + ". Local protection state was reconciled."
+                + (f" Learned outcome: {outcome.get('pnl_pct'):+.2f}%." if outcome else ""),
+            )
+
+        if status in {"filled", "canceled", "expired", "rejected"}:
+            if status == "filled" and filled_qty > reconciled_qty:
+                continue
+            if status != "filled":
+                await asyncio.to_thread(
+                    record_safety_block,
+                    {
+                        "symbol": symbol,
+                        "category": "submitted_exit_not_filled",
+                        "reason": str(order.get("reject_reason") or status),
+                    },
+                )
+                await _send_channel(
+                    config.discord_paper_log_channel_id or config.discord_review_channel_id,
+                    f"{symbol}: submitted exit ended as {status}. The tracked position was retained for safety.",
+                )
+            await asyncio.to_thread(remove_pending_exit_order, order_id)
 
 
 async def _process_pending_sells() -> None:
-    for pending in _rotating_batch(list_pending_sells(), "pending_sells"):
-        pending_key = str(pending.get("pending_key") or pending.get("symbol") or "")
+    queued_sells = [
+        item for item in list_queued_market_orders()
+        if str(item.get("side") or "").lower() == "sell"
+    ]
+    for pending in _rotating_batch(queued_sells, "pending_sells"):
+        pending_key = str(pending.get("queue_id") or "")
         symbol = str(pending.get("symbol") or "").upper()
         qty = _as_float(pending.get("qty"))
         if not symbol or qty <= 0:
-            await asyncio.to_thread(remove_pending_sell, pending_key)
-            continue
-        open_order, _ = await asyncio.to_thread(alpaca.has_open_order, symbol)
-        if open_order:
-            continue
-        ok, held, reason = await asyncio.to_thread(alpaca.has_sellable_quantity, symbol, qty)
-        if not ok:
-            await asyncio.to_thread(remove_pending_sell, pending_key)
-            await _send_channel(
-                config.discord_paper_log_channel_id or config.discord_review_channel_id,
-                f"{symbol}: queued SELL removed. {reason}",
+            await asyncio.to_thread(
+                mark_market_order_failed, pending_key, "Invalid queued SELL data."
             )
             continue
-        sell_qty = min(qty, held)
-        order, err = await asyncio.to_thread(
-            alpaca.submit_market_order,
-            symbol,
-            "sell",
-            sell_qty,
-            _client_order_id("queuedsell", pending_key),
-        )
+        is_short = str(pending.get("action") or "").upper() == "SELL_SHORT"
+        held = 0.0
+        if not is_short:
+            ok, held, reason = await asyncio.to_thread(alpaca.has_sellable_quantity, symbol, qty)
+            if not ok:
+                await asyncio.to_thread(mark_market_order_attempt, pending_key, reason)
+                continue
+        sell_qty = qty if is_short else min(qty, held)
+        pending["qty"] = sell_qty
+        order, err = await _submit_or_reconcile_queued_market_order(pending)
         if not order:
-            if _is_transient_broker_error(err):
+            if _is_market_closed_order_error(err) or _is_transient_broker_error(err):
+                await asyncio.to_thread(mark_market_order_attempt, pending_key, err)
                 logging.getLogger("discord_stock_prediction_agent").warning(
                     "Retaining queued SELL %s after transient Alpaca failure: %s",
                     pending_key,
                     _public_error(err),
                 )
                 continue
+            await asyncio.to_thread(mark_market_order_failed, pending_key, err)
             await asyncio.to_thread(
                 record_safety_block,
                 {"symbol": symbol, "category": "queued_sell_failed", "reason": err},
@@ -3527,72 +4857,185 @@ async def _process_pending_sells() -> None:
             )
             continue
         await asyncio.to_thread(_record_order, symbol, "sell", sell_qty, "submitted", str(order.get("id") or ""), "equity", "queued_sell")
-        await asyncio.to_thread(remove_pending_sell, pending_key)
-        exit_price, _ = await asyncio.to_thread(alpaca.get_latest_price, symbol)
-        outcome = {}
-        if _as_float(exit_price) > 0:
-            outcome = await asyncio.to_thread(
-                close_position_with_outcome,
+        if is_short:
+            # A queued SELL_SHORT is a brand-new short entry, not an exit of an
+            # existing position -- track it the same way _handle_sell does for
+            # an immediate fill, instead of treating it as closing something.
+            checked, _ = await asyncio.to_thread(alpaca.wait_for_order, str(order.get("id") or ""), 8)
+            checked = checked or order
+            entry_price = _as_float(checked.get("filled_avg_price"))
+            filled_qty = _as_float(checked.get("filled_qty")) or sell_qty
+            if entry_price > 0:
+                await asyncio.to_thread(
+                    upsert_position,
+                    symbol,
+                    filled_qty,
+                    entry_price,
+                    str(order.get("id") or ""),
+                    config.equity_stop_loss_pct,
+                    config.equity_take_profit_pct,
+                    "short",
+                )
+        else:
+            await _track_submitted_exit(
+                order,
                 symbol,
                 sell_qty,
-                _as_float(exit_price),
+                "equity",
                 str(pending.get("reason") or "queued_sell"),
             )
-        if not outcome:
-            await asyncio.to_thread(reduce_or_remove_position, symbol, sell_qty)
+        await asyncio.to_thread(remove_queued_market_order, pending_key)
         await _send_channel(
             config.discord_paper_log_channel_id or config.discord_review_channel_id,
-            f"{symbol}: queued SELL placed after market opened. Qty {sell_qty:g}."
-            + (
-                f" Learned outcome: {outcome.get('pnl_pct'):+.2f}%."
-                if outcome else ""
-            ),
+            f"{symbol}: queued {'SHORT SELL' if is_short else 'SELL'} submitted after market opened. "
+            f"Qty {sell_qty:g}; awaiting Alpaca fill confirmation.",
         )
 
 
 async def _process_pending_market_buys() -> None:
-    for pending in _rotating_batch(list_pending_buys(), "pending_buys"):
-        if not pending.get("queued"):
-            continue
-        pending_key = str(
-            pending.get("pending_key")
-            or pending.get("order_id")
-            or f"queued:{pending.get('symbol') or ''}"
-        )
+    queued_buys = [
+        item for item in list_queued_market_orders()
+        if str(item.get("side") or "").lower() == "buy"
+    ]
+    for pending in _rotating_batch(queued_buys, "pending_buys"):
+        pending_key = str(pending.get("queue_id") or "")
         symbol = str(pending.get("symbol") or "").upper()
         qty = _as_float(pending.get("qty"))
         if not symbol or qty <= 0:
-            await asyncio.to_thread(remove_pending_buy, pending_key)
+            await asyncio.to_thread(
+                mark_market_order_failed, pending_key, "Invalid queued BUY data."
+            )
             continue
-        order, err = await asyncio.to_thread(
-            alpaca.submit_market_order,
-            symbol,
-            "buy",
-            qty,
-            _client_order_id("queuedbuy", pending_key),
-        )
+        if str(pending.get("action") or "").upper() == "BUY_TO_COVER":
+            position, reason = await asyncio.to_thread(alpaca.get_position, symbol)
+            held = _as_float((position or {}).get("qty"))
+            if held >= 0:
+                await asyncio.to_thread(mark_market_order_attempt, pending_key, reason or "No short position to cover.")
+                continue
+            pending["qty"] = min(qty, abs(held))
+        order, err = await _submit_or_reconcile_queued_market_order(pending)
         if not order:
             if _is_market_closed_order_error(err) or _is_transient_broker_error(err):
+                await asyncio.to_thread(mark_market_order_attempt, pending_key, err)
                 continue
+            await asyncio.to_thread(mark_market_order_failed, pending_key, err)
             await asyncio.to_thread(
                 record_safety_block,
                 {"symbol": symbol, "category": "queued_buy_failed", "reason": err},
             )
-            await asyncio.to_thread(remove_pending_buy, pending_key)
             await _send_channel(
                 config.discord_paper_log_channel_id or config.discord_review_channel_id,
                 f"{symbol}: queued BUY attempted but was not placed. {_public_error(err)}",
             )
             continue
         order_id = str(order.get("id") or "")
-        await asyncio.to_thread(remove_pending_buy, pending_key)
+        if not order_id:
+            await asyncio.to_thread(
+                mark_market_order_attempt,
+                pending_key,
+                "Alpaca accepted the request without returning an order ID.",
+            )
+            continue
+        if str(pending.get("action") or "").upper() == "BUY_TO_COVER":
+            await _track_submitted_exit(
+                order, symbol, _as_float(pending.get("qty")), "equity", "queued_buy_to_cover"
+            )
+            await asyncio.to_thread(remove_queued_market_order, pending_key)
+            await _send_channel(
+                config.discord_paper_log_channel_id or config.discord_review_channel_id,
+                f"{symbol}: queued BUY TO COVER submitted after market opened. "
+                f"Qty {_as_float(pending.get('qty')):g}. Order ID `{order_id}`.",
+            )
+            continue
+        # Track the broker order before deleting the durable queue record. This
+        # ordering prevents a crash from losing the fill/protection lifecycle.
+        await asyncio.to_thread(
+            add_pending_buy,
+            symbol,
+            qty,
+            order_id,
+            config.equity_stop_loss_pct,
+            0.0,
+            config.equity_take_profit_pct,
+        )
+        await asyncio.to_thread(remove_queued_market_order, pending_key)
         await asyncio.to_thread(_record_order, symbol, "buy", qty, "submitted", order_id, "equity", "queued_buy")
-        if order_id:
-            await asyncio.to_thread(add_pending_buy, symbol, qty, order_id)
         await _send_channel(
             config.discord_paper_log_channel_id or config.discord_review_channel_id,
             f"{symbol}: queued BUY submitted after market opened. Qty {qty:g}. Order ID `{order_id or '-'}`.",
         )
+
+
+async def _recover_persisted_orders_on_startup() -> None:
+    """Immediately resume durable orders when a restarted agent finds an open market."""
+    logger = logging.getLogger("discord_stock_prediction_agent")
+    market_queue = await asyncio.to_thread(market_order_queue_summary)
+    option_queue_count = len(list_pending_option_orders())
+    if not market_queue["queued"] and not option_queue_count:
+        return
+    if not alpaca.ready():
+        logger.warning(
+            "Persisted orders are waiting, but Alpaca paper trading is not configured or enabled."
+        )
+        return
+
+    market_open, market_err = await asyncio.to_thread(alpaca.is_market_open)
+    if not market_open:
+        logger.info(
+            "Startup recovery retained %s equity and %s option order(s); market is closed%s.",
+            market_queue["queued"],
+            option_queue_count,
+            f" ({_public_error(market_err)})" if market_err else "",
+        )
+        return
+
+    logger.info(
+        "Market is open. Startup recovery is processing %s equity and %s option order(s).",
+        market_queue["queued"],
+        option_queue_count,
+    )
+    await _process_pending_market_buys()
+    await _activate_filled_pending_buys()
+    await _process_pending_sells()
+    await _process_pending_option_orders()
+    await _reconcile_pending_option_entry_orders()
+    await _reconcile_pending_multi_leg_entry_orders()
+
+    remaining = await asyncio.to_thread(market_order_queue_summary)
+    logger.info(
+        "Startup order recovery completed. Equity queue remaining: %s; option queue remaining: %s.",
+        remaining["queued"],
+        len(list_pending_option_orders()),
+    )
+
+
+def _migrate_legacy_market_order_queue() -> None:
+    """Move pre-upgrade queued equity orders out of agent_state.json once."""
+    for pending in list_pending_buys():
+        if not pending.get("queued"):
+            continue
+        pending_key = str(pending.get("pending_key") or pending.get("order_id") or "")
+        enqueue_market_order(
+            str(pending.get("symbol") or ""),
+            "buy",
+            _as_float(pending.get("qty")),
+            str(pending.get("reason") or "legacy_market_queue"),
+            config.stop_loss_pct,
+            pending_key,
+        )
+        remove_pending_buy(pending_key)
+
+    for pending in list_pending_sells():
+        pending_key = str(pending.get("pending_key") or pending.get("symbol") or "")
+        enqueue_market_order(
+            str(pending.get("symbol") or ""),
+            "sell",
+            _as_float(pending.get("qty")),
+            str(pending.get("reason") or "legacy_market_queue"),
+            config.stop_loss_pct,
+            pending_key,
+        )
+        remove_pending_sell(pending_key)
 
 
 async def _process_pending_multi_leg_order(pending: dict, pending_key: str) -> None:
@@ -3628,6 +5071,15 @@ async def _process_pending_multi_leg_order(pending: dict, pending_key: str) -> N
         held_qty = abs(_as_float((position or {}).get("qty")))
         required_qty = qty * max(1, int(leg.get("ratio_qty") or 1))
         if held_qty < required_qty:
+            return
+
+    trigger_direction = str(pending.get("underlying_trigger_direction") or "").lower()
+    trigger_price = _as_float(pending.get("underlying_trigger_price"))
+    if trigger_direction in {"above", "below"} and trigger_price > 0:
+        underlying_price, _ = await asyncio.to_thread(alpaca.get_latest_price, root)
+        observed = _as_float(underlying_price)
+        condition_met = observed > trigger_price if trigger_direction == "above" else observed < trigger_price
+        if observed <= 0 or not condition_met:
             return
 
     enabled, permission_err = await asyncio.to_thread(alpaca.has_multi_leg_options_trading)
@@ -3667,6 +5119,34 @@ async def _process_pending_multi_leg_order(pending: dict, pending_key: str) -> N
         return
 
     order_id = str(order.get("id") or "")
+    if bool(pending.get("is_multi_leg_exit")):
+        await _track_submitted_exit(
+            order,
+            str(pending.get("strategy_id") or ""),
+            qty,
+            "option_mleg",
+            str(pending.get("reason") or "multi_leg_exit"),
+        )
+    else:
+        await _track_submitted_multi_leg_entry(
+            order,
+            qty,
+            {
+                "root": root,
+                "structure": pending.get("structure"),
+                "legs": leg_specs,
+                "price_effect": pending.get("price_effect") or "debit",
+                "stop_loss": pending.get("stop_loss"),
+                "target_price": pending.get("target_price"),
+                "target_prices": pending.get("target_prices") or [],
+                "maximum_loss_amount": pending.get("maximum_loss_amount"),
+                "protectable": all(
+                    str(leg.get("position_intent") or "")
+                    in {"buy_to_open", "sell_to_open"}
+                    for leg in leg_specs
+                ),
+            },
+        )
     await asyncio.to_thread(remove_pending_option_order, pending_key)
     await asyncio.to_thread(
         _record_order,
@@ -3721,6 +5201,30 @@ async def _process_pending_option_orders() -> None:
             await asyncio.to_thread(remove_pending_option_order, pending_key)
             continue
 
+        if _option_cancel_deadline_passed(
+            pending.get("semantic_contract"), pending.get("created_at")
+        ):
+            await asyncio.to_thread(remove_pending_option_order, pending_key)
+            await asyncio.to_thread(
+                record_option_journal_entry,
+                {
+                    "occ_symbol": occ_symbol,
+                    "root": root,
+                    "side": side,
+                    "strike": pending.get("strike"),
+                    "expiry_date": pending.get("expiry_date"),
+                    "raw_input": pending.get("raw_input"),
+                    "semantic_contract": pending.get("semantic_contract") or {},
+                    "status": "conditional_entry_expired",
+                },
+            )
+            await _send_channel(
+                config.discord_paper_log_channel_id
+                or config.discord_review_channel_id,
+                f"{occ_symbol or root}: conditional entry deadline passed. The queued signal was removed without submitting an order.",
+            )
+            continue
+
         if pending.get("contract_pending"):
             contracts = None
             original_expiry = str(pending.get("expiry_date") or "")
@@ -3770,11 +5274,17 @@ async def _process_pending_option_orders() -> None:
         position_intent = str(pending.get("position_intent") or ("sell_to_close" if order_side == "sell" else "buy_to_open"))
         requires_position = bool(pending.get("requires_position"))
         if requires_position:
+            base_order_id = str(pending.get("base_order_id") or "")
+            if bool(pending.get("scale_in_order")) and base_order_id:
+                base_order, _ = await asyncio.to_thread(alpaca.get_order, base_order_id)
+                if str((base_order or {}).get("status") or "").lower() != "filled":
+                    continue
             alpaca_position, _ = await asyncio.to_thread(alpaca.get_position, occ_symbol)
             held_qty = abs(_as_float((alpaca_position or {}).get("qty")))
             if held_qty <= 0:
                 continue
-            qty = min(qty, held_qty)
+            if not bool(pending.get("scale_in_order")):
+                qty = min(qty, held_qty)
 
         order, err = await asyncio.to_thread(
             alpaca.submit_option_order,
@@ -3804,30 +5314,22 @@ async def _process_pending_option_orders() -> None:
             )
             continue
 
-        await asyncio.to_thread(remove_pending_option_order, pending_key)
         await asyncio.to_thread(_record_order, occ_symbol, order_side, qty, "submitted", str(order.get("id") or ""), "option", reason)
         if position_intent in {"sell_to_close", "buy_to_close"}:
-            remaining_qty = _as_float(pending.get("remaining_qty"))
-            if remaining_qty > 0:
-                updates = {
-                    "qty": round(remaining_qty, 6),
-                    "target_index": int(_as_float(pending.get("next_target_index"))),
-                }
-                if pending.get("move_stop_to_breakeven"):
-                    tracked = next(
-                        (item for item in list_option_positions() if str(item.get("occ_symbol") or "").upper() == occ_symbol.upper()),
-                        {},
-                    )
-                    entry = _as_float(tracked.get("entry_price"))
-                    if entry > 0:
-                        updates["stop_loss"] = entry
-                await asyncio.to_thread(
-                    update_option_position,
-                    occ_symbol,
-                    **updates,
-                )
-            else:
-                await asyncio.to_thread(remove_option_position, occ_symbol)
+            await _track_submitted_exit(
+                order,
+                occ_symbol,
+                qty,
+                "option",
+                reason,
+                target_index_after_fill=(
+                    int(_as_float(pending.get("next_target_index")))
+                    if pending.get("next_target_index") is not None
+                    else None
+                ),
+                move_stop_to_breakeven=bool(pending.get("move_stop_to_breakeven")),
+            )
+            await asyncio.to_thread(remove_pending_option_order, pending_key)
             await asyncio.to_thread(
                 record_option_journal_entry,
                 {
@@ -3851,24 +5353,43 @@ async def _process_pending_option_orders() -> None:
             )
             continue
 
-        await asyncio.to_thread(
-            upsert_option_position,
+        await _track_submitted_option_entry(
+            order,
             occ_symbol,
-            root,
-            side,
-            _as_float(pending.get("strike")),
-            str(pending.get("expiry_date") or ""),
             qty,
-            _as_float(limit_price),
-            str(order.get("id") or ""),
-            pending.get("stop_loss"),
-            pending.get("target_price"),
-            pending.get("signal_quality"),
-            position_intent,
-            pending.get("target_prices"),
-            pending.get("trailing_stop_pct"),
-            bool(pending.get("exit_before_market_close")),
+            {
+                "root": root,
+                "side": side,
+                "strike": pending.get("strike"),
+                "expiry_date": str(pending.get("expiry_date") or ""),
+                "stop_loss": pending.get("stop_loss"),
+                "target_price": pending.get("target_price"),
+                "target_prices": pending.get("target_prices"),
+                "trailing_stop_pct": pending.get("trailing_stop_pct"),
+                "exit_before_market_close": bool(pending.get("exit_before_market_close")),
+                "exit_minutes_before_close": pending.get("exit_minutes_before_close"),
+                "exit_if_target_not_hit": bool(pending.get("exit_if_target_not_hit")),
+                "risk_stop_pct": pending.get("risk_stop_pct"),
+                "maximum_loss_amount": pending.get("maximum_loss_amount"),
+                "position_type": pending.get("position_type"),
+                "exit_underlying_direction": pending.get("exit_underlying_direction"),
+                "exit_underlying_price": pending.get("exit_underlying_price"),
+                "time_in_force": pending.get("time_in_force"),
+                "stop_scope": pending.get("stop_scope"),
+                "semantic_contract": pending.get("semantic_contract") or {},
+                "signal_quality": pending.get("signal_quality"),
+                "position_intent": position_intent,
+            },
         )
+        if reason != "conditional_scale_in" and (
+            pending.get("add_trigger_premium")
+            or pending.get("add_trigger_underlying_price")
+        ):
+            scale_metadata = dict(pending)
+            scale_metadata["occ_symbol"] = occ_symbol
+            scale_metadata["base_order_id"] = str(order.get("id") or "")
+            await asyncio.to_thread(_queue_conditional_option_scale_in, scale_metadata)
+        await asyncio.to_thread(remove_pending_option_order, pending_key)
         await asyncio.to_thread(
             record_option_journal_entry,
             {
@@ -3884,15 +5405,15 @@ async def _process_pending_option_orders() -> None:
                 "signal_quality": pending.get("signal_quality"),
                 "risk_reward": pending.get("risk_reward"),
                 "raw_input": pending.get("raw_input"),
-                "status": "queued_order_placed",
+                "status": "queued_order_submitted",
             },
         )
         await _send_channel(
             config.discord_paper_log_channel_id or config.discord_review_channel_id,
-            f"{occ_symbol}: queued option {order_side.upper()} placed successfully after monitor check. "
+            f"{occ_symbol}: queued option {order_side.upper()} submitted successfully after monitor check. "
             f"Qty {qty:g}, type={order_type}"
             f"{' @ $' + f'{_as_float(limit_price):.2f}' if _as_float(limit_price) > 0 else ''}. "
-            f"Order ID `{order.get('id') or '-'}`.",
+            f"Order ID `{order.get('id') or '-'}`. Position protection activates after Alpaca confirms fills.",
         )
 
 
@@ -3915,40 +5436,65 @@ async def _activate_filled_pending_buys() -> None:
         filled_qty = _as_float(order.get("filled_qty"))
         if entry_price <= 0 or filled_qty <= 0:
             continue
+        protected_qty = _as_float(pending.get("protected_qty"))
+        newly_filled_qty = max(0.0, filled_qty - protected_qty)
+        stop_loss_pct = config.equity_stop_loss_pct
+        take_profit_pct = config.equity_take_profit_pct
+        if newly_filled_qty <= 0:
+            if status == "filled":
+                await asyncio.to_thread(remove_pending_buy, order_id)
+            continue
         await asyncio.to_thread(
             upsert_position,
             symbol,
-            filled_qty,
+            newly_filled_qty,
             entry_price,
             order_id,
-            config.stop_loss_pct,
+            stop_loss_pct,
+            take_profit_pct,
         )
-        await asyncio.to_thread(remove_pending_buy, order_id)
-        stop_price = entry_price * (1 - config.stop_loss_pct / 100)
+        if status == "filled":
+            await asyncio.to_thread(remove_pending_buy, order_id)
+        else:
+            await asyncio.to_thread(
+                update_pending_buy_protected_qty, order_id, filled_qty
+            )
+        levels = build_protection_levels(
+            entry_price,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+        )
         await _send_channel(
             config.discord_paper_log_channel_id or config.discord_review_channel_id,
-            f"{symbol}: buy order filled. Protection active near ${stop_price:.2f} "
-            f"({config.stop_loss_pct:.1f}% below ${entry_price:.2f}).",
+            f"{symbol}: {newly_filled_qty:g} newly filled share(s). Protection active: "
+            f"loss ${levels.stop_price:.2f} (-{stop_loss_pct:.1f}%) and profit "
+            f"${levels.target_price:.2f} (+{take_profit_pct:.1f}%) from fill ${entry_price:.2f}.",
         )
 
 
-@bot.command(name="agent_status")
-async def agent_status(ctx: commands.Context) -> None:
+async def _build_agent_status_text() -> str:
     alpaca_status = "configured" if alpaca.ready() else "not configured/disabled"
     tracked = list_positions()
     tracked_options = list_option_positions()
     summary = get_daily_summary()
     queue = await asyncio.to_thread(queue_stats)
-    await _send_context_output(
-        ctx,
+    market_queue = await asyncio.to_thread(market_order_queue_summary)
+    return (
         f"{config.agent_name} is online. Agent mode: {get_agent_mode()}. "
         f"Alpaca paper trading: {alpaca_status}. "
         f"Tracked equity positions: {len(tracked)}. Tracked option positions: {len(tracked_options)}. "
         f"Signal queue: {queue['queued']} waiting, {queue['processing']} processing, "
         f"{queue['dead']} dead-letter. Workers: {max(1, min(16, config.signal_worker_concurrency))}. "
+        f"Market orders waiting for Alpaca: {market_queue['queued']} queued, "
+        f"{market_queue['failed']} failed. "
         f"Today: {summary['signals']} signal(s), {summary['orders']} order event(s), "
         f"{summary['blocks']} safety block(s)."
     )
+
+
+@bot.command(name="agent_status")
+async def agent_status(ctx: commands.Context) -> None:
+    await _send_context_output(ctx, await _build_agent_status_text())
 
 
 async def _can_manage_agent_mode(ctx: commands.Context) -> bool:
@@ -3964,14 +5510,17 @@ async def _can_manage_agent_mode(ctx: commands.Context) -> bool:
         return False
 
 
-async def _set_agent_mode_from_command(ctx: commands.Context, mode: str) -> None:
-    if not await _can_manage_agent_mode(ctx):
-        await _send_context_output(
-            ctx,
-            "You need Administrator or Manage Server permission to change Agent mode.",
-        )
-        return
-    control = await asyncio.to_thread(set_agent_mode, mode, str(ctx.author.id))
+def _is_whatsapp_admin(sender_id: str) -> bool:
+    """WhatsApp equivalent of _can_manage_agent_mode -- there is no guild-
+    permission concept on WhatsApp, so a separate, explicit allowlist gates
+    mode-changing/admin commands there.
+    """
+    allowed = {item.strip() for item in str(config.whatsapp_admin_sender_ids or "").split(",") if item.strip()}
+    return bool(allowed) and str(sender_id or "").strip() in allowed
+
+
+async def _build_agent_mode_change_text(mode: str, changed_by: str) -> str:
+    control = await asyncio.to_thread(set_agent_mode, mode, changed_by)
     if control["mode"] == "ON":
         detail = "Prediction and options-strategy decision checks are active."
     else:
@@ -3979,7 +5528,17 @@ async def _set_agent_mode_from_command(ctx: commands.Context, mode: str) -> None
             "Every valid BUY/SELL signal will proceed directly to paper-order handling. "
             "Market, contract, position, price-condition, and broker safeguards remain active."
         )
-    await _send_context_output(ctx, f"Agent mode is now {control['mode']}. {detail}")
+    return f"Agent mode is now {control['mode']}. {detail}"
+
+
+async def _set_agent_mode_from_command(ctx: commands.Context, mode: str) -> None:
+    if not await _can_manage_agent_mode(ctx):
+        await _send_context_output(
+            ctx,
+            "You need Administrator or Manage Server permission to change Agent mode.",
+        )
+        return
+    await _send_context_output(ctx, await _build_agent_mode_change_text(mode, str(ctx.author.id)))
 
 
 @bot.command(name="agent_on")
@@ -3992,50 +5551,60 @@ async def agent_off(ctx: commands.Context) -> None:
     await _set_agent_mode_from_command(ctx, "OFF")
 
 
-@bot.command(name="agent_mode")
-async def agent_mode(ctx: commands.Context) -> None:
+async def _build_agent_mode_text() -> str:
     mode = get_agent_mode()
     detail = (
         "normal prediction and strategy decisions are active"
         if mode == "ON"
         else "valid incoming BUY/SELL signals go directly to paper-order handling"
     )
-    await _send_context_output(ctx, f"Agent mode: {mode}. {detail}.")
+    return f"Agent mode: {mode}. {detail}."
+
+
+@bot.command(name="agent_mode")
+async def agent_mode(ctx: commands.Context) -> None:
+    await _send_context_output(ctx, await _build_agent_mode_text())
+
+
+async def _build_agent_positions_text() -> str:
+    tracked = list_positions()
+    if not tracked:
+        return "No positions are currently tracked by this agent."
+    lines = [
+        f"{p['symbol']} ({str(p.get('side') or 'long').upper()}): qty {p['qty']}, "
+        f"entry ${float(p['entry_price']):.2f}, stop ${float(p['stop_price']):.2f}, "
+        f"target ${float(p.get('target_price') or 0):.2f}"
+        for p in tracked
+    ]
+    return "\n".join(lines)
 
 
 @bot.command(name="agent_positions")
 async def agent_positions(ctx: commands.Context) -> None:
-    tracked = list_positions()
+    await _send_context_output(ctx, await _build_agent_positions_text())
+
+
+async def _build_agent_option_positions_text() -> str:
+    tracked = list_option_positions()
     if not tracked:
-        await _send_context_output(ctx, "No positions are currently tracked by this agent.")
-        return
+        return "No option positions are currently tracked by this agent."
     lines = [
-        f"{p['symbol']}: qty {p['qty']}, entry ${float(p['entry_price']):.2f}, "
-        f"stop ${float(p['stop_price']):.2f}"
+        f"{p['occ_symbol']} ({str(p.get('position_intent') or 'buy_to_open').upper()}): "
+        f"qty {p['qty']}, entry ${float(p['entry_price']):.2f}"
         for p in tracked
     ]
-    await _send_context_output(ctx, "\n".join(lines))
+    return "\n".join(lines)
 
 
 @bot.command(name="agent_option_positions")
 async def agent_option_positions(ctx: commands.Context) -> None:
-    tracked = list_option_positions()
-    if not tracked:
-        await _send_context_output(ctx, "No option positions are currently tracked by this agent.")
-        return
-    lines = [
-        f"{p['occ_symbol']}: qty {p['qty']}, entry ${float(p['entry_price']):.2f}"
-        for p in tracked
-    ]
-    await _send_context_output(ctx, "\n".join(lines))
+    await _send_context_output(ctx, await _build_agent_option_positions_text())
 
 
-@bot.command(name="agent_summary")
-async def agent_summary(ctx: commands.Context) -> None:
+async def _build_agent_summary_text() -> str:
     summary = get_daily_summary()
     queue = await asyncio.to_thread(queue_stats)
-    await _send_context_output(
-        ctx,
+    return (
         "Daily Agent Summary\n"
         f"Date UTC: {summary['date_utc']}\n"
         f"Signals processed: {summary['signals']}\n"
@@ -4051,8 +5620,72 @@ async def agent_summary(ctx: commands.Context) -> None:
     )
 
 
-@bot.command(name="agent_learning")
-async def agent_learning(ctx: commands.Context) -> None:
+@bot.command(name="agent_summary")
+async def agent_summary(ctx: commands.Context) -> None:
+    await _send_context_output(ctx, await _build_agent_summary_text())
+
+
+async def _build_agent_health_text() -> str:
+    """Operational readiness without exposing credentials or account data."""
+    queue = await asyncio.to_thread(queue_stats)
+    market_queue = await asyncio.to_thread(market_order_queue_summary)
+    market_open, market_error = await asyncio.to_thread(alpaca.is_market_open)
+    status = "READY" if not production_config_errors() else "DEGRADED"
+    lines = [
+        f"Agent Health: {status}",
+        f"Agent mode: {get_agent_mode()}",
+        f"Alpaca paper configured: {config.has_alpaca and config.uses_paper_alpaca_endpoint}",
+        f"Alpaca market open: {market_open}",
+        f"Signal workers: {max(1, min(16, config.signal_worker_concurrency))}",
+        f"Signal queue: {queue['queued']} queued / {queue['processing']} processing / {queue['dead']} dead",
+        f"Market-order queue: {market_queue['queued']} queued / {market_queue['failed']} failed",
+        f"WhatsApp webhook: {'enabled' if config.whatsapp_webhook_enabled else 'disabled'}",
+    ]
+    if market_error:
+        lines.append("Alpaca clock check is temporarily unavailable.")
+    return "\n".join(lines)
+
+
+@bot.command(name="agent_health")
+async def agent_health(ctx: commands.Context) -> None:
+    await _send_context_output(ctx, await _build_agent_health_text())
+
+
+async def _build_agent_dead_letters_text() -> str:
+    dead = await asyncio.to_thread(list_dead_signals, 10)
+    if not dead:
+        return "No dead-letter signals are waiting."
+    lines = [f"Dead-letter signals: {len(dead)} shown"]
+    for item in dead:
+        raw = re.sub(r"\s+", " ", str(item.get("raw_text") or "")).strip()
+        lines.append(
+            f"- {str(item.get('id') or '')[:10]} [{item.get('transport', 'discord')}] "
+            f"attempts={item.get('attempts', 0)}: {raw[:120]}"
+        )
+    return "\n".join(lines)
+
+
+@bot.command(name="agent_dead_letters")
+async def agent_dead_letters(ctx: commands.Context) -> None:
+    await _send_context_output(ctx, await _build_agent_dead_letters_text())
+
+
+async def _build_agent_retry_dead_text(limit: int) -> str:
+    retried = await asyncio.to_thread(retry_dead_signals, max(1, min(1_000, limit)))
+    return f"Returned {retried} dead-letter signal(s) to the queue."
+
+
+@bot.command(name="agent_retry_dead")
+async def agent_retry_dead(ctx: commands.Context, limit: int = 100) -> None:
+    if not await _can_manage_agent_mode(ctx):
+        await _send_context_output(
+            ctx, "You need Administrator or Manage Server permission to retry dead letters."
+        )
+        return
+    await _send_context_output(ctx, await _build_agent_retry_dead_text(limit))
+
+
+async def _build_agent_learning_text() -> str:
     profile = get_learning_profile()
     summary = get_signal_learning_summary()
     parser_summary = get_parser_learning_summary()
@@ -4071,11 +5704,15 @@ async def agent_learning(ctx: commands.Context) -> None:
             f"- {item.get('key')}: seen {item.get('seen')}, approval {item.get('approval_rate')}%, "
             f"avg return {item.get('avg_return')}%, avg score {item.get('avg_score')}"
         )
-    await _send_context_output(ctx, "\n".join(lines))
+    return "\n".join(lines)
 
 
-@bot.command(name="agent_option_validation")
-async def agent_option_validation(ctx: commands.Context) -> None:
+@bot.command(name="agent_learning")
+async def agent_learning(ctx: commands.Context) -> None:
+    await _send_context_output(ctx, await _build_agent_learning_text())
+
+
+async def _build_agent_option_validation_text() -> str:
     summary = get_option_validation_summary()
     lines = [
         "Option Validation Summary",
@@ -4090,7 +5727,86 @@ async def agent_option_validation(ctx: commands.Context) -> None:
             f"exact={item.get('exact_status') or '-'}, proxy={item.get('proxy_status') or '-'}, "
             f"final={item.get('status')}"
         )
-    await _send_context_output(ctx, "\n".join(lines))
+    return "\n".join(lines)
+
+
+@bot.command(name="agent_option_validation")
+async def agent_option_validation(ctx: commands.Context) -> None:
+    await _send_context_output(ctx, await _build_agent_option_validation_text())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WhatsApp command parity -- same builder functions as the Discord @bot.command
+# handlers above, since WhatsApp messages never reach Discord's command
+# dispatch (they arrive via the webhook straight into the durable queue, not
+# discord.py's gateway). See _try_dispatch_whatsapp_command's call site in
+# _process_queued_signal_message.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_WHATSAPP_ADMIN_COMMANDS = {"agent_on", "agent_off", "agent_retry_dead"}
+_WHATSAPP_NOT_AUTHORIZED_TEXT = (
+    "You are not authorized to run this command from WhatsApp. "
+    "Ask an operator to add your sender ID to WHATSAPP_ADMIN_SENDER_IDS."
+)
+
+
+async def _dispatch_whatsapp_command_text(name: str, args: list[str], sender_id: str) -> Optional[str]:
+    """Return the response text for a recognized command name, or None if
+    `name` isn't one of the 12 known commands (caller should then treat the
+    message as a normal signal instead).
+    """
+    if name in _WHATSAPP_ADMIN_COMMANDS and not _is_whatsapp_admin(sender_id):
+        return _WHATSAPP_NOT_AUTHORIZED_TEXT
+
+    if name == "agent_status":
+        return await _build_agent_status_text()
+    if name == "agent_on":
+        return await _build_agent_mode_change_text("ON", sender_id)
+    if name == "agent_off":
+        return await _build_agent_mode_change_text("OFF", sender_id)
+    if name == "agent_mode":
+        return await _build_agent_mode_text()
+    if name == "agent_positions":
+        return await _build_agent_positions_text()
+    if name == "agent_option_positions":
+        return await _build_agent_option_positions_text()
+    if name == "agent_summary":
+        return await _build_agent_summary_text()
+    if name == "agent_health":
+        return await _build_agent_health_text()
+    if name == "agent_dead_letters":
+        return await _build_agent_dead_letters_text()
+    if name == "agent_retry_dead":
+        limit = int(args[0]) if args and args[0].isdigit() else 100
+        return await _build_agent_retry_dead_text(limit)
+    if name == "agent_learning":
+        return await _build_agent_learning_text()
+    if name == "agent_option_validation":
+        return await _build_agent_option_validation_text()
+    return None
+
+
+async def _try_dispatch_whatsapp_command(message) -> bool:
+    """If this WhatsApp message is one of the 12 !agent_* commands, handle it
+    and reply; return True so the caller skips normal signal processing.
+    Returns False for anything else (including unrecognized !words), leaving
+    it to flow through classify_and_parse as a normal signal.
+    """
+    text = str(getattr(message, "content", "") or "").strip()
+    if not text.startswith("!"):
+        return False
+    parts = text[1:].split()
+    if not parts:
+        return False
+    name = parts[0].strip().lower()
+    args = parts[1:]
+    sender_id = str(getattr(getattr(message, "author", None), "id", "") or "")
+
+    response = await _dispatch_whatsapp_command_text(name, args, sender_id)
+    if response is None:
+        return False
+    await _send_review_or_reply(message, response)
+    return True
 
 
 def main() -> None:

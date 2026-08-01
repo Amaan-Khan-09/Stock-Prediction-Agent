@@ -187,9 +187,11 @@ SIGNAL_RETRY_BASE_SECONDS=5
 SIGNAL_CLAIM_TIMEOUT_SECONDS=600
 PENDING_ORDER_BATCH_SIZE=100
 
-STOP_MONITOR_SECONDS=60
-AGENT_STOP_LOSS_PCT=0.5
-CONDITIONAL_TRIGGER_BAND_PCT=5.0
+PROTECTION_MONITOR_SECONDS=15
+EQUITY_STOP_LOSS_PCT=1.0
+EQUITY_TAKE_PROFIT_PCT=10.0
+OPTION_STOP_LOSS_PCT=5.0
+OPTION_TAKE_PROFIT_PCT=10.0
 MAX_EQUITY_QTY=1000000
 MAX_OPTION_QTY=1000
 MAX_DAILY_PAPER_TRADES=20
@@ -255,6 +257,58 @@ Run the Discord agent in a separate terminal, from the project root:
 python -m discord_stock_prediction_agent.discord_agent
 ```
 
+The same process can serve Discord and WhatsApp. Configure the `WHATSAPP_*`
+variables in `.env`, set `WHATSAPP_WEBHOOK_ENABLED=true`, and restart the agent.
+The signed webhook endpoints are:
+
+```text
+GET/POST http://localhost:5000/webhook
+GET      http://localhost:5000/healthz
+```
+
+Meta must reach `/webhook` through a public HTTPS URL. POST requests are rejected
+unless `X-Hub-Signature-256` matches `WHATSAPP_APP_SECRET`. Text, media captions,
+button replies, and list replies enter the same durable queue, parser, Agent ON/OFF
+decision layer, Alpaca paper-order lifecycle, and protection monitors as Discord.
+Use `WHATSAPP_ALLOWED_SENDER_IDS` and `WHATSAPP_ALLOWED_GROUP_IDS` as optional
+comma-separated allowlists.
+
+Signal replies and command output already reach WhatsApp because they're sent
+in response to an incoming message. Proactive/background alerts (protection
+stop-loss/take-profit triggers, a queued order finally filling once the market
+opens, a contract becoming tradable) are different: they're raised by the
+periodic monitor loop with no incoming message to reply to, so there's nothing
+to infer a WhatsApp destination from. Set `WHATSAPP_ALERT_TARGET` (a phone
+number, or the signals group ID with `WHATSAPP_ALERT_IS_GROUP=true`, the
+default) to also receive this whole class of alert on WhatsApp — the same
+role `AGENT_REVIEW_CHANNEL_ID` / `DISCORD_PAPER_LOG_CHANNEL_ID` play on Discord.
+Leave it blank to keep these alerts Discord-only.
+
+All 12 `!agent_*` commands listed under **Useful status commands** above also work
+from WhatsApp (same `!` prefix, same reply text, built from the same underlying
+functions as Discord) — WhatsApp messages skip Discord's own command dispatcher, so
+a dedicated router (`_try_dispatch_whatsapp_command` in `discord_agent.py`) recognizes
+and answers them before normal signal parsing runs. `!agent_on`, `!agent_off`, and
+`!agent_retry_dead` additionally require the sender's WhatsApp ID to be listed in
+`WHATSAPP_ADMIN_SENDER_IDS` — being in `WHATSAPP_ALLOWED_SENDER_IDS` only grants
+signal access, not mode-changing control, mirroring the Discord Administrator/Manage
+Server gate (which has no WhatsApp equivalent).
+
+The standalone ingress-only server is available for split deployments:
+
+```powershell
+python -m discord_stock_prediction_agent.whatsapp_webhook
+```
+
+It persists incoming events, while the Discord agent process remains the single
+decision and broker worker. This avoids two processes attempting the same order.
+
+Meta's current official Groups API requires an Official Business Account, uses
+invite-only groups, and allows at most 8 participants per group. For large communities,
+keep Discord as the primary signal room and use WhatsApp for small approved groups or
+direct conversations. See Meta's [platform overview](https://developers.facebook.com/documentation/business-messaging/whatsapp/about-the-platform/)
+and [Groups API documentation](https://developers.facebook.com/documentation/business-messaging/whatsapp/groups/).
+
 Do not run that module while the terminal is inside
 `discord_stock_prediction_agent`; the parent project directory must be the working
 directory. A process lock prevents two copies from using the same queues and state.
@@ -297,11 +351,25 @@ STO SPY 620P / BTO SPY 610P / STO SPY 670C / BTO SPY 680C 09/19 @2.15 Credit Qty
   available position.
 - Close-option actions require a matching Alpaca option position.
 - Market-closed approved orders are queued and retried after Alpaca reports open.
+- If the terminal was off when the market opened, the next agent startup checks
+  Alpaca immediately. Open-market orders are submitted during startup recovery;
+  closed-market orders stay persisted for the normal monitor.
+- Closed-market equity BUY/SELL orders use a dedicated durable SQLite queue.
+- A stable Alpaca `client_order_id` reconciles an accepted submission after a
+  timeout or agent restart, preventing accidental duplicate retries.
+- A queued BUY is removed from the market-order queue only after Alpaca returns
+  an accepted order ID. It then remains in fill tracking until every filled share
+  has the configured protection level.
 - Unavailable exact option contracts are stored and checked again.
 - Limit orders are submitted to Alpaca at the signal limit; Alpaca owns fill behavior.
 - Conditional equity and option entries wait for the specified price condition.
-- Agent-bought equities use the configured percentage protection monitor.
-- Option SL/TP/trailing conditions are monitored after the option position is visible.
+- Agent-bought equities use the confirmed Alpaca fill price for default `-1%`
+  loss protection and `+10%` profit protection.
+- Long option positions use the confirmed premium fill for default `-5%` loss
+  protection and `+10%` profit protection. Explicit signal SL/TP values override
+  those defaults. Short-option protection uses the economically inverse direction.
+- Filled atomic multi-leg debit/credit strategies are tracked at their net fill;
+  protection closes all legs together with one Alpaca MLeg order.
 - Successfully submitted queued items are removed from pending state.
 - Permanent broker rejections are removed; transient failures remain eligible for retry.
 - Duplicate signals may create independent paper orders when
@@ -313,14 +381,17 @@ These local files are created automatically and are intentionally ignored by Git
 
 | File | Contents |
 |---|---|
-| `discord_stock_prediction_agent/agent_state.json` | mode, decisions, learning, tracked positions, and pending orders |
+| `discord_stock_prediction_agent/agent_state.json` | mode, decisions, learning, tracked positions, submitted-entry/exit reconciliation, and pending options |
+| `discord_stock_prediction_agent/agent_state.backup.json` | atomic recovery copy used when the primary state file is unreadable |
 | `discord_stock_prediction_agent/signal_queue.sqlite3` | durable incoming queue, retries, and dead-letter state |
+| `discord_stock_prediction_agent/pending_market_orders.sqlite3` | approved equity orders waiting for Alpaca market-open submission; accepted rows are removed transactionally |
 | `discord_stock_prediction_agent/options_validation_cache.json` | recent option validation cache |
 | `discord_stock_prediction_agent/symbol_cache.json` | refreshed tradable-symbol directory |
 | `discord_stock_prediction_agent/logs/discord_agent.log` | rotating runtime log |
 | `discord_stock_prediction_agent/discord_agent.lock` | single-process runtime lock |
 
-Back up `agent_state.json` and `signal_queue.sqlite3` before moving an active deployment.
+Back up `agent_state.json`, `agent_state.backup.json`, `signal_queue.sqlite3`, and
+`pending_market_orders.sqlite3` before moving an active deployment.
 Do not commit them because they can contain Discord messages and broker metadata.
 
 ## Main Files
@@ -328,6 +399,8 @@ Do not commit them because they can contain Discord messages and broker metadata
 | File | Responsibility |
 |---|---|
 | `discord_agent.py` | Discord events, workers, decisions, monitors, commands, and output |
+| `whatsapp_webhook.py` | signed WhatsApp webhook verification and durable ingestion |
+| `whatsapp_client.py` | WhatsApp Cloud API output and embed-to-text conversion |
 | `signal_normalizer.py` | Discord text cleanup and format normalization |
 | `signal_parser.py` | equity parsing and conditional rules |
 | `options_parser.py` | single/multi-leg option parsing |
@@ -336,6 +409,7 @@ Do not commit them because they can contain Discord messages and broker metadata
 | `polygon_options_data.py` | exact-strike historical contract data |
 | `alpaca_paper.py` | paper account, contract, position, and order API |
 | `durable_signal_queue.py` | SQLite signal queue and retry lifecycle |
+| `pending_market_orders.py` | durable closed-market equity queue and broker-submission lifecycle |
 | `state_store.py` | atomic JSON state, pending orders, learning, and positions |
 | `runtime_lock.py` | prevents duplicate agent processes |
 | `config.py` | environment loading and production checks |
@@ -374,7 +448,9 @@ reviewing its flags first.
 - Use a service manager and automatic restart policy for long-running deployments.
 - Keep `.env`, broker keys, tokens, state databases, and logs outside Git.
 - Restrict Discord channel permissions and mode-changing permissions.
-- Monitor the dead-letter count with `!agent_status` and review rotating logs.
+- Use `!agent_health` for broker/queue readiness and review rotating logs.
+- Use `!agent_dead_letters` to inspect failures. Administrators can run
+  `!agent_retry_dead [limit]` to return a bounded set to the durable queue.
 - Paper-test every new parser or execution rule before considering real-money support.
 - For a 2,000-member server, measure API rate limits and processing latency under the
   expected burst pattern; worker concurrency alone does not remove provider limits.

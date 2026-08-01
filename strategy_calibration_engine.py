@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+from jsonl_store import append_jsonl
+
 ROOT          = Path(__file__).resolve().parent
 EVAL_FILE     = ROOT / "strategy_prediction_evaluation_runs.jsonl"
 CALIB_SOURCE  = "strategy_calibration_backtest"
@@ -247,8 +249,7 @@ def _generate_calibration_windows(
 def _save_calibration_record(record: dict) -> None:
     """Append one calibration probe record to EVAL_FILE."""
     try:
-        with open(EVAL_FILE, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
+        append_jsonl(EVAL_FILE, record)
     except Exception:
         pass
 

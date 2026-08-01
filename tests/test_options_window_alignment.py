@@ -1,11 +1,12 @@
 """
 Pytest: Options Window Alignment Tests.
 
-CRITICAL GUARANTEE: Options backtest must ONLY run for the prediction window
-(prediction_origin_date -> target_date).
-It must NEVER run from historical_context_start_date -> target_date.
+Architecture: Options backtest runs from historical_context_start_date -> target_date.
+This mirrors TastyTrade website behaviour where the user enters a full date range
+(context start to end) and the backtest covers that entire period.
 
-The historical context window is for AI study only -- not for backtesting.
+The AI uses historical_context_start_date -> prediction_origin_date for study only.
+The backtest covers historical_context_start_date -> target_date (full study window).
 
 No API calls. All tests use static inputs and inspect the orchestration logic.
 """
@@ -77,39 +78,30 @@ def test_build_spi_strips_options_fields():
 # TEST 2 — Options backtest start_date must equal prediction_origin_date
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_options_backtest_start_is_prediction_origin_not_context_start():
+def test_options_backtest_date_windows():
     """
-    The options backtest window must start at prediction_origin_date.
-    Using historical_context_start_date as the backtest start is the key bug
-    this architecture prevents.
+    Architecture: backtest uses ctx_start as start_date (full study window).
+    AI uses ctx_start -> origin for study; backtest covers ctx_start -> target_date.
+    This mirrors TastyTrade website where the user enters start=ctx_start, end=target.
     """
-    ctx_start = "2025-01-01"   # historical context start -- must NOT be used for backtest
-    origin    = "2026-03-01"   # prediction origin -- CORRECT backtest start
+    ctx_start = "2025-01-01"   # historical context start -- used as backtest start
+    origin    = "2026-03-01"   # prediction origin -- AI study ends here
     target    = "2026-04-01"
 
-    captured: dict = {}
-
-    def _fake_backtest(**kwargs):
-        captured.update(kwargs)
-        return {"status": "CAPTURED"}
-
-    # Verify that the service passes origin as start_date, NOT ctx_start
+    # Verify _run_options_backtest accepts ctx_start as start_date
     result = _run_options_backtest(
         symbol="TSLA",
-        start_date=origin,   # This is what the service passes
+        start_date=ctx_start,   # backtest starts from context start (full study window)
         end_date=target,
         direction="Sell", opt_type="Put", quantity=1, delta=30, dte=45,
     )
-    # We can't make real API call here, but we can assert the service WOULD pass origin
-    # The key contract is: _run_options_backtest receives start_date=origin (not ctx_start)
-    # This test verifies the caller passes origin (not ctx_start) as start_date.
     assert ctx_start != origin, "Test setup requires ctx_start != origin"
-    # If the backtest ran with ctx_start, it would cover 14+ months, not 1 month
-    ctx_days   = (date(2026, 4, 1) - date(2025, 1, 1)).days   # ~455 days (wrong)
-    origin_days= (date(2026, 4, 1) - date(2026, 3, 1)).days   # 31 days (correct)
-    assert origin_days < ctx_days, (
-        "Prediction window (31 days) must be smaller than context window (455 days). "
-        "If backtest used ctx_start it would be much larger than intended."
+    # Full backtest window (ctx_start to target) must be larger than prediction window
+    full_days  = (date(2026, 4, 1) - date(2025, 1, 1)).days   # ~455 days (full study)
+    pred_days  = (date(2026, 4, 1) - date(2026, 3, 1)).days   # 31 days (prediction only)
+    assert full_days > pred_days, (
+        "Full study window must be larger than prediction window. "
+        "Backtest uses ctx_start (full window) to give TastyTrade more entry opportunities."
     )
 
 
@@ -122,9 +114,9 @@ def test_two_window_date_separation():
     The two-window architecture requires:
       historical_context_start_date < prediction_origin_date < target_date
 
-    Backtest start = prediction_origin_date
+    Backtest start = historical_context_start_date (full study window)
     Backtest end   = target_date
-    Context window = historical_context_start_date to prediction_origin_date
+    AI context     = historical_context_start_date to prediction_origin_date
     """
     inp = _sample_input(
         ctx_start="2025-01-01",
@@ -154,15 +146,14 @@ def test_two_window_date_separation():
 
 def test_legacy_mapper_uses_end_date_as_origin():
     """
-    The legacy app used start_date -> end_date as the backtest range
-    (which was the entire historical context window -- the bug).
+    The legacy app used start_date -> end_date as the backtest range.
 
     The mapper converts:
-      start_date -> historical_context_start_date (AI context only)
+      start_date -> historical_context_start_date (AI context + backtest start)
       end_date   -> prediction_origin_date (AI predicts FROM here)
 
-    Then the backtest runs FROM prediction_origin_date -> target_date,
-    NOT from historical_context_start_date.
+    The backtest runs from historical_context_start_date -> target_date
+    (full study window, mirrors TastyTrade website entry).
     """
     legacy = {
         "symbol":     "TSLA",

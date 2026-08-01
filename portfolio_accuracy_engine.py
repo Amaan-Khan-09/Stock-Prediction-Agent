@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
+from jsonl_store import append_jsonl
+
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
@@ -43,8 +45,7 @@ def build_portfolio_evaluation_record(
 def save_portfolio_evaluation_record(record: dict) -> None:
     """Append one portfolio evaluation record to the portfolio-specific JSONL file."""
     try:
-        with open(PORTFOLIO_EVAL_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, default=str) + "\n")
+        append_jsonl(PORTFOLIO_EVAL_FILE, record)
     except Exception:
         pass
 

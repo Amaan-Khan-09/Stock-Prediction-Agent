@@ -332,6 +332,98 @@ def test_single_letter_ticker_is_not_an_option_side() -> None:
         _assert(option is not None and not option.is_multi_leg, f"{text} remains single-leg")
 
 
+def test_conditional_option_lifecycle_fields() -> None:
+    print("\nTest: conditional scale-in, timed exit, and risk override fields")
+    avgo = classify_and_parse(
+        "BTO AVGO 420C 11/21 @6.80 Qty 2. Add 3 more contracts above 425 breakout."
+    ).option
+    _assert(avgo is not None and avgo.valid, "AVGO conditional scale-in is valid")
+    _assert(avgo is not None and avgo.quantity == 2, "AVGO base qty == 2")
+    _assert(avgo is not None and avgo.add_quantity == 3, "AVGO add qty == 3")
+    _assert(avgo is not None and avgo.add_trigger_underlying_direction == "above", "AVGO add direction == above")
+    _assert(avgo is not None and avgo.add_trigger_underlying_price == 425, "AVGO add trigger == 425")
+
+    nflx = classify_and_parse(
+        "BTO NFLX 1450P 12/19 @18.60 Qty 2 EXIT ALL POSITIONS 30 MINUTES BEFORE MARKET CLOSE IF TARGET NOT HIT"
+    ).option
+    _assert(nflx is not None and nflx.valid, "NFLX timed exit is valid")
+    _assert(nflx is not None and nflx.exit_before_market_close, "NFLX time exit enabled")
+    _assert(nflx is not None and nflx.exit_minutes_before_close == 30, "NFLX exits 30 minutes before close")
+    _assert(nflx is not None and nflx.exit_if_target_not_hit, "NFLX target-not-hit qualifier preserved")
+
+    arm = classify_and_parse(
+        "Starter on ARM 190C 10/17 @4.35. Looking to add over 195. Risking only 1% on this trade."
+    ).option
+    _assert(arm is not None and arm.valid, "ARM starter is valid")
+    _assert(arm is not None and arm.position_type == "starter", "ARM position type == starter")
+    _assert(arm is not None and arm.add_trigger_underlying_price == 195, "ARM add trigger == 195")
+    _assert(arm is not None and arm.risk_stop_pct == 1, "ARM risk stop == 1%")
+
+
+def test_combo_and_partial_close_are_multi_leg() -> None:
+    """Regression test: is_multi_leg must count option+equity legs together, and
+    must trust build_multi_leg_contract()'s own MULTI_LEG determination instead of
+    re-deriving a leg count -- both a covered-call combo (1 option + 1 stock leg)
+    and a partial-leg-close on an existing position (1 option leg only) are
+    genuinely multi-leg strategies even though only one option leg is projected.
+    """
+    print("\nTest: combo (stock+option) and partial-leg-close signals are multi-leg")
+    covered_call = classify_and_parse(
+        "BUY 100 QQQ SHARES + STO 250C 09/19/2026 @4.27 CREDIT"
+    ).option
+    _assert(covered_call is not None and covered_call.valid, "covered call combo valid")
+    _assert(
+        covered_call is not None and covered_call.is_multi_leg,
+        "covered call combo is_multi_leg == True",
+        f"got {getattr(covered_call, 'is_multi_leg', None)}",
+    )
+    _assert(
+        covered_call is not None and covered_call.contains_equity_leg,
+        "covered call combo contains_equity_leg == True",
+    )
+
+    partial_close = classify_and_parse(
+        "BTC ONLY THE SHORT TSLA 290C 10/16/2026; LEAVE ALL OTHER IRON CONDOR LEGS OPEN"
+    ).option
+    _assert(partial_close is not None and partial_close.valid, "partial leg close valid")
+    _assert(
+        partial_close is not None and partial_close.is_multi_leg,
+        "partial leg close is_multi_leg == True",
+        f"got {getattr(partial_close, 'is_multi_leg', None)}",
+    )
+
+
+def test_short_straddle_and_strangle_classification() -> None:
+    """Regression test: options_parser's own leg-based classifier must label
+    short (sold) straddles/strangles correctly, not fall through to generic
+    'multi_leg' -- it previously only had the symmetric branch for long legs.
+    """
+    print("\nTest: short straddle/strangle structure classification")
+    from .options_parser import ParsedOptionLeg, _classify_multi_leg_structure
+
+    straddle_legs = (
+        ParsedOptionLeg(root="AAPL", strike=150.0, side="CALL", order_action="open_short",
+                        ratio_qty=1, expiry_date="2026-08-21"),
+        ParsedOptionLeg(root="AAPL", strike=150.0, side="PUT", order_action="open_short",
+                        ratio_qty=1, expiry_date="2026-08-21"),
+    )
+    _assert(
+        _classify_multi_leg_structure(straddle_legs, None) == "short_straddle",
+        "same-strike short legs classify as short_straddle",
+    )
+
+    strangle_legs = (
+        ParsedOptionLeg(root="AAPL", strike=160.0, side="CALL", order_action="open_short",
+                        ratio_qty=1, expiry_date="2026-08-21"),
+        ParsedOptionLeg(root="AAPL", strike=140.0, side="PUT", order_action="open_short",
+                        ratio_qty=1, expiry_date="2026-08-21"),
+    )
+    _assert(
+        _classify_multi_leg_structure(strangle_legs, None) == "short_strangle",
+        "different-strike short legs classify as short_strangle",
+    )
+
+
 def run_all() -> None:
     print("=" * 60)
     print("OPTIONS PARSER TEST HARNESS")
@@ -355,6 +447,9 @@ def run_all() -> None:
     test_invalid_only_for_empty()
     test_equity_path_unchanged()
     test_single_letter_ticker_is_not_an_option_side()
+    test_conditional_option_lifecycle_fields()
+    test_combo_and_partial_close_are_multi_leg()
+    test_short_straddle_and_strangle_classification()
 
     print("\n" + "=" * 60)
     print(f"Results: {PASS} passed, {FAIL} failed")

@@ -233,15 +233,23 @@ def test_validate_no_leakage_clean():
 # DECISION GUARDRAIL TESTS
 # ══════════════════════════════════════════════════════════════════════════════
 
+_BULL_SCORES = {"bullish_score": 70, "bearish_score": 35, "uncertainty_score": 40,
+                "dominant": "bullish", "dominant_score": 70}
+_BEAR_SCORES = {"bullish_score": 30, "bearish_score": 75, "uncertainty_score": 40,
+                "dominant": "bearish", "dominant_score": 75}
+
+
 def test_guardrail_buy():
+    """BUY requires signal confirmation — pass bullish scores for expected BUY."""
     from gemini_stock_prediction_agent import _apply_guardrails
-    d, r = _apply_guardrails(5.0, 70, 40, 80)
+    d, r = _apply_guardrails(5.0, 70, 40, 80, signal_scores=_BULL_SCORES)
     assert d == "BUY"
 
 
 def test_guardrail_sell():
+    """SELL requires signal confirmation — pass bearish scores for expected SELL."""
     from gemini_stock_prediction_agent import _apply_guardrails
-    d, r = _apply_guardrails(-4.0, 70, 40, 80)
+    d, r = _apply_guardrails(-4.0, 70, 40, 80, signal_scores=_BEAR_SCORES)
     assert d == "SELL"
 
 
@@ -258,20 +266,23 @@ def test_guardrail_review_low_quality():
 
 
 def test_guardrail_review_low_confidence():
+    """Confidence < 45 triggers REVIEW — threshold lowered from 55 to 45."""
     from gemini_stock_prediction_agent import _apply_guardrails
-    d, r = _apply_guardrails(5.0, 40, 40, 80)
+    d, r = _apply_guardrails(5.0, 44, 40, 80)
     assert d == "REVIEW"
 
 
 def test_guardrail_high_risk_buy_becomes_hold():
+    """High risk downgrades BUY to HOLD even with valid signal scores."""
     from gemini_stock_prediction_agent import _apply_guardrails
-    d, r = _apply_guardrails(5.0, 70, 85, 80)
+    d, r = _apply_guardrails(5.0, 70, 85, 80, signal_scores=_BULL_SCORES)
     assert d == "HOLD"
 
 
 def test_guardrail_high_risk_sell_becomes_review():
+    """High risk + bearish signal confirms SELL → REVIEW path."""
     from gemini_stock_prediction_agent import _apply_guardrails
-    d, r = _apply_guardrails(-4.0, 70, 85, 80)
+    d, r = _apply_guardrails(-4.0, 70, 85, 80, signal_scores=_BEAR_SCORES)
     assert d == "REVIEW"
 
 
@@ -386,3 +397,43 @@ def test_no_person_name_in_app():
         and "ajayakula" not in line.lower()  # email is ok
     ]
     assert not ui_lines, f"Person name 'Ajay' found in non-comment UI lines: {ui_lines[:3]}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Context enrichment failures must be visible, not silently swallowed
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_context_enrichment_warnings_wired_into_result():
+    """Benchmark bars, earnings calendar, and market movers were previously
+    wrapped in bare except/pass -- a transient failure looked identical to
+    'this symbol has no earnings/no benchmark data.' Confirm each failure path
+    now records into _context_enrichment_warnings, and that dict is returned
+    in the final result under context_enrichment_warnings.
+    """
+    text = _read(ROOT / "gemini_stock_prediction_agent.py")
+    assert "_context_enrichment_warnings" in text
+    assert '"context_enrichment_warnings":' in text
+    assert text.count('_context_enrichment_warnings["benchmark_bars"]') >= 1
+    assert text.count('_context_enrichment_warnings["earnings_calendar"]') >= 1
+    assert text.count('_context_enrichment_warnings["market_movers"]') >= 1
+    assert text.count('_context_enrichment_warnings["symbol_calibration"]') >= 1
+    # No remaining bare except/pass on these three specific enrichment blocks.
+    assert 'except Exception:\n        pass\n\n    # Fetch live market movers' not in text
+
+
+def test_calibration_summary_reports_error_instead_of_silently_swallowing(tmp_path, monkeypatch):
+    """build_calibration_summary() must surface a malformed calibration_profiles.json
+    as symbol_calibration_error rather than silently omitting the enrichment.
+    ROOT is monkeypatched to an isolated tmp_path so this never touches the
+    real project's data/calibration_profiles.json.
+    """
+    import gemini_stock_prediction_agent as gsp_mod
+
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data" / "calibration_profiles.json").write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setattr(gsp_mod, "ROOT", tmp_path)
+
+    summary = gsp_mod.build_calibration_summary(symbol="AAPL", horizon_days=30)
+
+    assert "symbol_calibration_error" in summary
+    assert "symbol_calibration" not in summary

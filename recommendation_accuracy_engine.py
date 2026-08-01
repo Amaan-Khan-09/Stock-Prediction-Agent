@@ -16,6 +16,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
+from jsonl_store import append_jsonl
+
 
 DEFAULT_GROUND_TRUTH_PATHS = [
     os.path.join(os.path.dirname(__file__), "data", "recommendation_ground_truth.csv"),
@@ -387,8 +389,7 @@ def evaluate_recommendation_accuracy(
             "run_id": run_id,
             "accuracy": {k: v for k, v in result.items() if k != "evaluated_rows"},
         }
-        with open(RECOMMENDATION_ACCURACY_PATH, "a", encoding="utf-8") as file:
-            file.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        append_jsonl(RECOMMENDATION_ACCURACY_PATH, payload)
     return result
 
 

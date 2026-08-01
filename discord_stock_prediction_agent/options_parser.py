@@ -8,14 +8,15 @@ non-actionable market commentary (NO_TRADE), or empty/unparseable (INVALID).
 from __future__ import annotations
 
 import re
-from math import gcd
 from dataclasses import dataclass, field, replace
 from datetime import date
 from typing import Optional
 
 from .signal_parser import PHRASE_ALIASES, SYMBOL_ALIASES, parse_signal, ParsedSignal
-from .options_symbol import default_expiry_date
+from .options_symbol import default_expiry_date, reduce_ratios_by_gcd
 from .signal_normalizer import normalize_signal_input
+from .single_leg_contract import build_single_leg_contract
+from .multi_leg_contract import build_multi_leg_contract
 from .symbol_directory import is_symbol_like, resolve_cached_symbol
 
 # Cash-settled index roots that signal_parser.py's alias tables don't cover
@@ -34,13 +35,17 @@ _SIDE_STRIKE_RE = re.compile(
     r".{0,60}?\b(?:STRIKE(?:\s+RATE|\s+PRICE)?|STRIKE|AT|@)?\s*\$?(\d{1,6}(?:\.\d{1,2})?)\b",
     re.IGNORECASE,
 )
-_PREMIUM_RE = re.compile(r"(?:\b(?:AT|FOR|PREMIUM|ENTRY|PRICE|LIMIT)\b|@)\s*\$?(\d+(?:\.\d+)?)\b", re.IGNORECASE)
+_PREMIUM_RE = re.compile(r"(?:\b(?:AT|FOR|PREMIUM|ENTRY|PRICE|LIMIT|AROUND)\b|@)\s*\$?(\d+(?:\.\d+)?)\b", re.IGNORECASE)
 _STOP_LOSS_RE = re.compile(
-    r"\b(?:SL|BY|STOP(?:\s+LOSS)?|STOPLOSS)\b\s*(?:BELOW|UNDER|AT|@|[:=\-])?\s*\$?(\d+(?:\.\d+)?)\b",
+    r"\b(?:SL|BY|STOP(?:\s+LOSS)?|STOPLOSS|CUT(?:\s+IT)?\s+IF\s+PREMIUM\s+LOSES)\b"
+    r"(?:\s+ALL)?(?:\s+IF\s+PREMIUM\s+(?:REACHES|RISES\s+TO))?"
+    r"\s*(?:BELOW|UNDER|AT|@|[:=\-])?\s*\$?(\d+(?:\.\d+)?)\b",
     re.IGNORECASE,
 )
 _TARGET_RE = re.compile(
-    r"\b(?:TP|PT|TARGETS?|TGT|PROFIT\s+TARGET|TAKE\s+PROFIT)\b\s*(?:AT|@|[:=\-])?\s*\$?(\d+(?:\.\d+)?)\b",
+    r"\b(?:TP|PT|TARGETS?|TGT|PROFIT\s+TARGET|TAKE\s+PROFIT|"
+    r"BUY\s+BACK(?:\s+AT)?|BTC(?:\s+AT)?)\b"
+    r"\s*(?:AT|@|[:=\-])?\s*\$?(\d+(?:\.\d+)?)\b",
     re.IGNORECASE,
 )
 _RISK_REWARD_RE = re.compile(
@@ -78,9 +83,9 @@ _SAME_DAY_EXPIRY_RE = re.compile(r"\b(?:SAME\s+DAY|0DTE|ZERO\s+DTE|EOD|TODAY)\b"
 _QTY_RE = [
     re.compile(r"\bqty\s*[:=]?\s*(\d+(?:\.\d+)?)\b", re.IGNORECASE),
     re.compile(r"\bquantity\s*[:=]?\s*(\d+(?:\.\d+)?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:STARTER\s+)?(?:BTO|STO|BTC|STC|BUY|SELL|LONG|SHORT)\s+(\d+(?:\.\d+)?)\s+(?:OF\s+\d+\s+)?(?:[A-Z.]+\s+)?\d", re.IGNORECASE),
     re.compile(r"\bcontracts?\s*[:=]?\s*(\d+(?:\.\d+)?)\b", re.IGNORECASE),
     re.compile(r"\b(\d+(?:\.\d+)?)\s*-?\s*(?:contracts?|lots?)\b", re.IGNORECASE),
-    re.compile(r"\b(?:BTO|STO|BTC|STC|BUY|SELL|LONG|SHORT)\s+(\d+(?:\.\d+)?)\s+(?:OF\s+\d+\s+)?(?:[A-Z.]+\s+)?\d", re.IGNORECASE),
     re.compile(r"\bx\s*(\d+(?:\.\d+)?)\b", re.IGNORECASE),
     re.compile(r"\b(\d+(?:\.\d+)?)\s*x\b", re.IGNORECASE),
 ]
@@ -152,7 +157,14 @@ _ROOT_IGNORE_WORDS = {
     "INTO", "TO", "CLOSE", "OPEN", "DEBIT", "CREDIT", "CASH", "SECURED", "COVERED",
     "COLLAR", "ROLL", "ROLLING", "TRIM", "POSITION", "MANAGEMENT", "SIGNALS",
     "EARNINGS", "PROFITS", "RUNNERS", "VWAP", "DELTA", "ON", "OF", "ABOVE", "BELOW",
-    "TP", "PT", "TGT", "SL", "BY", "RR",
+    "TP", "PT", "TGT", "TARGET", "TARGETS", "SL", "BY", "RR",
+    # These are ordinary trading-signal syntax words that also happen to
+    # resolve as real symbols/company names in the live Alpaca directory
+    # (ALL=Allstate, GO=Grocery Outlet, HOLD, MAX, MOVE, NOW=ServiceNow,
+    # OR=Overstock/Oregon-linked names, ...). Without excluding them here,
+    # a phrase like "if target not hit" or "hold this one" can resolve the
+    # option's underlying to the wrong real company.
+    "ALL", "GO", "HOLD", "MAX", "MOVE", "NOW", "OR", "BLOCK",
 }
 
 
@@ -182,9 +194,24 @@ class ParsedOptionSignal:
     close_percent: Optional[float] = None
     add_quantity: Optional[float] = None
     add_trigger_premium: Optional[float] = None
+    add_trigger_underlying_direction: Optional[str] = None
+    add_trigger_underlying_price: Optional[float] = None
+    entry_premium_direction: Optional[str] = None
+    entry_premium_price: Optional[float] = None
     underlying_trigger_direction: Optional[str] = None
     underlying_trigger_price: Optional[float] = None
     exit_before_market_close: bool = False
+    exit_minutes_before_close: Optional[int] = None
+    exit_if_target_not_hit: bool = False
+    risk_stop_pct: Optional[float] = None
+    maximum_loss_amount: Optional[float] = None
+    exit_underlying_direction: Optional[str] = None
+    exit_underlying_price: Optional[float] = None
+    time_in_force: str = "DAY"
+    remaining_instruction: Optional[str] = None
+    stop_scope: Optional[str] = None
+    entry_price_type: Optional[str] = None
+    position_type: Optional[str] = None
     contains_equity_leg: bool = False
     expiry_date: Optional[str] = None  # YYYY-MM-DD, resolved
     expiry_mode: str = "0dte"  # "explicit" | "0dte"
@@ -197,6 +224,7 @@ class ParsedOptionSignal:
     quantity: float = 1.0
     raw_text: str = ""
     reason: str = ""
+    semantic_contract: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -313,7 +341,9 @@ def _extract_delta_target(text: str) -> Optional[float]:
 
 def _extract_fill_price(text: str) -> Optional[float]:
     for match in _PREMIUM_RE.finditer(text):
-        prefix = text[max(0, match.start() - 18):match.start()].upper()
+        # Management phrases can exceed 18 characters. Keep exit/trim levels
+        # from being mistaken for a new entry premium.
+        prefix = text[max(0, match.start() - 48):match.start()].upper()
         if re.search(r"\b(?:SL|STOP|STOPLOSS|TARGET|TGT|TP|PT|PROFIT|TRIM)\b", prefix):
             continue
         try:
@@ -573,20 +603,15 @@ def _normalize_leg_ratios(
 ) -> tuple[tuple[ParsedOptionLeg, ...], float]:
     if not legs:
         return legs, quantity
-    ratios = [max(1, int(leg.ratio_qty)) for leg in legs]
-    common = ratios[0]
-    for ratio in ratios[1:]:
-        common = gcd(common, ratio)
-    if len(legs) == 1:
-        common = ratios[0]
+    reduced_ratios, common = reduce_ratios_by_gcd([leg.ratio_qty for leg in legs])
     if common <= 1:
         return legs, quantity
     normalized = tuple(
         ParsedOptionLeg(
             leg.root, leg.strike, leg.side, leg.order_action,
-            max(1, int(leg.ratio_qty) // common), leg.expiry_date,
+            reduced_ratio, leg.expiry_date,
         )
-        for leg in legs
+        for leg, reduced_ratio in zip(legs, reduced_ratios)
     )
     return normalized, max(float(quantity), float(common))
 
@@ -606,20 +631,106 @@ def _extract_management_fields(text: str) -> dict:
         text,
         re.IGNORECASE,
     )
-    trigger = re.search(
-        r"\b(?:STOCK\s+)?(?:BREAKS?|CLOSES?)\s+(ABOVE|BELOW)\s+\$?(\d+(?:\.\d+)?)",
+    add_at = re.search(
+        r"\bADD\s+(\d+(?:\.\d+)?)\s+(?:MORE\s+)?CONTRACTS?\s+"
+        r"(?:AT|@)\s+\$?(\d+(?:\.\d+)?)\b",
         text,
         re.IGNORECASE,
     )
+    add_underlying = re.search(
+        r"\b(?:LOOKING\s+TO\s+)?ADD(?:ING)?"
+        r"(?:\s+(\d+(?:\.\d+)?))?\s*(?:MORE\s+)?(?:CONTRACTS?\s+)?"
+        r"(?:IF\s+)?(?:THE\s+)?(?:UNDERLYING\s+|STOCK\s+)?"
+        r"(?:IS\s+|BREAKS?\s+)?(ABOVE|OVER|BELOW|UNDER)\s+\$?(\d+(?:\.\d+)?)"
+        r"(?:\s+BREAKOUT)?\b",
+        text,
+        re.IGNORECASE,
+    )
+    trigger = re.search(
+        r"\b(?:ONLY\s+IF|ENTER\s+IF|BUY\s+IF|BTO\s+IF)\s+"
+        r"(?:(?:[A-Z.]{1,8}|THE\s+STOCK|STOCK|UNDERLYING)\s+)?"
+        r"(?:TRADES?|BREAKS?|CLOSES?|MOVES?|IS)?\s*(ABOVE|BELOW)\s+\$?(\d+(?:\.\d+)?)",
+        text,
+        re.IGNORECASE,
+    )
+    exit_trigger = re.search(
+        r"\b(?:EXIT|STOP|CLOSE|BTC|BUY\s+BACK)\s+(?:THE\s+POSITION\s+)?IF\s+"
+        r"(?:(?:[A-Z.]{1,8}|THE\s+STOCK|STOCK|UNDERLYING)\s+)?"
+        r"(?:TRADES?|BREAKS?|CLOSES?|MOVES?|IS)?\s*(ABOVE|BELOW)\s+\$?(\d+(?:\.\d+)?)",
+        text,
+        re.IGNORECASE,
+    )
+    premium_entry = re.search(
+        r"\b(?:ONLY\s+IF|ENTER\s+IF|BUY\s+IF|BTO\s+IF)\s+(?:THE\s+)?"
+        r"(?:OPTION\s+)?PREMIUM\s+(?:FALLS?|DROPS?|MOVES?)\s+"
+        r"(ABOVE|BELOW)\s+\$?(\d+(?:\.\d+)?)",
+        text,
+        re.IGNORECASE,
+    )
+    timed_exit = re.search(
+        r"\b(?:EXIT|CLOSE)\s+(?:ALL\s+)?(?:POSITIONS?\s+)?"
+        r"(?:(\d+)\s+MINUTES?\s+)?BEFORE\s+MARKET\s+CLOSE\b",
+        text,
+        re.IGNORECASE,
+    )
+    risk_pct = re.search(
+        r"\bRISK(?:ING)?(?:\s+ONLY)?\s+(\d+(?:\.\d+)?)\s*%"
+        r"(?:\s+(?:ON|OF)\s+(?:THIS\s+)?TRADE)?\b",
+        text,
+        re.IGNORECASE,
+    )
+    max_loss = re.search(
+        r"\bMAX(?:IMUM)?\s+LOSS\s*\$\s*(\d[\d,]*(?:\.\d+)?)\b",
+        text,
+        re.IGNORECASE,
+    )
+    tif = re.search(r"\b(GTC|DAY|IOC|FOK)\b", text, re.IGNORECASE)
+    add_direction = None
+    if add_underlying:
+        add_direction = (
+            "above" if add_underlying.group(2).lower() in {"above", "over"} else "below"
+        )
     return {
         "target_prices": targets,
         "trailing_stop_pct": float(trail.group(1)) if trail else None,
         "close_percent": float(close_pct.group(1)) if close_pct else None,
-        "add_quantity": float(add.group(1)) if add else None,
-        "add_trigger_premium": float(add.group(2)) if add else None,
+        "add_quantity": (
+            float(add.group(1))
+            if add else
+            float(add_at.group(1))
+            if add_at else
+            float(add_underlying.group(1))
+            if add_underlying and add_underlying.group(1) else None
+        ),
+        "add_trigger_premium": (
+            float(add.group(2)) if add else float(add_at.group(2)) if add_at else None
+        ),
+        "add_trigger_underlying_direction": add_direction,
+        "add_trigger_underlying_price": float(add_underlying.group(3)) if add_underlying else None,
+        "entry_premium_direction": premium_entry.group(1).lower() if premium_entry else None,
+        "entry_premium_price": float(premium_entry.group(2)) if premium_entry else None,
         "underlying_trigger_direction": trigger.group(1).lower() if trigger else None,
         "underlying_trigger_price": float(trigger.group(2)) if trigger else None,
-        "exit_before_market_close": bool(re.search(r"\b(?:EXIT|CLOSE).{0,30}BEFORE\s+MARKET\s+CLOSE\b", text, re.IGNORECASE)),
+        "exit_underlying_direction": exit_trigger.group(1).lower() if exit_trigger else None,
+        "exit_underlying_price": float(exit_trigger.group(2)) if exit_trigger else None,
+        "exit_before_market_close": bool(timed_exit),
+        "exit_minutes_before_close": int(timed_exit.group(1) or 15) if timed_exit else None,
+        "exit_if_target_not_hit": bool(
+            timed_exit and re.search(r"\bIF\s+(?:THE\s+)?TARGET\s+(?:IS\s+)?NOT\s+HIT\b", text, re.IGNORECASE)
+        ),
+        "risk_stop_pct": float(risk_pct.group(1)) if risk_pct else None,
+        "maximum_loss_amount": float(max_loss.group(1).replace(",", "")) if max_loss else None,
+        "time_in_force": tif.group(1).upper() if tif else "DAY",
+        "remaining_instruction": (
+            "KEEP_OPEN" if re.search(r"\bKEEP\s+(?:THE\s+)?REST\s+OPEN\b", text, re.IGNORECASE) else None
+        ),
+        "stop_scope": (
+            "ALL_CONTRACTS" if re.search(r"\bSTOP\s+ALL\b", text, re.IGNORECASE) else None
+        ),
+        "entry_price_type": (
+            "APPROXIMATE" if re.search(r"\b(?:AROUND|NEAR)\s+\$?\d", text, re.IGNORECASE) else None
+        ),
+        "position_type": "starter" if re.search(r"\bSTARTER\b", text, re.IGNORECASE) else None,
         "contains_equity_leg": bool(re.search(r"\b\d+(?:\.\d+)?\s+[A-Z.]+\s+SHARES?\b", text, re.IGNORECASE)),
     }
 
@@ -627,7 +738,9 @@ def _extract_management_fields(text: str) -> dict:
 def _classify_multi_leg_structure(
     legs: tuple[ParsedOptionLeg, ...], current: Optional[str]
 ) -> Optional[str]:
-    if current and current not in {"multi_leg", "spread", "straddle", "strangle"}:
+    if current and current not in {
+        "multi_leg", "spread", "straddle", "strangle", "custom_four_leg"
+    }:
         return current
     if len(legs) == 4:
         strikes = {leg.strike for leg in legs}
@@ -655,6 +768,9 @@ def _classify_multi_leg_structure(
     both_open_long = first.order_action == second.order_action == "open_long"
     if both_open_long and first.side != second.side:
         return "long_straddle" if first.strike == second.strike else "long_strangle"
+    both_open_short = first.order_action == second.order_action == "open_short"
+    if both_open_short and first.side != second.side:
+        return "short_straddle" if first.strike == second.strike else "short_strangle"
     if first.side == second.side == "CALL":
         if first.order_action == "open_long" and second.order_action == "open_short":
             return "bull_call_spread" if first.strike < second.strike else "bear_call_spread"
@@ -869,6 +985,260 @@ def parse_option_signal(text: str) -> ParsedOptionSignal:
         reason="",
     )
 
+
+def _project_single_leg_contract(
+    option: ParsedOptionSignal, contract: dict[str, object]
+) -> ParsedOptionSignal:
+    """Project canonical semantics into fields consumed by execution/monitors."""
+    action = str(contract.get("action") or "")
+    order_action = {
+        "BUY_TO_OPEN": "open_long",
+        "SELL_TO_OPEN": "open_short",
+        "SELL_TO_CLOSE": "close_long",
+        "BUY_TO_CLOSE": "close_short",
+        "SCALE_OUT": "close_long",
+        "MANAGE_LONG_POSITION": "manage",
+    }.get(action, option.order_action)
+
+    entry = contract.get("limit_price")
+    if entry is None:
+        entry = contract.get("maximum_entry_price")
+    if entry is None:
+        entry = contract.get("initial_entry_price")
+    if entry is None:
+        entry = contract.get("entry_price")
+
+    take_profit = contract.get("take_profit")
+    if isinstance(take_profit, list):
+        target_prices = tuple(float(value) for value in take_profit)
+        target_price = target_prices[0] if target_prices else option.target_price
+    elif take_profit is not None:
+        target_price = float(take_profit)
+        target_prices = (target_price,)
+    else:
+        target_price = option.target_price
+        target_prices = option.target_prices
+
+    planned_exit = contract.get("planned_exit")
+    stop_loss = contract.get("stop_loss", option.stop_loss)
+    if isinstance(planned_exit, dict):
+        planned_target = planned_exit.get("limit_price", planned_exit.get("take_profit_buy_to_close"))
+        if planned_target is not None:
+            target_price = float(planned_target)
+            target_prices = (target_price,)
+        if planned_exit.get("stop_price") is not None:
+            stop_loss = float(planned_exit["stop_price"])
+
+    scale_in = contract.get("scale_in")
+    add_quantity = option.add_quantity
+    add_trigger_premium = option.add_trigger_premium
+    add_trigger_underlying_direction = option.add_trigger_underlying_direction
+    add_trigger_underlying_price = option.add_trigger_underlying_price
+    if isinstance(scale_in, dict):
+        add_quantity = float(scale_in.get("quantity") or add_quantity or 0) or None
+        condition = scale_in.get("condition")
+        if isinstance(condition, dict):
+            add_trigger_underlying_direction = (
+                "above" if condition.get("operator") == ">" else "below"
+            )
+            add_trigger_underlying_price = float(condition.get("value") or 0) or None
+    elif isinstance(scale_in, list) and scale_in:
+        first = scale_in[0]
+        if isinstance(first, dict):
+            add_quantity = float(first.get("quantity") or 0) or None
+            add_trigger_premium = float(first.get("limit_price") or 0) or None
+
+    entry_condition = contract.get("entry_condition")
+    trigger_direction = option.underlying_trigger_direction
+    trigger_price = option.underlying_trigger_price
+    if isinstance(entry_condition, dict):
+        trigger_direction = "above" if entry_condition.get("operator") == ">" else "below"
+        trigger_price = float(entry_condition.get("value") or 0) or None
+
+    time_exit = contract.get("time_exit")
+    exit_before_close = option.exit_before_market_close
+    exit_minutes = option.exit_minutes_before_close
+    exit_if_target_not_hit = option.exit_if_target_not_hit
+    if time_exit == "BEFORE_MARKET_CLOSE":
+        exit_before_close = True
+        exit_minutes = 15
+    elif isinstance(time_exit, dict):
+        exit_before_close = True
+        exit_minutes = int(time_exit.get("offset_minutes_before_market_close") or 15)
+        exit_if_target_not_hit = time_exit.get("condition") == "TAKE_PROFIT_NOT_HIT"
+
+    quantity = contract.get(
+        "quantity",
+        contract.get("initial_quantity", contract.get("close_quantity", option.quantity)),
+    )
+    return replace(
+        option,
+        semantic_contract=contract,
+        order_action=order_action,
+        quantity=float(quantity or option.quantity),
+        fill_price=float(entry) if entry is not None else option.fill_price,
+        stop_loss=float(stop_loss) if stop_loss is not None else None,
+        target_price=target_price,
+        target_prices=target_prices,
+        trailing_stop_pct=float(
+            contract.get("trailing_stop_percent", contract.get("remaining_trailing_stop_percent"))
+        ) if contract.get("trailing_stop_percent", contract.get("remaining_trailing_stop_percent")) is not None else option.trailing_stop_pct,
+        close_percent=float(contract["close_percentage"]) if contract.get("close_percentage") is not None else option.close_percent,
+        add_quantity=add_quantity,
+        add_trigger_premium=add_trigger_premium,
+        add_trigger_underlying_direction=add_trigger_underlying_direction,
+        add_trigger_underlying_price=add_trigger_underlying_price,
+        underlying_trigger_direction=trigger_direction,
+        underlying_trigger_price=trigger_price,
+        exit_before_market_close=exit_before_close,
+        exit_minutes_before_close=exit_minutes,
+        exit_if_target_not_hit=exit_if_target_not_hit,
+        risk_stop_pct=float(contract["portfolio_risk_percent"]) if contract.get("portfolio_risk_percent") is not None else option.risk_stop_pct,
+        maximum_loss_amount=float(contract["maximum_loss"]) if contract.get("maximum_loss") is not None else option.maximum_loss_amount,
+        time_in_force=str(contract.get("time_in_force") or option.time_in_force),
+        stop_scope=str(contract.get("stop_scope") or option.stop_scope or "") or None,
+        position_type=str(contract.get("position_size") or option.position_type or "").lower() or None,
+    )
+
+
+def _project_multi_leg_contract(
+    option: ParsedOptionSignal, contract: dict[str, object]
+) -> ParsedOptionSignal:
+    """Project canonical multi-leg semantics into broker-facing parser fields."""
+    action_map = {
+        "BUY_TO_OPEN": "open_long",
+        "SELL_TO_OPEN": "open_short",
+        "SELL_TO_CLOSE": "close_long",
+        "BUY_TO_CLOSE": "close_short",
+    }
+    projected_legs: list[ParsedOptionLeg] = []
+    contains_equity_leg = False
+    option_leg_index = 0
+    for raw_leg in contract.get("legs", []):
+        if not isinstance(raw_leg, dict):
+            continue
+        if raw_leg.get("asset_type") == "STOCK":
+            contains_equity_leg = True
+            continue
+        expiration = str(raw_leg.get("expiration") or "")
+        parts = re.split(r"[/-]", expiration)
+        if len(parts) == 3:
+            year = parts[2]
+            if len(year) == 2:
+                year = f"20{year}"
+            expiration = f"{year}-{int(parts[0]):02d}-{int(parts[1]):02d}"
+        elif len(parts) == 2:
+            positional_leg = (
+                option.legs[option_leg_index]
+                if option_leg_index < len(option.legs) else None
+            )
+            matching_leg = positional_leg or next(
+                (
+                    existing
+                    for existing in option.legs
+                    if existing.strike == float(raw_leg.get("strike") or 0)
+                    and existing.side == str(raw_leg.get("option_type") or "").upper()
+                    and existing.expiry_date
+                ),
+                None,
+            )
+            if matching_leg:
+                expiration = str(matching_leg.expiry_date)
+            elif option.expiry_date:
+                expiration = str(option.expiry_date)
+        projected_legs.append(
+            ParsedOptionLeg(
+                root=str(contract.get("symbol") or option.root).upper(),
+                strike=float(raw_leg.get("strike") or 0),
+                side=str(raw_leg.get("option_type") or "").upper(),
+                order_action=action_map.get(str(raw_leg.get("action") or ""), "manage"),
+                ratio_qty=max(1, int(raw_leg.get("ratio") or 1)),
+                expiry_date=expiration or None,
+            )
+        )
+        option_leg_index += 1
+    first_leg = projected_legs[0] if projected_legs else None
+    price = contract.get("net_price")
+    risk = contract.get("risk_management")
+    stop_loss = option.stop_loss
+    target_price = option.target_price
+    target_prices = option.target_prices
+    maximum_loss_amount = option.maximum_loss_amount
+    if isinstance(risk, dict):
+        if risk.get("stop_loss") is not None:
+            stop_loss = float(risk["stop_loss"])
+        if risk.get("take_profit") is not None:
+            target_price = float(risk["take_profit"])
+            target_prices = (target_price,)
+        if risk.get("maximum_loss_inr") is not None:
+            maximum_loss_amount = float(risk["maximum_loss_inr"])
+
+    trigger_direction = option.underlying_trigger_direction
+    trigger_price = option.underlying_trigger_price
+    advanced = contract.get("advanced_instructions")
+    if isinstance(advanced, dict):
+        if advanced.get("maximum_loss_inr") is not None:
+            maximum_loss_amount = float(advanced["maximum_loss_inr"])
+        entry_condition = advanced.get("entry_condition")
+        if isinstance(entry_condition, dict) and entry_condition.get("value") is not None:
+            trigger_direction = (
+                "below" if "BELOW" in str(entry_condition.get("type") or "").upper() else "above"
+            )
+            trigger_price = float(entry_condition["value"])
+    expiry_date = first_leg.expiry_date if first_leg else option.expiry_date
+    strategy = str(contract.get("strategy") or option.structure or "multi_leg").lower()
+    strategy = {
+        "covered_call_combo": "covered_call",
+        "call_butterfly": "butterfly_spread",
+        "put_butterfly": "butterfly_spread",
+        "diagonal_call_spread": "diagonal_spread",
+        "diagonal_put_spread": "diagonal_spread",
+        "call_ratio_spread": "ratio_spread",
+        "put_ratio_spread": "ratio_spread",
+        "call_backspread": "ratio_backspread",
+        "put_backspread": "ratio_backspread",
+        "custom_four_leg": "multi_leg",
+    }.get(strategy, strategy)
+    strategy = _classify_multi_leg_structure(tuple(projected_legs), strategy) or strategy
+    order_action = first_leg.order_action if first_leg else "manage"
+    tense = "management" if any(
+        leg.order_action in {"close_long", "close_short", "manage"}
+        for leg in projected_legs
+    ) else "new_order"
+    return replace(
+        option,
+        valid=bool(projected_legs),
+        root=str(contract.get("symbol") or option.root).upper(),
+        strike=first_leg.strike if first_leg else option.strike,
+        side=first_leg.side if first_leg else option.side,
+        fill_price=float(price) if price is not None else option.fill_price,
+        stop_loss=stop_loss,
+        target_price=target_price,
+        target_prices=target_prices,
+        maximum_loss_amount=maximum_loss_amount,
+        underlying_trigger_direction=trigger_direction,
+        underlying_trigger_price=trigger_price,
+        expiry_date=expiry_date,
+        expiry_mode="explicit" if expiry_date else option.expiry_mode,
+        structure=strategy,
+        # This function only runs when multi_leg_contract.build_multi_leg_contract()
+        # already returned a non-empty contract -- i.e. it already decided this is
+        # multi-leg (covered-call combos, and partial-leg-close instructions against
+        # an existing multi-leg position, can legitimately end up with only 1
+        # projected option leg). Trust that single source of truth instead of
+        # re-deriving a leg count here, which double-counts the classification and
+        # gets combo/partial-close cases wrong.
+        is_multi_leg=True,
+        legs=tuple(projected_legs),
+        price_effect=str(contract.get("net_price_type") or option.price_effect or "").lower() or None,
+        tense=tense,
+        order_action=order_action,
+        quantity=float(contract.get("quantity") or 1),
+        contains_equity_leg=contains_equity_leg,
+        semantic_contract=contract,
+        reason="" if projected_legs else option.reason,
+    )
+
 def classify_and_parse(text: str) -> ParsedMessage:
     """Route a raw Discord message to EQUITY / OPTION / NO_TRADE / INVALID."""
     raw = text or ""
@@ -878,7 +1248,20 @@ def classify_and_parse(text: str) -> ParsedMessage:
 
     if looks_like_option_signal(compact):
         option = parse_option_signal(compact)
+        # Feed the contract builders the same normalized text the classifier used
+        # (emoji/zero-width/code-fence/markdown stripped, OCC symbols expanded) --
+        # not the raw message, so a signal that parses fine doesn't silently lose
+        # its stop-loss/target/scale-in fields just because it had noisy formatting.
+        multi_leg_contract = build_multi_leg_contract(compact, option)
+        semantic_contract = multi_leg_contract or (
+            build_single_leg_contract(compact, option)
+            if option.valid and not option.is_multi_leg else {}
+        )
         option = replace(option, raw_text=raw)
+        if multi_leg_contract:
+            option = _project_multi_leg_contract(option, multi_leg_contract)
+        elif semantic_contract:
+            option = _project_single_leg_contract(option, semantic_contract)
         return ParsedMessage(kind="OPTION", option=option, raw_text=raw, reason=option.reason)
 
     equity = parse_signal(compact)

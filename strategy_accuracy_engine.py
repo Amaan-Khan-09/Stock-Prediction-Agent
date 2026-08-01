@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from jsonl_store import append_jsonl
+
 EVAL_FILE         = Path(__file__).resolve().parent / "strategy_prediction_evaluation_runs.jsonl"
 INVALID_EVAL_FILE = Path(__file__).resolve().parent / "strategy_prediction_evaluation_runs_invalid.jsonl"
 MODEL_VERSION = "strategy_predictor_v3_backtest_surrogate_calibrated"
@@ -146,8 +148,7 @@ def is_valid_evaluation_record(record: dict) -> bool:
 def quarantine_invalid_record(record: dict) -> None:
     """Save a record to the invalid/quarantine JSONL file."""
     try:
-        with open(INVALID_EVAL_FILE, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
+        append_jsonl(INVALID_EVAL_FILE, record)
     except Exception:
         pass
 
@@ -155,8 +156,7 @@ def quarantine_invalid_record(record: dict) -> None:
 def save_strategy_evaluation_record(record: dict) -> None:
     """Append one record to the evaluation JSONL file."""
     try:
-        with open(EVAL_FILE, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
+        append_jsonl(EVAL_FILE, record)
     except Exception:
         pass
 

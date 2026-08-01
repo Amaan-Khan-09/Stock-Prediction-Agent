@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 import threading
+from math import gcd
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
@@ -170,17 +171,52 @@ class AlpacaPaperClient:
         qty: float,
         client_order_id: str = "",
     ) -> Tuple[Optional[Dict[str, Any]], str]:
+        return self.submit_equity_order(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            order_type="market",
+            time_in_force="day",
+            client_order_id=client_order_id,
+        )
+
+    def submit_equity_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        order_type: str = "market",
+        limit_price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+        time_in_force: str = "day",
+        client_order_id: str = "",
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Submit an equity market, limit, stop, or stop-limit paper order."""
         if not self.ready():
             return None, "Alpaca paper trading is not configured or disabled."
         if qty <= 0:
             return None, "Quantity must be greater than zero."
-        payload = {
+        normalized_type = str(order_type or "market").lower()
+        if normalized_type not in {"market", "limit", "stop", "stop_limit"}:
+            return None, f"Unsupported equity order type: {normalized_type}."
+        tif = str(time_in_force or "day").lower()
+        if tif not in {"day", "gtc", "ioc", "fok"}:
+            return None, f"Unsupported time in force: {tif}."
+        payload: Dict[str, Any] = {
             "symbol": symbol.upper(),
             "qty": str(qty),
             "side": side.lower(),
-            "type": "market",
-            "time_in_force": "day",
+            "type": normalized_type,
+            "time_in_force": tif,
         }
+        if normalized_type in {"limit", "stop_limit"}:
+            if limit_price is None or float(limit_price) <= 0:
+                return None, "limit_price is required for this equity order."
+            payload["limit_price"] = str(limit_price)
+        if normalized_type in {"stop", "stop_limit"}:
+            if stop_price is None or float(stop_price) <= 0:
+                return None, "stop_price is required for this equity order."
+            payload["stop_price"] = str(stop_price)
         if client_order_id:
             payload["client_order_id"] = str(client_order_id)[:48]
         return self._post("/v2/orders", payload)
@@ -355,6 +391,7 @@ class AlpacaPaperClient:
             return None, "Multi-leg option orders require 2 to 4 legs."
         allowed_intents = {"buy_to_open", "buy_to_close", "sell_to_open", "sell_to_close"}
         normalized_legs = []
+        ratios = []
         for index, leg in enumerate(legs or [], start=1):
             symbol = str(leg.get("symbol") or "").upper()
             side = str(leg.get("side") or "").lower()
@@ -365,6 +402,7 @@ class AlpacaPaperClient:
                 ratio_qty = 0
             if not symbol or side not in {"buy", "sell"} or intent not in allowed_intents or ratio_qty <= 0:
                 return None, f"Multi-leg option leg {index} is incomplete or invalid."
+            ratios.append(ratio_qty)
             normalized_legs.append(
                 {
                     "symbol": symbol,
@@ -373,6 +411,11 @@ class AlpacaPaperClient:
                     "position_intent": intent,
                 }
             )
+        common_ratio = ratios[0]
+        for ratio in ratios[1:]:
+            common_ratio = gcd(common_ratio, ratio)
+        if common_ratio != 1:
+            return None, "Multi-leg ratios must be reduced to their simplest form."
         payload: Dict[str, Any] = {
             "order_class": "mleg",
             "qty": str(contracts_qty),
