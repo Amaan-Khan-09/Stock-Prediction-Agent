@@ -47,6 +47,7 @@ from .pending_market_orders import (
     queue_summary as market_order_queue_summary,
     remove_queued_market_order,
 )
+from .automate_agent import AUTOMATE_AGENT_TAG, BoomCandidate, plan_automate_trades
 from .prediction_bridge import run_project_prediction
 from .protection_policy import build_protection_levels, evaluate_protection
 from .runtime_lock import acquire_runtime_lock
@@ -3911,6 +3912,7 @@ async def stop_loss_monitor() -> None:
         await _process_pending_option_orders()
         await _reconcile_pending_option_entry_orders()
         await _reconcile_pending_multi_leg_entry_orders()
+    equity_clock = None
     for position in list_positions():
         symbol = str(position.get("symbol") or "").upper()
         qty = _as_float(position.get("qty"))
@@ -3939,17 +3941,35 @@ async def stop_loss_monitor() -> None:
             await asyncio.to_thread(remove_position, symbol)
             continue
         trigger = evaluate_protection(current_price, levels, short_position=short_position)
+        eod_forced = False
         if not trigger.triggered:
-            continue
+            if bool(position.get("exit_before_market_close")) and market_open:
+                if equity_clock is None:
+                    equity_clock, _ = await asyncio.to_thread(alpaca.get_clock)
+                try:
+                    next_close = datetime.fromisoformat(
+                        str((equity_clock or {}).get("next_close") or "").replace("Z", "+00:00")
+                    )
+                    seconds_to_close = (next_close - datetime.now(next_close.tzinfo)).total_seconds()
+                    eod_forced = 0 <= seconds_to_close <= config.automate_agent_exit_minutes_before_close * 60
+                except (TypeError, ValueError):
+                    eod_forced = False
+            if not eod_forced:
+                continue
 
         exit_reason = (
-            "protection_stop_loss"
-            if trigger.reason == "stop_loss"
-            else "protection_take_profit"
+            "protection_stop_loss" if trigger.triggered and trigger.reason == "stop_loss"
+            else "protection_take_profit" if trigger.triggered
+            else "eod_forced_exit"
         )
-        boundary_label = "stop" if trigger.reason == "stop_loss" else "target"
+        boundary_label = (
+            "stop" if trigger.triggered and trigger.reason == "stop_loss"
+            else "target" if trigger.triggered
+            else "end-of-day"
+        )
         exit_side = "buy" if short_position else "sell"
         exit_qty = min(qty, held_qty)
+        reference_price = trigger.trigger_price if trigger.triggered else current_price
 
         if not market_open:
             await asyncio.to_thread(
@@ -3975,7 +3995,7 @@ async def stop_loss_monitor() -> None:
             exit_qty,
             _client_order_id(
                 "equityprotect",
-                f"{symbol}:{entry}:{exit_reason}:{trigger.trigger_price}",
+                f"{symbol}:{entry}:{exit_reason}:{reference_price}",
             ),
         )
         if order:
@@ -3983,10 +4003,15 @@ async def stop_loss_monitor() -> None:
             await _track_submitted_exit(
                 order, symbol, exit_qty, "equity", exit_reason
             )
+            reason_text = (
+                f"{boundary_label} protection triggered at ${current_price:.2f} "
+                f"(boundary ${reference_price:.2f})"
+                if trigger.triggered
+                else f"forced end-of-day close at ${current_price:.2f}"
+            )
             await _send_channel(
                 config.discord_paper_log_channel_id or config.discord_review_channel_id,
-                f"{symbol}: {boundary_label} protection triggered at ${current_price:.2f} "
-                f"(boundary ${trigger.trigger_price:.2f}). Submitted {exit_qty:g} share(s) "
+                f"{symbol}: {reason_text}. Submitted {exit_qty:g} share(s) "
                 f"to {'cover the short' if short_position else 'close the position'}; "
                 "awaiting Alpaca fill confirmation.",
             )
@@ -5736,6 +5761,114 @@ async def _build_agent_option_validation_text() -> str:
 @bot.command(name="agent_option_validation")
 async def agent_option_validation(ctx: commands.Context) -> None:
     await _send_context_output(ctx, await _build_agent_option_validation_text())
+
+
+async def _scan_automate_agent_watchlist() -> list[BoomCandidate]:
+    """Runs the existing prediction engine across the configured watchlist.
+
+    Deliberately reuses run_project_prediction (the same engine every other
+    part of this project already relies on) rather than a new, unvalidated
+    heuristic. One symbol failing to fetch/predict never aborts the scan for
+    the rest of the watchlist.
+    """
+    candidates: list[BoomCandidate] = []
+    for symbol in config.automate_agent_watchlist:
+        try:
+            result = await asyncio.to_thread(run_project_prediction, symbol)
+        except Exception as exc:  # noqa: BLE001 -- one bad symbol shouldn't kill the scan
+            logging.getLogger("discord_stock_prediction_agent").warning(
+                "automate_agent: prediction failed for %s: %s", symbol, exc
+            )
+            continue
+        if result.get("status") != "SUCCESS":
+            continue
+        candidates.append(BoomCandidate(symbol=symbol, decision=str(result.get("decision") or "")))
+    return candidates
+
+
+async def _build_automate_agent_text() -> str:
+    if not alpaca.ready():
+        return "automate_agent: Alpaca paper trading is not configured."
+
+    market_open, _ = await asyncio.to_thread(alpaca.is_market_open)
+    if not market_open:
+        return "automate_agent: market is closed. No action taken."
+
+    candidates = await _scan_automate_agent_watchlist()
+    open_positions = await asyncio.to_thread(list_positions)
+    plan = plan_automate_trades(
+        candidates,
+        open_positions,
+        config.automate_agent_min_positions,
+        config.automate_agent_max_positions,
+    )
+
+    if not plan.to_buy:
+        return (
+            f"automate_agent: scanned {len(config.automate_agent_watchlist)} watchlist symbol(s), "
+            "no BUY-decision candidates found this cycle. No trades placed."
+        )
+
+    lines = ["automate_agent cycle summary"]
+
+    for symbol in plan.to_evict:
+        position = next((p for p in open_positions if p.get("symbol") == symbol), None)
+        held_qty = _as_float((position or {}).get("qty"))
+        if held_qty <= 0:
+            continue
+        order, err = await asyncio.to_thread(
+            alpaca.submit_market_order,
+            symbol, "sell", held_qty,
+            _client_order_id("automate_evict", f"{symbol}:{held_qty}"),
+        )
+        if order:
+            await asyncio.to_thread(_record_order, symbol, "sell", held_qty, "submitted", str(order.get("id") or ""), "equity", "automate_agent_evict")
+            await asyncio.to_thread(remove_position, symbol)
+            lines.append(f"- Evicted {symbol} ({held_qty:g} sh) to free a slot at the {config.automate_agent_max_positions}-position cap.")
+        else:
+            lines.append(f"- Tried to evict {symbol} but the sell was not placed: {_public_error(err)}")
+
+    bought: list[str] = []
+    for symbol in plan.to_buy:
+        price, price_err = await asyncio.to_thread(alpaca.get_latest_price, symbol)
+        if not price or price <= 0:
+            lines.append(f"- Skipped {symbol}: could not get a live price ({_public_error(price_err)}).")
+            continue
+        qty = max(1, int(config.automate_agent_notional_per_trade // price))
+        order, err = await asyncio.to_thread(
+            alpaca.submit_market_order,
+            symbol, "buy", qty,
+            _client_order_id("automate_buy", f"{symbol}:{qty}:{price}"),
+        )
+        if order:
+            await asyncio.to_thread(_record_order, symbol, "buy", qty, "submitted", str(order.get("id") or ""), "equity", "automate_agent_buy")
+            await asyncio.to_thread(
+                upsert_position,
+                symbol, qty, price, str(order.get("id") or ""),
+                config.equity_stop_loss_pct, config.equity_take_profit_pct, "long",
+                AUTOMATE_AGENT_TAG, True,
+            )
+            bought.append(symbol)
+            lines.append(
+                f"- Bought {symbol}: {qty:g} sh @ ~${price:.2f} "
+                f"(stop {config.equity_stop_loss_pct:g}%, target {config.equity_take_profit_pct:g}%, "
+                f"auto-closes within {config.automate_agent_exit_minutes_before_close} min of market close)."
+            )
+        else:
+            lines.append(f"- Tried to buy {symbol} but the order was not placed: {_public_error(err)}")
+
+    lines.append(
+        f"Scanned {len(config.automate_agent_watchlist)} watchlist symbol(s); "
+        f"{len(bought)} new position(s) opened this cycle."
+    )
+    summary = "\n".join(lines)
+    await _send_channel(config.discord_review_channel_id, summary)
+    return summary
+
+
+@bot.command(name="automate_agent")
+async def automate_agent(ctx: commands.Context) -> None:
+    await _send_context_output(ctx, await _build_automate_agent_text())
 
 
 # ══════════════════════════════════════════════════════════════════════════════

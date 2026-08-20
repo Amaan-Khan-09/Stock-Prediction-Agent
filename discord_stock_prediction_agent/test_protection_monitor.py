@@ -195,6 +195,51 @@ def test_equity_closed_market_stop_is_durable_and_not_duplicated() -> None:
     asyncio.run(_with_runtime(scenario))
 
 
+def test_equity_exit_before_close_forces_a_flat_position_out() -> None:
+    """A position tagged exit_before_market_close, priced flat (neither
+    stop nor target hit), still gets force-closed once within the
+    configured exit window of the actual market close -- covers the
+    automate_agent EOD-flatten requirement."""
+    async def scenario(fake: ProtectionAlpaca) -> None:
+        state_store.upsert_position(
+            "TSLA", 4, 100.0, "buy", 1.0, 10.0, "long",
+            "automate_agent", True,
+        )
+        fake.quantities["TSLA"] = 4
+        fake.prices["TSLA"] = 100.5  # flat -- neither the 1% stop nor 10% target
+        fake.get_clock = lambda: (
+            {
+                "is_open": True,
+                "next_close": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+            },
+            "",
+        )
+        await discord_agent.stop_loss_monitor.coro()
+        assert len(fake.submissions) == 1
+        assert fake.submissions[0]["symbol"] == "TSLA"
+        assert fake.submissions[0]["side"] == "sell"
+
+    asyncio.run(_with_runtime(scenario))
+
+
+def test_equity_exit_before_close_does_not_fire_outside_the_window() -> None:
+    """The same flagged, flat position is left alone when close is still
+    hours away -- only near-close should force an exit."""
+    async def scenario(fake: ProtectionAlpaca) -> None:
+        state_store.upsert_position(
+            "TSLA", 4, 100.0, "buy", 1.0, 10.0, "long",
+            "automate_agent", True,
+        )
+        fake.quantities["TSLA"] = 4
+        fake.prices["TSLA"] = 100.5
+        # fake.get_clock defaults to next_close 6 hours away -- well outside
+        # the exit window, so nothing should be submitted.
+        await discord_agent.stop_loss_monitor.coro()
+        assert len(fake.submissions) == 0
+
+    asyncio.run(_with_runtime(scenario))
+
+
 def test_agent_positions_text_shows_side_so_shorts_are_not_ambiguous() -> None:
     with TemporaryDirectory() as tmp:
         original_state = state_store.STATE_PATH

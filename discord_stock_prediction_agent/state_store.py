@@ -667,6 +667,8 @@ def upsert_position(
     stop_loss_pct: float = 1.0,
     take_profit_pct: float = 10.0,
     side: str = "long",
+    opened_by: str = "",
+    exit_before_market_close: bool = False,
 ) -> None:
     state = load_state()
     positions = state.setdefault("agent_positions", {})
@@ -696,6 +698,13 @@ def upsert_position(
         "stop_loss_pct": max(0.0, float(stop_loss_pct)),
         "take_profit_pct": max(0.0, float(take_profit_pct)),
         "last_order_id": order_id,
+        # Sticky once set, same pattern as options' exit_before_market_close:
+        # a repeat upsert (e.g. adding shares) shouldn't silently clear either
+        # flag from the position's first fill.
+        "opened_by": str(opened_by or previous.get("opened_by") or ""),
+        "exit_before_market_close": bool(
+            exit_before_market_close or previous.get("exit_before_market_close")
+        ),
         "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
     save_state(state)

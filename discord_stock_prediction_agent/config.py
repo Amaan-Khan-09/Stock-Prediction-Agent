@@ -102,6 +102,26 @@ class AgentConfig:
     runtime_log_max_bytes: int = _int_env("RUNTIME_LOG_MAX_BYTES", 5_000_000)
     runtime_log_backup_count: int = _int_env("RUNTIME_LOG_BACKUP_COUNT", 5)
 
+    # !automate_agent -- autonomous intraday scan-and-trade. Reuses the
+    # existing equity stop-loss/take-profit config above rather than a
+    # separate knob, since both default to the same 1%/10% already.
+    automate_agent_min_positions: int = _int_env("AUTOMATE_AGENT_MIN_POSITIONS", 1)
+    automate_agent_max_positions: int = _int_env("AUTOMATE_AGENT_MAX_POSITIONS", 5)
+    automate_agent_exit_minutes_before_close: int = _int_env(
+        "AUTOMATE_AGENT_EXIT_MINUTES_BEFORE_CLOSE", 15
+    )
+    automate_agent_notional_per_trade: float = _float_env(
+        "AUTOMATE_AGENT_NOTIONAL_PER_TRADE", 1000.0
+    )
+    automate_agent_watchlist: tuple[str, ...] = tuple(
+        s.strip().upper()
+        for s in os.getenv(
+            "AUTOMATE_AGENT_WATCHLIST",
+            "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,AMD,AVGO,NFLX",
+        ).split(",")
+        if s.strip()
+    )
+
     whatsapp_webhook_enabled: bool = _bool_env("WHATSAPP_WEBHOOK_ENABLED", False)
     whatsapp_verify_token: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
     whatsapp_access_token: str = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
