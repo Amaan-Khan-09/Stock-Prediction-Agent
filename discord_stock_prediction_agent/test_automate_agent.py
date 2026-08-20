@@ -60,6 +60,35 @@ def test_rank_orders_by_confidence_descending() -> None:
     _assert([c.symbol for c in ranked] == ["MSFT", "NVDA", "AAPL"], "sorted strongest-first", str(ranked))
 
 
+def test_rank_tiebreaks_by_predicted_return_pct() -> None:
+    print("\nTest: ranking tiebreaks equal-confidence candidates by predicted_return_pct")
+    candidates = [
+        BoomCandidate("AAPL", "BUY", confidence=0.7, predicted_return_pct=1.0),
+        BoomCandidate("MSFT", "BUY", confidence=0.7, predicted_return_pct=3.5),
+        BoomCandidate("NVDA", "BUY", confidence=0.7, predicted_return_pct=2.0),
+    ]
+    ranked = rank_boom_candidates(candidates)
+    _assert(
+        [c.symbol for c in ranked] == ["MSFT", "NVDA", "AAPL"],
+        "same confidence, higher predicted_return_pct wins",
+        str(ranked),
+    )
+
+
+def test_rank_excludes_needs_human_review() -> None:
+    print("\nTest: ranking drops BUY candidates the model itself flagged as uncertain")
+    candidates = [
+        BoomCandidate("AAPL", "BUY", confidence=0.9, needs_human_review=True),
+        BoomCandidate("MSFT", "BUY", confidence=0.5, needs_human_review=False),
+    ]
+    ranked = rank_boom_candidates(candidates)
+    _assert(
+        [c.symbol for c in ranked] == ["MSFT"],
+        "AAPL excluded despite higher confidence -- needs_human_review is a hard filter, not a ranking input",
+        str(ranked),
+    )
+
+
 def test_oldest_automate_position_ignores_user_trades() -> None:
     print("\nTest: eviction never targets a real user's position")
     positions = [
@@ -156,6 +185,8 @@ def run_all() -> None:
 
     test_rank_keeps_only_buy_decisions()
     test_rank_orders_by_confidence_descending()
+    test_rank_tiebreaks_by_predicted_return_pct()
+    test_rank_excludes_needs_human_review()
     test_oldest_automate_position_ignores_user_trades()
     test_oldest_automate_position_none_when_all_user_owned()
     test_count_automate_positions()

@@ -27,13 +27,28 @@ AUTOMATE_AGENT_TAG = "automate_agent"
 class BoomCandidate:
     symbol: str
     decision: str  # "BUY" | "SELL" | "HOLD" | "REVIEW" from run_project_prediction
-    confidence: float = 0.0  # higher = stronger conviction, used only to rank
+    confidence: float = 0.0  # 0-100 confidence_score from the prediction engine
+    predicted_return_pct: float = 0.0  # used as a tiebreaker when confidence ties
+    needs_human_review: bool = False  # the model's OWN flag that this call is uncertain
 
 
 def rank_boom_candidates(candidates: list[BoomCandidate]) -> list[BoomCandidate]:
-    """Keeps only BUY-decision candidates, strongest conviction first."""
-    buys = [c for c in candidates if c.decision.upper() == "BUY"]
-    return sorted(buys, key=lambda c: c.confidence, reverse=True)
+    """Keeps only BUY-decision candidates that the prediction engine itself
+    didn't flag as needing human review, strongest conviction first.
+
+    needs_human_review is the model's own signal that its call here is
+    uncertain enough to want a second opinion. automate_agent is the one
+    path in this whole project with no human reviewing before execution --
+    silently ignoring that flag specifically here would be the worst place
+    to ignore it. Excluding those candidates keeps this consistent with
+    the rest of the system's "when the model says it's unsure, a human (or
+    here, extra caution) is required" design.
+    """
+    buys = [
+        c for c in candidates
+        if c.decision.upper() == "BUY" and not c.needs_human_review
+    ]
+    return sorted(buys, key=lambda c: (c.confidence, c.predicted_return_pct), reverse=True)
 
 
 def oldest_automate_position(open_positions: list[dict]) -> Optional[str]:

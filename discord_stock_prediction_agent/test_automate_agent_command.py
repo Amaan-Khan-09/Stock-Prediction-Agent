@@ -48,15 +48,27 @@ class FakeAutomateAlpaca:
         return dict(order), ""
 
 
-async def _with_runtime(test_body, predictions: dict[str, str]) -> None:
-    """predictions maps symbol -> decision ("BUY"/"HOLD"/"SELL"); any
-    watchlist symbol not present in the map is treated as a failed lookup
-    (status != SUCCESS), matching a real provider error for that symbol.
+async def _with_runtime(test_body, predictions: dict[str, object]) -> None:
+    """predictions maps symbol -> either a bare decision string
+    ("BUY"/"HOLD"/"SELL"), or a dict with a "decision" key plus optional
+    "confidence_score"/"predicted_return_pct"/"needs_human_review" entries
+    to exercise the ai_prediction extraction path in
+    _scan_automate_agent_watchlist. Any watchlist symbol not present in the
+    map is treated as a failed lookup (status != SUCCESS), matching a real
+    provider error for that symbol.
     """
     def fake_predict(symbol: str, horizon_days=None):
         if symbol not in predictions:
             return {"status": "FAILED", "symbol": symbol, "decision": "REVIEW"}
-        return {"status": "SUCCESS", "symbol": symbol, "decision": predictions[symbol]}
+        spec = predictions[symbol]
+        if isinstance(spec, dict):
+            ai_prediction = {k: v for k, v in spec.items() if k != "decision"}
+            return {
+                "status": "SUCCESS", "symbol": symbol,
+                "decision": spec.get("decision", "BUY"),
+                "ai_prediction": ai_prediction,
+            }
+        return {"status": "SUCCESS", "symbol": symbol, "decision": spec}
 
     with TemporaryDirectory() as tmp:
         original_state = state_store.STATE_PATH
@@ -301,6 +313,48 @@ def test_at_cap_evicts_oldest_automate_position_before_buying() -> None:
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
+def test_needs_human_review_candidate_is_not_bought() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        watchlist = discord_agent.config.automate_agent_watchlist
+        risky, safe = watchlist[0], watchlist[1]
+        fake.prices[risky] = 50.0
+        fake.prices[safe] = 60.0
+
+        await discord_agent._build_automate_agent_text()
+
+        symbols_bought = {p["symbol"] for p in state_store.list_positions()}
+        assert risky not in symbols_bought, "needs_human_review candidate must never be auto-bought"
+        assert safe in symbols_bought, "the non-flagged candidate is still bought normally"
+
+    predictions = {
+        discord_agent.config.automate_agent_watchlist[0]: {
+            "decision": "BUY", "confidence_score": 95, "needs_human_review": True,
+        },
+        discord_agent.config.automate_agent_watchlist[1]: {
+            "decision": "BUY", "confidence_score": 40, "needs_human_review": False,
+        },
+    }
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_buy_summary_shows_confidence_and_predicted_return() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+
+        text = await discord_agent._build_automate_agent_text()
+
+        assert "confidence 82" in text, text
+        assert "predicted return +3.50%" in text, text
+
+    predictions = {
+        discord_agent.config.automate_agent_watchlist[0]: {
+            "decision": "BUY", "confidence_score": 82, "predicted_return_pct": 3.5,
+        },
+    }
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
 def test_a_failed_symbol_lookup_does_not_abort_the_whole_scan() -> None:
     async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
         watchlist = discord_agent.config.automate_agent_watchlist
@@ -330,5 +384,7 @@ if __name__ == "__main__":
     test_no_buy_candidates_places_no_trades()
     test_open_market_buys_a_boom_candidate_and_tags_it()
     test_at_cap_evicts_oldest_automate_position_before_buying()
+    test_needs_human_review_candidate_is_not_bought()
+    test_buy_summary_shows_confidence_and_predicted_return()
     test_a_failed_symbol_lookup_does_not_abort_the_whole_scan()
     print("ALL AUTOMATE_AGENT COMMAND INTEGRATION TESTS PASSED")

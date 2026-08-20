@@ -5787,7 +5787,14 @@ async def _scan_automate_agent_watchlist() -> list[BoomCandidate]:
             return None
         if result.get("status") != "SUCCESS":
             return None
-        return BoomCandidate(symbol=symbol, decision=str(result.get("decision") or ""))
+        ai_prediction = result.get("ai_prediction") or {}
+        return BoomCandidate(
+            symbol=symbol,
+            decision=str(result.get("decision") or ""),
+            confidence=_as_float(ai_prediction.get("confidence_score")),
+            predicted_return_pct=_as_float(ai_prediction.get("predicted_return_pct")),
+            needs_human_review=bool(ai_prediction.get("needs_human_review")),
+        )
 
     results = await asyncio.gather(
         *(_predict_one(symbol) for symbol in config.automate_agent_watchlist)
@@ -5887,6 +5894,7 @@ async def _build_automate_agent_text() -> str:
                 )
                 lines.append(f"- Tried to evict {symbol} but hit an unexpected error; left untouched.")
 
+        candidates_by_symbol = {c.symbol.upper(): c for c in candidates}
         bought: list[str] = []
         for symbol in plan.to_buy:
             try:
@@ -5918,10 +5926,17 @@ async def _build_automate_agent_text() -> str:
                         AUTOMATE_AGENT_TAG, True,
                     )
                     bought.append(symbol)
+                    picked = candidates_by_symbol.get(symbol.upper())
+                    conviction = (
+                        f" [confidence {picked.confidence:.0f}, predicted return {picked.predicted_return_pct:+.2f}%]"
+                        if picked is not None
+                        else ""
+                    )
                     lines.append(
                         f"- Bought {symbol}: {qty:g} sh @ ~${price:.2f} "
                         f"(stop {config.equity_stop_loss_pct:g}%, target {config.equity_take_profit_pct:g}%, "
                         f"auto-closes within {config.automate_agent_exit_minutes_before_close} min of market close)."
+                        f"{conviction}"
                     )
                 else:
                     lines.append(f"- Tried to buy {symbol} but the order was not placed: {_public_error(err)}")
