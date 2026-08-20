@@ -69,6 +69,12 @@ async def _with_runtime(test_body, predictions: dict[str, str]) -> None:
         discord_agent.alpaca = fake
         discord_agent.run_project_prediction = fake_predict
         discord_agent._send_channel = capture_send
+        # The cooldown/lock are module-level globals so they persist across
+        # sequential test runs in the same process -- reset both so each
+        # test starts from a clean slate regardless of run order.
+        discord_agent._automate_agent_last_run = 0.0
+        if discord_agent._automate_agent_lock.locked():
+            discord_agent._automate_agent_lock.release()
         try:
             await test_body(fake, sent)
         finally:
@@ -76,6 +82,77 @@ async def _with_runtime(test_body, predictions: dict[str, str]) -> None:
             discord_agent.alpaca = original_alpaca
             discord_agent.run_project_prediction = original_predict
             discord_agent._send_channel = original_send
+
+
+def test_agent_off_takes_no_action() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        state_store.set_agent_mode("OFF")
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+        text = await discord_agent._build_automate_agent_text()
+        assert "agent mode is off" in text.lower()
+        assert not state_store.list_positions()
+        assert not fake.submissions
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: "BUY"}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_cooldown_blocks_immediate_re_run() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+        first = await discord_agent._build_automate_agent_text()
+        assert len(fake.submissions) == 1, "first run buys normally"
+
+        second = await discord_agent._build_automate_agent_text()
+        assert "cooling down" in second.lower()
+        assert len(fake.submissions) == 1, "no second order placed during cooldown"
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: "BUY"}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_concurrent_invocations_do_not_double_fill_slots() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        for sym in discord_agent.config.automate_agent_watchlist:
+            fake.prices[sym] = 50.0
+        results = await asyncio.gather(
+            discord_agent._build_automate_agent_text(),
+            discord_agent._build_automate_agent_text(),
+        )
+        assert any("already running" in r.lower() for r in results), (
+            "the second overlapping call should see the lock, not run a second scan"
+        )
+        positions = state_store.list_positions()
+        assert len(positions) <= discord_agent.config.automate_agent_max_positions
+
+    predictions = {sym: "BUY" for sym in discord_agent.config.automate_agent_watchlist}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_one_symbol_erroring_during_buy_does_not_abort_the_cycle() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        watchlist = discord_agent.config.automate_agent_watchlist
+        bad_symbol, good_symbol = watchlist[0], watchlist[1]
+        fake.prices[good_symbol] = 80.0
+        fake.prices[bad_symbol] = 80.0
+
+        original_submit = fake.submit_market_order
+        def flaky_submit(symbol, side, qty, client_order_id=""):
+            if symbol == bad_symbol and side == "buy":
+                raise RuntimeError("simulated transient broker error")
+            return original_submit(symbol, side, qty, client_order_id)
+        fake.submit_market_order = flaky_submit
+
+        text = await discord_agent._build_automate_agent_text()
+        symbols_bought = {p["symbol"] for p in state_store.list_positions()}
+        assert good_symbol in symbols_bought, "the good symbol still gets bought"
+        assert bad_symbol not in symbols_bought, "the erroring symbol is skipped, not crashing the cycle"
+        assert "unexpected error" in text.lower()
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: "BUY", discord_agent.config.automate_agent_watchlist[1]: "BUY"}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
 def test_market_closed_takes_no_action() -> None:
@@ -168,6 +245,10 @@ def test_a_failed_symbol_lookup_does_not_abort_the_whole_scan() -> None:
 
 
 if __name__ == "__main__":
+    test_agent_off_takes_no_action()
+    test_cooldown_blocks_immediate_re_run()
+    test_concurrent_invocations_do_not_double_fill_slots()
+    test_one_symbol_erroring_during_buy_does_not_abort_the_cycle()
     test_market_closed_takes_no_action()
     test_no_buy_candidates_places_no_trades()
     test_open_market_buys_a_boom_candidate_and_tags_it()

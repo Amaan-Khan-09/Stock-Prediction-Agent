@@ -113,6 +113,11 @@ class AgentConfig:
     automate_agent_notional_per_trade: float = _float_env(
         "AUTOMATE_AGENT_NOTIONAL_PER_TRADE", 1000.0
     )
+    # Each cycle runs the prediction engine once per watchlist symbol
+    # (real historical-data fetch + AI call each time) -- a cooldown keeps
+    # rapid re-triggering from burning API calls/rate limits for no benefit,
+    # since the market doesn't meaningfully change signal in a few seconds.
+    automate_agent_cooldown_seconds: int = _int_env("AUTOMATE_AGENT_COOLDOWN_SECONDS", 60)
     automate_agent_watchlist: tuple[str, ...] = tuple(
         s.strip().upper()
         for s in os.getenv(

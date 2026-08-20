@@ -5770,104 +5770,154 @@ async def _scan_automate_agent_watchlist() -> list[BoomCandidate]:
     part of this project already relies on) rather than a new, unvalidated
     heuristic. One symbol failing to fetch/predict never aborts the scan for
     the rest of the watchlist.
+
+    Symbols are scanned concurrently, not one at a time -- each is an
+    independent, real historical-data-fetch-plus-AI-call that can take real
+    time, and there's no reason to make a user wait N times as long as a
+    single lookup just because the watchlist has N symbols.
     """
-    candidates: list[BoomCandidate] = []
-    for symbol in config.automate_agent_watchlist:
+    async def _predict_one(symbol: str) -> Optional[BoomCandidate]:
         try:
             result = await asyncio.to_thread(run_project_prediction, symbol)
         except Exception as exc:  # noqa: BLE001 -- one bad symbol shouldn't kill the scan
             logging.getLogger("discord_stock_prediction_agent").warning(
                 "automate_agent: prediction failed for %s: %s", symbol, exc
             )
-            continue
+            return None
         if result.get("status") != "SUCCESS":
-            continue
-        candidates.append(BoomCandidate(symbol=symbol, decision=str(result.get("decision") or "")))
-    return candidates
+            return None
+        return BoomCandidate(symbol=symbol, decision=str(result.get("decision") or ""))
+
+    results = await asyncio.gather(
+        *(_predict_one(symbol) for symbol in config.automate_agent_watchlist)
+    )
+    return [c for c in results if c is not None]
+
+
+_automate_agent_lock = asyncio.Lock()
+_automate_agent_last_run: float = 0.0
 
 
 async def _build_automate_agent_text() -> str:
     if not alpaca.ready():
         return "automate_agent: Alpaca paper trading is not configured."
 
+    # Consistency with the rest of the system: if an admin has explicitly
+    # turned the agent OFF, an autonomous trigger shouldn't start placing
+    # trades either -- OFF should mean OFF everywhere, not just for
+    # human-originated signals.
+    if not _agent_is_enabled():
+        return "automate_agent: agent mode is OFF. Run !agent_on first if this is intentional."
+
     market_open, _ = await asyncio.to_thread(alpaca.is_market_open)
     if not market_open:
         return "automate_agent: market is closed. No action taken."
 
-    candidates = await _scan_automate_agent_watchlist()
-    open_positions = await asyncio.to_thread(list_positions)
-    plan = plan_automate_trades(
-        candidates,
-        open_positions,
-        config.automate_agent_min_positions,
-        config.automate_agent_max_positions,
-    )
+    if _automate_agent_lock.locked():
+        return "automate_agent: a scan-and-trade cycle is already running. Try again once it finishes."
 
-    if not plan.to_buy:
-        return (
-            f"automate_agent: scanned {len(config.automate_agent_watchlist)} watchlist symbol(s), "
-            "no BUY-decision candidates found this cycle. No trades placed."
+    async with _automate_agent_lock:
+        global _automate_agent_last_run
+        now = asyncio.get_event_loop().time()
+        elapsed = now - _automate_agent_last_run
+        if elapsed < config.automate_agent_cooldown_seconds:
+            wait_left = int(config.automate_agent_cooldown_seconds - elapsed)
+            return f"automate_agent: cooling down, try again in {wait_left}s."
+        _automate_agent_last_run = now
+
+        candidates = await _scan_automate_agent_watchlist()
+        open_positions = await asyncio.to_thread(list_positions)
+        plan = plan_automate_trades(
+            candidates,
+            open_positions,
+            config.automate_agent_min_positions,
+            config.automate_agent_max_positions,
         )
 
-    lines = ["automate_agent cycle summary"]
-
-    for symbol in plan.to_evict:
-        position = next((p for p in open_positions if p.get("symbol") == symbol), None)
-        held_qty = _as_float((position or {}).get("qty"))
-        if held_qty <= 0:
-            continue
-        order, err = await asyncio.to_thread(
-            alpaca.submit_market_order,
-            symbol, "sell", held_qty,
-            _client_order_id("automate_evict", f"{symbol}:{held_qty}"),
-        )
-        if order:
-            await asyncio.to_thread(_record_order, symbol, "sell", held_qty, "submitted", str(order.get("id") or ""), "equity", "automate_agent_evict")
-            await asyncio.to_thread(remove_position, symbol)
-            lines.append(f"- Evicted {symbol} ({held_qty:g} sh) to free a slot at the {config.automate_agent_max_positions}-position cap.")
-        else:
-            lines.append(f"- Tried to evict {symbol} but the sell was not placed: {_public_error(err)}")
-
-    bought: list[str] = []
-    for symbol in plan.to_buy:
-        price, price_err = await asyncio.to_thread(alpaca.get_latest_price, symbol)
-        if not price or price <= 0:
-            lines.append(f"- Skipped {symbol}: could not get a live price ({_public_error(price_err)}).")
-            continue
-        qty = max(1, int(config.automate_agent_notional_per_trade // price))
-        order, err = await asyncio.to_thread(
-            alpaca.submit_market_order,
-            symbol, "buy", qty,
-            _client_order_id("automate_buy", f"{symbol}:{qty}:{price}"),
-        )
-        if order:
-            await asyncio.to_thread(_record_order, symbol, "buy", qty, "submitted", str(order.get("id") or ""), "equity", "automate_agent_buy")
-            await asyncio.to_thread(
-                upsert_position,
-                symbol, qty, price, str(order.get("id") or ""),
-                config.equity_stop_loss_pct, config.equity_take_profit_pct, "long",
-                AUTOMATE_AGENT_TAG, True,
+        if not plan.to_buy:
+            return (
+                f"automate_agent: scanned {len(config.automate_agent_watchlist)} watchlist symbol(s), "
+                "no BUY-decision candidates found this cycle. No trades placed."
             )
-            bought.append(symbol)
-            lines.append(
-                f"- Bought {symbol}: {qty:g} sh @ ~${price:.2f} "
-                f"(stop {config.equity_stop_loss_pct:g}%, target {config.equity_take_profit_pct:g}%, "
-                f"auto-closes within {config.automate_agent_exit_minutes_before_close} min of market close)."
-            )
-        else:
-            lines.append(f"- Tried to buy {symbol} but the order was not placed: {_public_error(err)}")
 
-    lines.append(
-        f"Scanned {len(config.automate_agent_watchlist)} watchlist symbol(s); "
-        f"{len(bought)} new position(s) opened this cycle."
-    )
-    summary = "\n".join(lines)
-    await _send_channel(config.discord_review_channel_id, summary)
-    return summary
+        lines = ["automate_agent cycle summary"]
+
+        for symbol in plan.to_evict:
+            try:
+                position = next((p for p in open_positions if p.get("symbol") == symbol), None)
+                held_qty = _as_float((position or {}).get("qty"))
+                if held_qty <= 0:
+                    continue
+                order, err = await asyncio.to_thread(
+                    alpaca.submit_market_order,
+                    symbol, "sell", held_qty,
+                    _client_order_id("automate_evict", f"{symbol}:{held_qty}"),
+                )
+                if order:
+                    await asyncio.to_thread(_record_order, symbol, "sell", held_qty, "submitted", str(order.get("id") or ""), "equity", "automate_agent_evict")
+                    await asyncio.to_thread(remove_position, symbol)
+                    lines.append(f"- Evicted {symbol} ({held_qty:g} sh) to free a slot at the {config.automate_agent_max_positions}-position cap.")
+                else:
+                    lines.append(f"- Tried to evict {symbol} but the sell was not placed: {_public_error(err)}")
+            except Exception as exc:  # noqa: BLE001 -- one symbol's failure must not abort the cycle
+                logging.getLogger("discord_stock_prediction_agent").error(
+                    "automate_agent: eviction failed for %s: %s", symbol, exc
+                )
+                lines.append(f"- Tried to evict {symbol} but hit an unexpected error; left untouched.")
+
+        bought: list[str] = []
+        for symbol in plan.to_buy:
+            try:
+                price, price_err = await asyncio.to_thread(alpaca.get_latest_price, symbol)
+                if not price or price <= 0:
+                    lines.append(f"- Skipped {symbol}: could not get a live price ({_public_error(price_err)}).")
+                    continue
+                qty = max(1, int(config.automate_agent_notional_per_trade // price))
+                order, err = await asyncio.to_thread(
+                    alpaca.submit_market_order,
+                    symbol, "buy", qty,
+                    _client_order_id("automate_buy", f"{symbol}:{qty}:{price}"),
+                )
+                if order:
+                    await asyncio.to_thread(_record_order, symbol, "buy", qty, "submitted", str(order.get("id") or ""), "equity", "automate_agent_buy")
+                    await asyncio.to_thread(
+                        upsert_position,
+                        symbol, qty, price, str(order.get("id") or ""),
+                        config.equity_stop_loss_pct, config.equity_take_profit_pct, "long",
+                        AUTOMATE_AGENT_TAG, True,
+                    )
+                    bought.append(symbol)
+                    lines.append(
+                        f"- Bought {symbol}: {qty:g} sh @ ~${price:.2f} "
+                        f"(stop {config.equity_stop_loss_pct:g}%, target {config.equity_take_profit_pct:g}%, "
+                        f"auto-closes within {config.automate_agent_exit_minutes_before_close} min of market close)."
+                    )
+                else:
+                    lines.append(f"- Tried to buy {symbol} but the order was not placed: {_public_error(err)}")
+            except Exception as exc:  # noqa: BLE001 -- one symbol's failure must not abort the cycle
+                logging.getLogger("discord_stock_prediction_agent").error(
+                    "automate_agent: buy failed for %s: %s", symbol, exc
+                )
+                lines.append(f"- Tried to buy {symbol} but hit an unexpected error; skipped.")
+
+        lines.append(
+            f"Scanned {len(config.automate_agent_watchlist)} watchlist symbol(s); "
+            f"{len(bought)} new position(s) opened this cycle."
+        )
+        summary = "\n".join(lines)
+        await _send_channel(config.discord_review_channel_id, summary)
+        return summary
 
 
 @bot.command(name="automate_agent")
 async def automate_agent(ctx: commands.Context) -> None:
+    if not await _can_manage_agent_mode(ctx):
+        await _send_context_output(
+            ctx,
+            "You need Administrator or Manage Server permission to run automate_agent "
+            "-- it places real trades autonomously.",
+        )
+        return
     await _send_context_output(ctx, await _build_automate_agent_text())
 
 
