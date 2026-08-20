@@ -197,6 +197,45 @@ def test_daily_context_clears_on_new_day() -> None:
     )
 
 
+def test_bare_spread_commentary_single_leg_not_forced_multi_leg() -> None:
+    print("\nTest: single-leg message mentioning 'spread' in passing isn't forced multi-leg")
+    text = (
+        "Rolled down SPX strike to 7765C at 1.80. Approx .65 premiums left.\n"
+        "Not adding any funds just rolling down the strike. This can help hedge Credit spread as well"
+    )
+    option = classify_and_parse(text).option
+    _assert(option is not None and option.valid, "parses as valid single-leg OPTION")
+    _assert(option is not None and not option.is_multi_leg, "stays single-leg")
+    _assert(option is not None and option.root == "SPX", "root == SPX")
+    _assert(option is not None and option.strike == 7765.0, "strike == 7765.0")
+
+
+def test_genuine_two_leg_spread_still_builds_multi_leg() -> None:
+    print("\nTest: a genuine 2-leg spread instruction still builds multi-leg (no regression)")
+    option = classify_and_parse(
+        "BTO AAPL 240C / STO AAPL 250C 09/19 @4.60 Debit Credit spread"
+    ).option
+    _assert(option is not None and option.valid, "valid")
+    _assert(option is not None and option.is_multi_leg, "still recognized as multi-leg")
+
+
+def test_commentary_words_do_not_leak_as_equity_tickers() -> None:
+    print("\nTest: common trading-room commentary words aren't guessed as equity tickers")
+    cases = [
+        "Small Hedge for long portfolio. Can avoid if got nothing to hedge",
+        "Take profit here level might hold",
+        "Sold most at 3.50 Might hold yesterday low",
+        "SPX : ES Long 7768 Stoploss 7760",
+        "Sold last 2 runners at 7.80 Holding FLY",
+        "Will need to hold 7740",
+    ]
+    for text in cases:
+        symbol = _extract_symbol(text)
+        _assert(symbol == "", f"{text!r} -> no equity symbol guessed", f"got {symbol!r}")
+        kind = classify_and_parse(text).kind
+        _assert(kind == "NO_TRADE", f"{text!r} classifies as NO_TRADE", f"got {kind}")
+
+
 def run_all() -> None:
     print("=" * 60)
     print("TRADING-ALERT-ROOM REGRESSION TEST HARNESS")
@@ -215,6 +254,9 @@ def run_all() -> None:
     test_daily_context_never_overrides_explicit_root()
     test_daily_context_isolated_per_channel()
     test_daily_context_clears_on_new_day()
+    test_bare_spread_commentary_single_leg_not_forced_multi_leg()
+    test_genuine_two_leg_spread_still_builds_multi_leg()
+    test_commentary_words_do_not_leak_as_equity_tickers()
 
     print("\n" + "=" * 60)
     print(f"Results: {PASS} passed, {FAIL} failed")

@@ -467,8 +467,17 @@ def _extract_structure(text: str) -> tuple[Optional[str], bool]:
             inherently_multi_leg = structure in {
                 "iron_condor", "iron_butterfly", "reverse_iron_condor",
                 "diagonal_spread", "calendar_spread", "ratio_spread",
-                "ratio_backspread", "butterfly_spread", "spread",
+                "ratio_backspread", "butterfly_spread",
             }
+            # NOTE: bare "spread" is deliberately NOT in the always-multi-leg
+            # set above (unlike the more specific compound forms). Real
+            # trading-room messages often mention "spread" in passing
+            # commentary about an unrelated position ("this can help hedge
+            # Credit spread as well") with only one real leg in the message
+            # -- forcing those into strict multi-leg validation rejected
+            # otherwise-valid single-leg signals. Falls through to the
+            # general option_leg_count >= 2 check below instead, same as
+            # "roll" already does.
             option_only_multi_leg = inherently_multi_leg or (
                 option_leg_count >= 2
                 and structure not in {"covered_call", "protective_put"}

@@ -517,6 +517,19 @@ def _extract_symbol(text: str) -> str:
         "SMALL", "TRADE",
         # Options moneyness jargon, not tickers.
         "ITM", "OTM", "ATM",
+        # Past-tense trade-report verbs, not tickers -- mirrors the same
+        # fix already made on the options path (options_parser.py's
+        # _ROOT_IGNORE_WORDS). "Sold most at 3.50" or "Will need to hold
+        # 7740" should never resolve SOLD/WILL to a ticker.
+        "SOLD", "BOUGHT", "CLOSED", "EXITED", "WILL",
+        # Common trading-room commentary words that also happen to look
+        # like plausible tickers, and in HEDGE/TAKE/FLY's case are pure
+        # commentary; ES specifically is a real ticker (Eversource Energy)
+        # but is far more often shorthand for E-mini S&P futures in this
+        # kind of room -- an instrument this bot doesn't trade at all, so
+        # excluding it avoids a dangerous silent misroute to the wrong
+        # company for a message that was never about Eversource.
+        "HEDGE", "TAKE", "FLY", "ES", "AVOID", "HERE", "MOST", "GOT", "LEVEL",
     }
     for token in tokens:
         token_key = re.sub(r"[^A-Za-z0-9.\-]", "", token or "").upper().replace("-", ".").strip(".")
