@@ -136,7 +136,7 @@ _NEW_ORDER_VERBS = {
 }
 _OPEN_LONG_TOKENS = {"BUY", "BTO", "LONG", "PURCHASE", "GRABBED", "GRAB", "STARTER", "OPENING", "OPENED", "ENTERED", "ADD", "ADDING", "SCALE", "SCALING"}
 _OPEN_SHORT_TOKENS = {"STO"}
-_CLOSE_LONG_TOKENS = {"STC", "TRIM"}
+_CLOSE_LONG_TOKENS = {"STC", "TRIM", "SOLD", "CLOSED", "EXITED"}
 _CLOSE_SHORT_TOKENS = {"BTC"}
 _MANAGEMENT_RE = re.compile(
     r"\b(?:MOVE\s+STOP|BREAKEVEN|TAKE\s+\d+%|CLOSE\s+REMAINING|HOLD\s+OVERNIGHT|"
@@ -165,6 +165,13 @@ _ROOT_IGNORE_WORDS = {
     # a phrase like "if target not hit" or "hold this one" can resolve the
     # option's underlying to the wrong real company.
     "ALL", "GO", "HOLD", "MAX", "MOVE", "NOW", "OR", "BLOCK",
+    # Bare "C"/"P" are almost always the leftover CALL/PUT side-letter from a
+    # strike like "7770C" once the strike digits are stripped out by the
+    # token scan below, not a genuine root mention -- but both are also real
+    # single-letter tickers (C=Citigroup, P not currently listed but reserved
+    # the same way), so an accidental leak here silently misroutes to the
+    # wrong company instead of failing to find a root at all.
+    "C", "P",
 }
 
 
@@ -252,7 +259,13 @@ def _extract_root(text: str) -> str:
     for phrase, symbol in sorted(PHRASE_ALIASES.items(), key=lambda kv: len(kv[0]), reverse=True):
         if re.search(rf"\b{re.escape(phrase)}\b", normalized):
             return symbol
-    tokens = re.findall(r"[A-Za-z][A-Za-z]{0,5}", upper)
+    # Match whole words, not a fixed-width slice -- capping at 6 chars here
+    # used to truncate longer words (e.g. "ALREADY") into two fragments
+    # ("ALREAD" + "Y"), and a leftover fragment like "Y" can itself look like
+    # a plausible ticker to is_symbol_like() below even though the real word
+    # was never a candidate at all. Whole-word matching lets the existing
+    # length/ignore-word checks reject it properly instead.
+    tokens = re.findall(r"[A-Za-z]+", upper)
     for token in tokens:
         if token in _INDEX_ROOTS:
             return token
@@ -454,7 +467,7 @@ def _extract_structure(text: str) -> tuple[Optional[str], bool]:
             inherently_multi_leg = structure in {
                 "iron_condor", "iron_butterfly", "reverse_iron_condor",
                 "diagonal_spread", "calendar_spread", "ratio_spread",
-                "ratio_backspread", "butterfly_spread", "roll", "spread",
+                "ratio_backspread", "butterfly_spread", "spread",
             }
             option_only_multi_leg = inherently_multi_leg or (
                 option_leg_count >= 2

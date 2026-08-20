@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -135,6 +136,47 @@ def test_state_recovers_from_backup_and_never_silently_resets() -> None:
             state_store.STATE_PATH = original_path
 
 
+def test_save_state_never_promotes_a_truncated_write() -> None:
+    """Production logs showed the primary state file repeatedly ending up
+    truncated to a single '{' despite the write path already being atomic
+    (temp file + fsync + os.replace). This proves the read-back verification
+    added to save_state() stops any such corrupted write from ever being
+    promoted to the real destination -- the file stays at its last-good
+    content and a loud RuntimeError is raised instead of silent corruption."""
+    with TemporaryDirectory() as tmp:
+        original_path = state_store.STATE_PATH
+        state_store.STATE_PATH = Path(tmp) / "agent_state.json"
+        try:
+            state_store.record_order_event({"symbol": "AAPL", "status": "filled"})
+            good_content = state_store.STATE_PATH.read_text(encoding="utf-8")
+
+            original_fsync = os.fsync
+
+            def truncating_fsync(fd: int) -> None:
+                # Simulate whatever transient interference (AV scan, disk
+                # hiccup) truncates a write in production.
+                os.ftruncate(fd, 1)
+                original_fsync(fd)
+
+            os.fsync = truncating_fsync
+            try:
+                try:
+                    state_store.record_order_event({"symbol": "MSFT", "status": "filled"})
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("a truncated temp-file write must not be promoted")
+            finally:
+                os.fsync = original_fsync
+
+            _check(
+                state_store.STATE_PATH.read_text(encoding="utf-8") == good_content,
+                "primary state file must stay at its last-good content after a failed write-verify",
+            )
+        finally:
+            state_store.STATE_PATH = original_path
+
+
 def run_all() -> None:
     test_durable_queue_concurrency()
     print("PASS durable queue: 500 concurrent signals, unique claims, cleanup")
@@ -144,6 +186,8 @@ def run_all() -> None:
     print("PASS atomic JSON state and duplicate queued equity trades")
     test_state_recovers_from_backup_and_never_silently_resets()
     print("PASS agent-state backup recovery and fail-closed corruption handling")
+    test_save_state_never_promotes_a_truncated_write()
+    print("PASS save_state rejects a truncated/corrupted write instead of promoting it")
     print("PRODUCTION QUEUE TESTS PASSED")
 
 

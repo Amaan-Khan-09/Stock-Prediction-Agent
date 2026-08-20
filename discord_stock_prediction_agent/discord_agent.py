@@ -33,6 +33,7 @@ from .durable_signal_queue import (
     recover_inflight_signals,
     retry_dead_signals,
 )
+from .daily_signal_context import classify_and_parse_with_daily_context
 from .market_context import get_market_context, refresh_market_context_async
 from .multi_leg_validation import infer_multi_leg_price_effect, validate_multi_leg_strategy
 from .options_parser import ParsedOptionLeg, ParsedOptionSignal, classify_and_parse
@@ -3775,7 +3776,9 @@ async def _process_queued_signal_message(message: discord.Message) -> None:
         if await _try_dispatch_whatsapp_command(message):
             return
 
-    routed = classify_and_parse(message.content)
+    routed = classify_and_parse_with_daily_context(
+        message.content, str(getattr(message.channel, "id", "") or "")
+    )
     symbol_for_event = ""
     action_for_event = ""
     if routed.equity:

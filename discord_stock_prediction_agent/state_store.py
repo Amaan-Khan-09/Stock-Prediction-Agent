@@ -114,6 +114,19 @@ def save_state(state: Dict[str, Any]) -> None:
                     handle.write(payload)
                     handle.flush()
                     os.fsync(handle.fileno())
+                # Never promote a temp file that isn't actually intact. Whatever
+                # transient interference (AV scan, disk hiccup) occasionally
+                # corrupts a write, this read-back check keeps it from ever
+                # reaching the real destination -- the recurring
+                # "Recovered agent state from backup" errors in production
+                # logs show the destination file itself sometimes ends up
+                # truncated, even though this write path was already atomic.
+                written = temporary.read_text(encoding="utf-8")
+                if written != payload:
+                    raise RuntimeError(
+                        f"State write verification failed for {destination.name}: "
+                        f"wrote {len(payload)} chars, read back {len(written)} chars."
+                    )
                 for attempt in range(5):
                     try:
                         os.replace(temporary, destination)

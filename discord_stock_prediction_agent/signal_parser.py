@@ -504,6 +504,19 @@ def _extract_symbol(text: str) -> str:
         # ENTIRE, THINK, PICK) -- without excluding them, casual phrasing like
         # "close out amzn" or "go long on sofi" resolves to the wrong symbol.
         "GO", "MY", "OUT", "HALF", "ENTIRE", "THINK", "PICK", "SOME", "ALL", "UP",
+        # Cash-settled index roots (SPX, NDX, RUT, DJX, VIX, XSP) aren't
+        # equity-tradable at all -- they only make sense on the options path
+        # (options_parser.py). Left unexcluded here, a bare mention (no
+        # strike/side, so it never reaches the options path) falls through to
+        # this module's fuzzy/cached-symbol resolution and can silently
+        # resolve to an unrelated same-prefix equity ticker (e.g. SPX -> SPXC,
+        # "SPX Technologies", a real but completely different NYSE company).
+        "SPX", "NDX", "RUT", "DJX", "VIX", "XSP",
+        # "Small"/"Trade" as in "small trade" (describing position size) is
+        # not a ticker; SMALL happens to satisfy the plausible-symbol regex.
+        "SMALL", "TRADE",
+        # Options moneyness jargon, not tickers.
+        "ITM", "OTM", "ATM",
     }
     for token in tokens:
         token_key = re.sub(r"[^A-Za-z0-9.\-]", "", token or "").upper().replace("-", ".").strip(".")
