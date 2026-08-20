@@ -94,6 +94,7 @@ from .state_store import (
     remove_option_position,
     remove_multi_leg_position,
     remove_position,
+    today_realized_pnl,
     remove_pending_sell,
     remove_conditional_equity_order,
     close_position_with_outcome,
@@ -5825,6 +5826,27 @@ async def _build_automate_agent_text() -> str:
             return f"automate_agent: cooling down, try again in {wait_left}s."
         _automate_agent_last_run = now
 
+        account, _ = await asyncio.to_thread(alpaca.get_account)
+        equity = _as_float((account or {}).get("equity"))
+
+        # Account-level circuit breaker: independent of any single
+        # position's stop-loss, checked before spending time/API calls on
+        # a scan we won't act on anyway. A per-trade stop limits one
+        # position; this limits the whole autonomous strategy for the rest
+        # of a bad day. Existing open positions are still protected and
+        # closed normally by stop_loss_monitor -- this only blocks *new*
+        # entries.
+        realized_today = await asyncio.to_thread(today_realized_pnl, AUTOMATE_AGENT_TAG)
+        if equity > 0:
+            loss_limit = -abs(equity * config.automate_agent_max_daily_loss_pct / 100.0)
+            if realized_today <= loss_limit:
+                return (
+                    f"automate_agent: daily loss circuit breaker tripped "
+                    f"(realized P&L today: ${realized_today:,.2f}, limit: ${loss_limit:,.2f}). "
+                    "No new positions will be opened for the rest of the day; existing positions "
+                    "are still protected by the normal stop-loss/take-profit monitor."
+                )
+
         candidates = await _scan_automate_agent_watchlist()
         open_positions = await asyncio.to_thread(list_positions)
         plan = plan_automate_trades(
@@ -5872,7 +5894,16 @@ async def _build_automate_agent_text() -> str:
                 if not price or price <= 0:
                     lines.append(f"- Skipped {symbol}: could not get a live price ({_public_error(price_err)}).")
                     continue
-                qty = max(1, int(config.automate_agent_notional_per_trade // price))
+                # Fixed-fractional sizing: a constant % of *current* equity,
+                # not a hardcoded dollar figure, so sizing scales with the
+                # account and automatically shrinks after a drawdown. Falls
+                # back to the fixed notional only if equity wasn't available.
+                risk_budget = (
+                    equity * config.automate_agent_risk_pct_per_trade / 100.0
+                    if equity > 0
+                    else config.automate_agent_notional_per_trade
+                )
+                qty = max(1, int(risk_budget // price))
                 order, err = await asyncio.to_thread(
                     alpaca.submit_market_order,
                     symbol, "buy", qty,

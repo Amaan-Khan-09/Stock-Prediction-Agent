@@ -110,9 +110,25 @@ class AgentConfig:
     automate_agent_exit_minutes_before_close: int = _int_env(
         "AUTOMATE_AGENT_EXIT_MINUTES_BEFORE_CLOSE", 15
     )
+    # Fallback notional if account equity can't be fetched -- normal sizing
+    # is risk-based (automate_agent_risk_pct_per_trade), not this fixed
+    # figure. See automate_agent.py for why: fixed-dollar sizing doesn't
+    # scale with account size, which is a well-established anti-pattern.
     automate_agent_notional_per_trade: float = _float_env(
         "AUTOMATE_AGENT_NOTIONAL_PER_TRADE", 1000.0
     )
+    # Fixed-fractional position sizing: risk a small, constant % of current
+    # account equity per trade rather than a fixed dollar amount, so sizing
+    # naturally scales with account growth and shrinks during drawdowns.
+    # 0.5-2% is the widely-cited professional ceiling for this.
+    automate_agent_risk_pct_per_trade: float = _float_env("AUTOMATE_AGENT_RISK_PCT_PER_TRADE", 2.0)
+    # Account-level circuit breaker, independent of any single position's
+    # stop-loss: if automate_agent's own cumulative realized P&L for the
+    # current day drops below this % of equity, it stops opening new
+    # positions for the rest of the day. A per-trade stop limits one
+    # position; this limits the whole autonomous strategy in a single bad
+    # session. 2-5% is the commonly cited range for this kind of breaker.
+    automate_agent_max_daily_loss_pct: float = _float_env("AUTOMATE_AGENT_MAX_DAILY_LOSS_PCT", 3.0)
     # Each cycle runs the prediction engine once per watchlist symbol
     # (real historical-data fetch + AI call each time) -- a cooldown keeps
     # rapid re-triggering from burning API calls/rate limits for no benefit,

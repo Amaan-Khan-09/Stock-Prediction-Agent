@@ -767,6 +767,7 @@ def close_position_with_outcome(
         "pnl_value": round(pnl_value, 6),
         "profitable": pnl_pct > 0,
         "reason": reason,
+        "opened_by": str(current.get("opened_by") or ""),
         "closed_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
 
@@ -797,6 +798,25 @@ def close_position_with_outcome(
 
     save_state(state)
     return outcome
+
+
+def today_realized_pnl(opened_by: str = "") -> float:
+    """Sums pnl_value from today's (UTC) closed-trade outcomes.
+
+    Pass opened_by="automate_agent" to scope this to autonomous trades only
+    -- a real user's own trading shouldn't count against automate_agent's
+    daily-loss circuit breaker, or vice versa.
+    """
+    today = _today_prefix()
+    total = 0.0
+    for outcome in load_state().get("trade_outcomes", []):
+        closed_at = str(outcome.get("closed_at") or "")
+        if not closed_at.startswith(today):
+            continue
+        if opened_by and str(outcome.get("opened_by") or "") != opened_by:
+            continue
+        total += float(outcome.get("pnl_value") or 0)
+    return round(total, 6)
 
 
 @_state_mutation

@@ -21,12 +21,16 @@ class FakeAutomateAlpaca:
         self.prices: dict[str, float] = {}
         self.quantities: dict[str, float] = {}
         self.submissions: list[dict] = []
+        self.equity = 50_000.0
 
     def ready(self):
         return True
 
     def is_market_open(self):
         return self.market_open, ""
+
+    def get_account(self):
+        return {"equity": str(self.equity)}, ""
 
     def get_position(self, symbol: str):
         qty = self.quantities.get(symbol, 0.0)
@@ -82,6 +86,76 @@ async def _with_runtime(test_body, predictions: dict[str, str]) -> None:
             discord_agent.alpaca = original_alpaca
             discord_agent.run_project_prediction = original_predict
             discord_agent._send_channel = original_send
+
+
+def _inject_today_outcome(pnl_value: float, opened_by: str = AUTOMATE_AGENT_TAG) -> None:
+    """Directly writes a closed-trade outcome record for today (UTC),
+    bypassing the full open/close position lifecycle -- lets the circuit
+    breaker test control the exact realized P&L figure it's checking
+    against, rather than reverse-engineering entry/exit prices to hit one.
+    """
+    state = state_store.load_state()
+    state.setdefault("trade_outcomes", []).append({
+        "symbol": "TESTSYM",
+        "pnl_value": pnl_value,
+        "opened_by": opened_by,
+        "closed_at": state_store._utcstamp(),
+    })
+    state_store.save_state(state)
+
+
+def test_daily_loss_circuit_breaker_blocks_new_positions() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        fake.equity = 50_000.0
+        # -3% of 50,000 is the default trip point (-1,500); simulate a
+        # worse loss already realized today from automate_agent's own trades.
+        _inject_today_outcome(-2000.0, opened_by=AUTOMATE_AGENT_TAG)
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+
+        text = await discord_agent._build_automate_agent_text()
+
+        assert "circuit breaker" in text.lower()
+        assert not fake.submissions, "no new order should be placed once tripped"
+        assert not state_store.list_positions()
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: "BUY"}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_daily_loss_circuit_breaker_ignores_a_real_users_losses() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        fake.equity = 50_000.0
+        # A large loss on a REAL user's own trade today should never trip
+        # automate_agent's breaker -- it's scoped to automate_agent's own
+        # realized P&L only.
+        _inject_today_outcome(-10_000.0, opened_by="")
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+
+        text = await discord_agent._build_automate_agent_text()
+
+        assert "circuit breaker" not in text.lower()
+        assert len(fake.submissions) == 1, "automate_agent should still trade normally"
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: "BUY"}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_position_sizing_scales_with_account_equity() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+        fake.equity = 100_000.0  # double the 50k default
+
+        await discord_agent._build_automate_agent_text()
+
+        # risk_pct default 2% of 100,000 = 2,000 budget @ $100/share = 20 sh,
+        # vs. 10 sh at the 50k default used elsewhere in this file.
+        assert fake.submissions[0]["qty"] == "20"
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: "BUY"}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
 def test_agent_off_takes_no_action() -> None:
@@ -245,6 +319,9 @@ def test_a_failed_symbol_lookup_does_not_abort_the_whole_scan() -> None:
 
 
 if __name__ == "__main__":
+    test_daily_loss_circuit_breaker_blocks_new_positions()
+    test_daily_loss_circuit_breaker_ignores_a_real_users_losses()
+    test_position_sizing_scales_with_account_equity()
     test_agent_off_takes_no_action()
     test_cooldown_blocks_immediate_re_run()
     test_concurrent_invocations_do_not_double_fill_slots()
