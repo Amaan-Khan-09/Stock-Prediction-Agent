@@ -1,0 +1,77 @@
+{
+  "csv_analyzed": "data\\batch_validation_results_baseline_tsla.csv",
+  "rows_analyzed": 10,
+  "valid_runs": 10,
+  "data_unavailable_runs": 0,
+  "matches": 4,
+  "mismatches": 6,
+  "match_pct": 40.0,
+  "top_failure_categories": [
+    {
+      "category": "UNKNOWN_FAILURE",
+      "count": 3,
+      "description": "Unclassified miss — needs manual review.",
+      "fix": "Manual review — log to calibration dataset."
+    },
+    {
+      "category": "WRONG_MAGNITUDE",
+      "count": 1,
+      "description": "Direction correct but return magnitude badly off.",
+      "fix": "Add volatility-adjusted return forecast to Gemini prompt."
+    },
+    {
+      "category": "OVER_HOLD",
+      "count": 1,
+      "description": "AI called HOLD when market moved strongly.",
+      "fix": "Lower HOLD threshold; add momentum confirmation gate."
+    },
+    {
+      "category": "FALSE_BUY",
+      "count": 1,
+      "description": "AI called BUY but actual was SELL or flat.",
+      "fix": "Add bearish-divergence check; raise buy confidence threshold."
+    }
+  ],
+  "by_symbol": {
+    "TSLA": {
+      "valid_runs": 10,
+      "matches": 4,
+      "match_pct": 40.0,
+      "top_failures": {
+        "UNKNOWN_FAILURE": 3,
+        "WRONG_MAGNITUDE": 1,
+        "OVER_HOLD": 1,
+        "FALSE_BUY": 1
+      }
+    }
+  },
+  "by_horizon": {
+    "7": {
+      "valid_runs": 10,
+      "matches": 4,
+      "match_pct": 40.0
+    }
+  },
+  "symbols_with_data_unavailable": [],
+  "hold_bias": {
+    "overall_hold_rate": 20.0,
+    "severity": "OK",
+    "hold_count": 2,
+    "false_neutral_count": 1,
+    "false_neutral_rate": 50.0,
+    "avg_abs_actual_return_when_ai_hold": 3.79,
+    "hold_rate_by_symbol": {
+      "TSLA": 20.0
+    },
+    "hold_rate_by_horizon": {
+      "7": 20.0
+    },
+    "top_overheld_symbols": [
+      {
+        "symbol": "TSLA",
+        "hold_rate": 20.0
+      }
+    ],
+    "warning": ""
+  }
+}

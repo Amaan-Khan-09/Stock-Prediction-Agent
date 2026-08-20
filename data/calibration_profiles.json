@@ -1,0 +1,61 @@
+{
+  "profiles": {
+    "TSLA": {
+      "symbol": "TSLA",
+      "runs_available": 0,
+      "data_quality": "INSUFFICIENT_DATA",
+      "calibration_available": false
+    },
+    "SPY": {
+      "symbol": "SPY",
+      "runs_available": 5,
+      "calibration_available": true,
+      "data_quality": "LIMITED",
+      "match_pct": 40.0,
+      "hold_rate_pct": 100.0,
+      "false_buy_rate_pct": 0.0,
+      "false_sell_rate_pct": 0.0,
+      "avg_return_error_pp": 2.3631,
+      "top_failure_categories": [
+        "OVER_HOLD"
+      ],
+      "volatility_warning": false,
+      "news_earnings_warning": false,
+      "calibration_summary": "SPY: 5 validation runs. Match rate 40.0%. WARNING: AI over-holds on this symbol — consider lowering HOLD threshold. Top failure category: OVER_HOLD."
+    }
+  },
+  "global": {
+    "n": 5,
+    "decision_match_pct": 40.0,
+    "direction_match_pct": 40.0,
+    "avg_return_error_pp": 2.36,
+    "hold_rate": 100.0,
+    "buy_rate": 0.0,
+    "sell_rate": 0.0,
+    "false_buy_rate": 0.0,
+    "false_sell_rate": 0.0,
+    "over_hold_rate": 60.0,
+    "best_horizon": "7",
+    "worst_horizon": "7"
+  },
+  "by_horizon": {
+    "7": {
+      "runs": 5,
+      "decision_match_pct": 40.0,
+      "hold_rate": 100.0,
+      "avg_return_error_pp": 2.36
+    }
+  },
+  "prompt_guidance": [
+    "GLOBAL HOLD RATE: 100.0% — OVER_HOLD is the primary accuracy enemy. Force BUY/SELL when signals agree.",
+    "SYMBOL WARNING: SPY has 100.0% hold rate — over-holds severely. Commit to directional call when trend+momentum agree."
+  ],
+  "symbols_profiled": [
+    "TSLA",
+    "SPY"
+  ],
+  "total_profiles": 2,
+  "profiles_with_data": 1,
+  "generated_at": "2026-07-20T13:33:15.782107",
+  "tag": "default"
+}

@@ -1,0 +1,6 @@
+run_id,symbol,mode,origin_date,target_date,horizon_days,price_basis,ai_decision,actual_decision,agreement,predicted_return_pct,actual_return_pct,return_error_pp,confidence,risk,bullish_score,bearish_score,uncertainty_score,validation_status,exact_validation_status,proxy_validation_status,validation_type,failure_reason,recommended_fix
+080F1B8A,SPY,stock,2026-06-01,2026-06-08,7,close,HOLD,SELL,MISMATCH,2.7929,-2.547,5.3399,85,40,,,,SUCCESS,NOT_APPLICABLE,NOT_APPLICABLE,stock_price_validation,OVER_HOLD,Widen decision thresholds or add momentum confirmation.
+7C43458F,SPY,stock,2026-05-01,2026-05-08,7,close,HOLD,BUY,MISMATCH,2.9282,2.3548,0.5734,85,51,,,,SUCCESS,NOT_APPLICABLE,NOT_APPLICABLE,stock_price_validation,OVER_HOLD,Widen decision thresholds or add momentum confirmation.
+4AE8C1C1,SPY,stock,2026-04-01,2026-04-08,7,close,HOLD,BUY,MISMATCH,-1.3644,3.1698,-4.5342,65,40,,,,SUCCESS,NOT_APPLICABLE,NOT_APPLICABLE,stock_price_validation,OVER_HOLD,Widen decision thresholds or add momentum confirmation.
+57B771EA,SPY,stock,2026-03-01,2026-03-08,7,close,HOLD,HOLD,MATCH,-0.0599,-1.1254,1.0655,73,40,,,,SUCCESS,NOT_APPLICABLE,NOT_APPLICABLE,stock_price_validation,NONE,NONE
+DE477DAC,SPY,stock,2026-02-01,2026-02-08,7,close,HOLD,HOLD,MATCH,0.5886,0.2861,0.3025,65,40,,,,SUCCESS,NOT_APPLICABLE,NOT_APPLICABLE,stock_price_validation,NONE,NONE

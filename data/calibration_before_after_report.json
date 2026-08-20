@@ -1,0 +1,27 @@
+{
+  "generated_at": "2026-07-30T02:53:12.540369",
+  "baseline_tag": "base",
+  "post_tag": "post",
+  "baseline_decision_match": 40.0,
+  "post_decision_match": 40.0,
+  "decision_match_delta": 0.0,
+  "baseline_direction_match": 50.0,
+  "post_direction_match": 50.0,
+  "direction_match_delta": 0.0,
+  "baseline_hold_rate": 30.0,
+  "post_hold_rate": 30.0,
+  "hold_rate_delta": 0.0,
+  "baseline_avg_error": 10.0,
+  "post_avg_error": 10.0,
+  "avg_error_delta": 0.0,
+  "baseline_valid_runs": 20,
+  "post_valid_runs": 20,
+  "improved": [],
+  "regressed": [],
+  "honest_assessment": "NO IMPROVEMENT YET — further feature/data work required.",
+  "limitations": [
+    "Batch runs use historical data from same provider — may share data quality issues.",
+    "Sample size may be insufficient for statistical significance.",
+    "Results are for backtesting research only — not production trading accuracy."
+  ]
+}

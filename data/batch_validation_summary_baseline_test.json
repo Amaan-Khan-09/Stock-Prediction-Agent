@@ -1,0 +1,65 @@
+{
+  "generated_at": "2026-07-20T13:22:27.823810",
+  "symbols": [
+    "SPY",
+    "TSLA"
+  ],
+  "horizons": [
+    7,
+    14,
+    30,
+    45
+  ],
+  "total_runs": 5,
+  "valid_runs": 0,
+  "failed_runs": 5,
+  "data_unavailable_count": 0,
+  "symbols_failed": [
+    "SPY"
+  ],
+  "decision_match_pct": 0.0,
+  "direction_match_pct": 0.0,
+  "avg_return_error_pp": null,
+  "hold_rate_pct": 0.0,
+  "false_buy_count": 0,
+  "false_sell_count": 0,
+  "over_hold_count": 0,
+  "match_by_symbol": {
+    "SPY": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    },
+    "TSLA": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    }
+  },
+  "match_by_horizon": {
+    "7": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    },
+    "14": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    },
+    "30": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    },
+    "45": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    }
+  },
+  "top_failure_reasons": [],
+  "recommended_prompt_changes": [
+    "Match rate below 30% — investigate feature quality and prompt clarity."
+  ]
+}

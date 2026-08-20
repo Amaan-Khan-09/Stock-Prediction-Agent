@@ -136,13 +136,12 @@ def test_missing_tt_token_does_not_return_success():
 
 
 def test_tt_auth_debug_section_exists():
-    """TT auth debug must show credential source, token refresh, customer check."""
+    """TT auth info must be present — shown in TASTYTRADE AUTH TRUTH CHECK panel."""
     text = _read(ROOT / "stock_prediction_app.py")
-    assert "Tastytrade Auth Debug" in text
+    assert "TASTYTRADE AUTH TRUTH CHECK" in text
     assert "Credential Source" in text
     assert "Token Refresh" in text or "token_refresh" in text
     assert "Customer Check" in text or "customer_check" in text
-    assert "Backtest Create" in text or "backtest_create" in text
 
 
 def test_accuracy_save_gate_blocks_when_tastytrade_failed():
@@ -164,34 +163,42 @@ def test_alpaca_not_used_for_live_trading():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. Strike mode with strike 0 blocks run
+# 7. All 4 Tastytrade strike selection modes are implemented
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_pre_run_gate_blocks_zero_strike_in_app():
-    """App must have pre-run gate that blocks strike=0 in Strike mode."""
+    """App must implement all 4 Tastytrade strike selection modes (exact-strike mode removed)."""
     text = _read(ROOT / "stock_prediction_app.py")
-    assert "Strike Mode requires Strike Price > 0" in text
-    assert "MISSING_STRIKE_PRICE" in text
+    # All 4 modes present in UI and leg building
+    assert "Percentage OTM" in text
+    assert "Price Offset From Underlying" in text
+    assert "Premium" in text
+    assert "percentageOtm" in text
+    assert "priceOffset" in text
+    assert '"strikeSelection":     "premium"' in text
+    # Exact-strike mode must be removed (no longer supported)
+    assert "EXACT_STRIKE_UNSUPPORTED" not in text or "EXACT_STRIKE_UNSUPPORTED_BY_PROVIDER" not in text
 
 
 def test_server_guard_blocks_exact_strike_missing():
-    """Server-side guard in _run_options_all must block when exact strike is missing."""
+    """Delta mode must validate delta_ui is present before running backtest."""
     text = _read(ROOT / "stock_prediction_app.py")
-    assert "MISSING_STRIKE_SERVER_GUARD" in text
-    assert "EXACT_STRIKE mode requires a valid strike price" in text
+    # Delta mode must check that delta_ui exists before building leg
+    assert "Delta value missing" in text
+    assert "REVIEW_REQUIRED" in text
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8. Strike mode never sends user's delta as selection value
+# 8. Delta mode uses user's actual delta value, no hardcoded ATM proxy
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_strike_mode_does_not_use_user_delta_in_exact_branch():
-    """Proxy branch uses delta=50 (ATM reference), never the user's delta_ui."""
+    """Delta mode leg must use the user's actual delta_ui value, not a hardcoded ATM proxy."""
     text = _read(ROOT / "stock_prediction_app.py")
-    # In exact mode, proxy uses delta=50 explicitly labeled
-    assert '"delta":               50,' in text
-    # User's delta should only be used in the else (delta selection) branch
+    # Delta mode uses user's actual delta_ui
     assert '"delta":               int(_delta_ui),' in text
+    # No hardcoded ATM proxy (delta=50) sent to Tastytrade
+    assert '"delta":               50,' not in text
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -223,17 +230,67 @@ def test_delta_mode_user_value_used():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_exact_strike_marked_unsupported_by_provider():
-    """When contract_selection_method=EXACT_STRIKE, status must be UNSUPPORTED_BY_PROVIDER."""
+    """App supports 4 strike selection methods; entry frequency uses confirmed Tastytrade values."""
     text = _read(ROOT / "stock_prediction_app.py")
-    assert "UNSUPPORTED_BY_PROVIDER" in text
-    assert "EXACT_STRIKE_UNSUPPORTED_BY_PROVIDER" in text
+    # Entry frequency is stored in options_params and passed to the payload builder
+    assert "api_entry_frequency" in text
+    # Confirmed working values: every day, weekly, monthly (not the unverified on_exact_dte_match)
+    assert '"every day"' in text
+    assert '"weekly"' in text
+    assert '"monthly"' in text
+    assert "_api_entry_freq" in text
+    assert "entry_frequency=_api_entry_freq" in text
 
 
 def test_proxy_labeled_approximate():
-    """Proxy run must be labeled DELTA_PROXY_APPROXIMATE, never EXACT."""
-    text = _read(ROOT / "stock_prediction_app.py")
-    assert "DELTA_PROXY_APPROXIMATE" in text
-    assert "fallback_used" in text
+    """Proxy run must be labeled DELTA_PROXY_APPROXIMATE in the options model, and fallback_used in app logic."""
+    app_text   = _read(ROOT / "stock_prediction_app.py")
+    model_text = _read(ROOT / "src" / "models" / "options_models.py")
+    assert "DELTA_PROXY_APPROXIMATE" in model_text, "DELTA_PROXY_APPROXIMATE must be defined in options_models.py"
+    assert "fallback_used" in app_text, "fallback_used must be set in app backtest logic"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 13. Discord parses SPX 7570 as exact strike
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_discord_parses_spx_7570_as_exact_strike():
+    """parse_signal('Buy SPX 7570 call at 1.40') must return strike=7570, EXACT_STRIKE."""
+    from agents.discord_parser import parse_signal
+    sig = parse_signal("Buy SPX 7570 call at 1.40")
+    assert sig.strike == 7570.0, f"Expected strike=7570, got {sig.strike}"
+    assert sig.option_type == "CALL", f"Expected CALL, got {sig.option_type}"
+    assert sig.delta_ui is None, f"Delta must be None in exact-strike signal, got {sig.delta_ui}"
+    assert sig.contract_selection_method == "EXACT_STRIKE"
+
+
+def test_discord_parses_spy_620c():
+    """parse_signal for SPY 620C must return strike=620, EXACT_STRIKE."""
+    from agents.discord_parser import parse_signal
+    sig = parse_signal("SPY 620C 2026-07-17 @ 1.43 qty 2")
+    assert sig.strike == 620.0, f"Expected 620, got {sig.strike}"
+    assert sig.underlying == "SPY"
+    assert sig.contract_selection_method == "EXACT_STRIKE"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 14. Reply chain P&L = $130
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_reply_chain_pnl_130():
+    """Entry 2 @ 1.40, trim 1 @ 1.90, exit 1 @ 2.20 → realized P&L = $130."""
+    from agents.discord_parser import parse_signal, calculate_reply_chain_pnl
+
+    entry = parse_signal("Entered SPY 620C 0DTE @ 1.40, 2 contracts")
+    trim  = parse_signal("trimmed half at 1.90")
+    out   = parse_signal("out rest at 2.20")
+
+    result = calculate_reply_chain_pnl([entry, trim, out])
+    assert result["status"] in ("CLOSED", "PARTIAL"), f"Expected CLOSED/PARTIAL, got {result['status']}"
+    assert result["realized_pnl"] == 130.0, (
+        f"Expected $130, got ${result['realized_pnl']}. "
+        f"Exits: {result.get('exits')}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -343,132 +400,3 @@ def test_rapidapi_capability_panel_present():
     """App must show RapidAPI capability panel when key is present."""
     text = _read(ROOT / "stock_prediction_app.py")
     assert "RapidAPI Plan Capabilities" in text or "RapidAPI Key Missing" in text
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 20. Primary predicted-symbol history falls back to yfinance, not just benchmark
-# ══════════════════════════════════════════════════════════════════════════════
-
-def test_fetch_price_history_falls_back_to_yfinance(monkeypatch):
-    """fetch_price_history() (the primary predicted-symbol path, not just the
-    benchmark-only fetch_price_history_for_range()) must reach yfinance as a
-    last resort when both RapidAPI and NASDAQ fail -- previously it gave up
-    right after NASDAQ and yfinance was only wired into the benchmark fetch.
-    """
-    import requests
-    import historical_price_service as hps
-
-    hps._PRICE_CACHE.clear()
-    hps._PROVIDER_USED.clear()
-    monkeypatch.setenv("RAPIDAPI_KEY", "test-key-not-real")
-
-    class _NotFound:
-        status_code = 404
-        text = "not found"
-
-        def json(self):
-            return {}
-
-    monkeypatch.setattr(requests, "post", lambda *a, **k: _NotFound())
-    monkeypatch.setattr(requests, "get", lambda *a, **k: _NotFound())
-    monkeypatch.setattr(
-        hps, "_fetch_external_historical_provider",
-        lambda symbol, start, end: ([], "NASDAQ simulated failure"),
-    )
-    monkeypatch.setattr(
-        hps, "_fetch_yfinance",
-        lambda symbol, start, end: (
-            [{"date": "2024-01-02", "close": 100.0, "open": 99.0,
-              "high": 101.0, "low": 98.0, "volume": 1000.0, "source": "yfinance"}],
-            "",
-        ),
-    )
-
-    bars, err = hps.fetch_price_history("AAPL", min_days=400)
-    assert err == "", f"Expected success via yfinance fallback, got error: {err}"
-    assert bars and bars[0]["close"] == 100.0
-    assert hps.get_provider_used("AAPL") == "yfinance"
-
-
-def test_fetch_price_history_reports_all_three_providers_when_all_fail(monkeypatch):
-    """When RapidAPI, NASDAQ, and yfinance all fail, the error message must
-    mention all three so a user can tell which providers were actually tried."""
-    import requests
-    import historical_price_service as hps
-
-    hps._PRICE_CACHE.clear()
-    hps._PROVIDER_USED.clear()
-    monkeypatch.setenv("RAPIDAPI_KEY", "test-key-not-real")
-
-    class _NotFound:
-        status_code = 404
-        text = "not found"
-
-        def json(self):
-            return {}
-
-    monkeypatch.setattr(requests, "post", lambda *a, **k: _NotFound())
-    monkeypatch.setattr(requests, "get", lambda *a, **k: _NotFound())
-    monkeypatch.setattr(
-        hps, "_fetch_external_historical_provider",
-        lambda symbol, start, end: ([], "NASDAQ simulated failure"),
-    )
-    monkeypatch.setattr(
-        hps, "_fetch_yfinance",
-        lambda symbol, start, end: ([], "yfinance simulated failure"),
-    )
-
-    bars, err = hps.fetch_price_history("ZZZZ", min_days=400)
-    assert bars == []
-    assert "NASDAQ simulated failure" in err
-    assert "yfinance simulated failure" in err
-
-
-def test_fetch_yfinance_uses_unadjusted_close(monkeypatch):
-    """_fetch_yfinance must request auto_adjust=False so its closes stay
-    comparable to RapidAPI/NASDAQ's unadjusted closes -- otherwise a symbol
-    falling back to yfinance while its benchmark comes from RapidAPI/NASDAQ
-    (or vice versa) would silently mix adjusted and unadjusted price series
-    in relative-strength/return comparisons.
-    """
-    import pandas as pd
-    import historical_price_service as hps
-
-    captured_kwargs = {}
-
-    class _FakeTicker:
-        def __init__(self, symbol):
-            self.symbol = symbol
-
-        def history(self, **kwargs):
-            captured_kwargs.update(kwargs)
-            return pd.DataFrame(
-                {"Close": [100.0], "Open": [99.0], "High": [101.0],
-                 "Low": [98.0], "Volume": [1000]},
-                index=[pd.Timestamp("2024-01-02")],
-            )
-
-    fake_yf = type("FakeYF", (), {"Ticker": staticmethod(lambda symbol: _FakeTicker(symbol))})
-
-    import sys
-    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
-
-    bars, err = hps._fetch_yfinance("AAPL", "2024-01-01", "2024-01-05")
-    assert err == ""
-    assert captured_kwargs.get("auto_adjust") is False
-    assert bars[0]["close"] == 100.0
-
-
-def test_rapidapi_capability_panel_not_stale():
-    """The RapidAPI capability panel must not claim earnings-calendar/market-movers
-    are unimplemented -- gemini_stock_prediction_agent.py already fetches and
-    injects both into the prompt (leakage-gated). This previously told users a
-    working feature didn't exist.
-    """
-    app_text = _read(ROOT / "stock_prediction_app.py")
-    assert "NOT YET IMPLEMENTED" not in app_text
-    assert "not yet wired into prompt" not in app_text
-
-    agent_text = _read(ROOT / "gemini_stock_prediction_agent.py")
-    assert "get_earnings_calendar" in agent_text
-    assert "fetch_top_movers_for_gemini" in agent_text

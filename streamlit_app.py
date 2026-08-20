@@ -13,6 +13,7 @@ Legacy options app (archive only):
 from __future__ import annotations
 
 import sys
+import importlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -22,7 +23,7 @@ sys.path.insert(1, str(ROOT / "tools"))
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env", override=True)
 
-# Import the corrected app module — set_page_config runs at import time
-from stock_prediction_app import main
+import stock_prediction_app as _spa
+importlib.reload(_spa)
 
-main()
+_spa.main()

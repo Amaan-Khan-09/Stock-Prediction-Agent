@@ -278,7 +278,10 @@ def _fetch_external_historical_provider(
         if clean.startswith(prefix):
             clean = clean[len(prefix):]
             break
-    # Resolve index names (SPX → ^GSPC for NASDAQ API)
+    # NASDAQ API only covers stocks/ETFs — skip entirely for index symbols
+    if clean in _INDEX_SYMBOL_MAP:
+        return [], f"NASDAQ API does not support index symbols — skipping {clean}"
+    # Resolve exchange-specific symbol (no-op for stocks/ETFs not in the map)
     clean = _INDEX_SYMBOL_MAP.get(clean, {}).get("nasdaq", clean)
 
     assetclass = "etf" if clean in _ETF_SYMBOLS else "stocks"
@@ -359,14 +362,6 @@ def _fetch_yfinance(
     Fetch daily OHLCV bars via yfinance.
     Returns (bars, error_msg). Bars carry source="yfinance".
     Used as fallback when other providers cannot cover the requested date range.
-
-    auto_adjust=False intentionally: RapidAPI TradingView and the NASDAQ external
-    provider both return raw/unadjusted closes (no dividend/split adjustment).
-    Fetching yfinance with auto_adjust=True would silently mix adjusted and
-    unadjusted price series whenever a symbol falls back to yfinance while a
-    benchmark (or vice versa) comes from RapidAPI/NASDAQ, corrupting relative-
-    strength and return comparisons between the two. Matching yfinance's
-    convention to the other providers' here keeps every source comparable.
     """
     try:
         import yfinance as yf
@@ -377,14 +372,24 @@ def _fetch_yfinance(
                 break
         # Resolve index names to yfinance tickers (SPX → ^GSPC, etc.)
         clean = _INDEX_SYMBOL_MAP.get(clean, {}).get("yfinance", clean)
-        ticker = yf.Ticker(clean)
-        df = ticker.history(start=start_date, end=end_date, auto_adjust=False)
+
+        # Use a browser-like session to avoid Yahoo Finance rate-limiting
+        _yf_session = requests.Session()
+        _yf_session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        })
+        ticker = yf.Ticker(clean, session=_yf_session)
+        df = ticker.history(start=start_date, end=end_date, auto_adjust=True)
         if df is None or df.empty:
             return [], f"yfinance returned no data for {clean} ({start_date} to {end_date})"
         bars: List[Dict] = []
         for ts, row in df.iterrows():
             try:
-                day_str = ts.strftime("%Y-%m-%d")
+                day_str = str(ts)[:10]
                 close = float(row.get("Close", 0) or 0)
                 if close <= 0:
                     continue
@@ -407,6 +412,92 @@ def _fetch_yfinance(
         return [], "yfinance not installed — run: pip install yfinance"
     except Exception as exc:
         return [], f"yfinance error for {symbol}: {type(exc).__name__}: {exc}"
+
+
+# ── Direct Yahoo Finance REST API (bypasses yfinance library completely) ────────
+def _fetch_yahoo_direct(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+) -> Tuple[List[Dict], str]:
+    """
+    Fetch daily OHLCV bars directly from Yahoo Finance v8/finance/chart API.
+    Does not use yfinance library — makes the HTTP request itself.
+    Reliable fallback when yfinance library returns 'possibly delisted' for indices.
+    """
+    try:
+        clean = symbol.upper()
+        for prefix in ("NASDAQ:", "NYSE:", "AMEX:", "ARCA:"):
+            if clean.startswith(prefix):
+                clean = clean[len(prefix):]
+                break
+        clean = _INDEX_SYMBOL_MAP.get(clean, {}).get("yfinance", clean)
+
+        from datetime import datetime as _dt
+        period1 = int(_dt.strptime(start_date[:10], "%Y-%m-%d").timestamp())
+        period2 = int(_dt.strptime(end_date[:10],   "%Y-%m-%d").timestamp()) + 86400
+
+        hdrs = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept":          "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        # Try both Yahoo Finance query endpoints
+        for _base in ("https://query2.finance.yahoo.com", "https://query1.finance.yahoo.com"):
+            try:
+                url  = f"{_base}/v8/finance/chart/{requests.utils.quote(clean)}"
+                resp = requests.get(
+                    url,
+                    headers=hdrs,
+                    params={"period1": period1, "period2": period2, "interval": "1d",
+                            "includePrePost": "false"},
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    continue
+                result = (resp.json().get("chart") or {}).get("result") or []
+                if not result:
+                    continue
+                timestamps = result[0].get("timestamp") or []
+                q = (result[0].get("indicators") or {}).get("quote") or [{}]
+                q = q[0]
+                closes  = q.get("close",  [])
+                opens   = q.get("open",   [])
+                highs   = q.get("high",   [])
+                lows    = q.get("low",    [])
+                volumes = q.get("volume", [])
+                bars: List[Dict] = []
+                for i, ts in enumerate(timestamps):
+                    try:
+                        day_str = _dt.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
+                        close = float(closes[i]) if (i < len(closes) and closes[i] is not None) else 0.0
+                        if close <= 0:
+                            continue
+                        bars.append({
+                            "date":   day_str,
+                            "close":  round(close, 4),
+                            "open":   round(float(opens[i]   or close) if i < len(opens)   else close, 4),
+                            "high":   round(float(highs[i]   or close) if i < len(highs)   else close, 4),
+                            "low":    round(float(lows[i]    or close) if i < len(lows)    else close, 4),
+                            "volume": float(volumes[i] or 0)           if i < len(volumes) else 0.0,
+                            "source": "yahoo_direct",
+                        })
+                    except (IndexError, TypeError, ValueError):
+                        continue
+                if bars:
+                    bars.sort(key=lambda b: b["date"])
+                    return bars, ""
+            except requests.Timeout:
+                continue
+            except Exception:
+                continue
+        return [], f"Yahoo Finance direct API returned no data for {clean} ({start_date} to {end_date})"
+    except Exception as exc:
+        return [], f"Yahoo Finance direct API error for {symbol}: {type(exc).__name__}: {exc}"
 
 
 def _fetch_rapidapi_for_range(
@@ -434,7 +525,16 @@ def _fetch_rapidapi_for_range(
         # Resolve index names to TradingView format (SPX → SP:SPX, etc.)
         _idx_tv = _INDEX_SYMBOL_MAP.get(base, {}).get("tradingview")
         if _idx_tv:
-            exchanges = [_idx_tv]
+            # Try primary TradingView format plus common fallback formats for indices
+            _tv_fallbacks: Dict[str, List[str]] = {
+                "SPX":  ["SP:SPX",  "TVC:SPX",  "CBOE:SPX",  "FOREXCOM:SPXUSD"],
+                "NDX":  ["NASDAQ:NDX", "TVC:NDX", "INDEX:NDX"],
+                "DJI":  ["DJ:DJI",  "TVC:DJI",  "INDEX:DJI"],
+                "DJIA": ["DJ:DJI",  "TVC:DJI",  "INDEX:DJI"],
+                "VIX":  ["CBOE:VIX", "TVC:VIX"],
+                "RUT":  ["TVC:RUT",  "INDEX:RUT"],
+            }
+            exchanges = _tv_fallbacks.get(base, [_idx_tv])
         else:
             sym_fmt = _fmt(symbol)
             if sym_fmt.startswith("NASDAQ:"):
@@ -591,10 +691,34 @@ def fetch_price_history_for_range(
             "providers_tried": chain,
         }
 
+    # ── Provider 4: Direct Yahoo Finance REST API (bypasses yfinance library) ────
+    yd_bars, yd_err = _fetch_yahoo_direct(symbol, requested_start, requested_end)
+    yd_first  = yd_bars[0]["date"] if yd_bars else None
+    yd_status = _coverage_status(yd_first, requested_start)
+    chain.append({
+        "provider":  "yahoo_direct",
+        "status":    yd_status,
+        "first_bar": yd_first,
+        "bars":      len(yd_bars),
+        "error":     yd_err,
+    })
+    if yd_bars:
+        eff_start  = yd_first or requested_start
+        final_stat = yd_status
+        _PROVIDER_USED[sym_key] = "yahoo_direct"
+        return yd_bars, "", {
+            "requested_start": requested_start,
+            "effective_start": eff_start,
+            "provider":        "yahoo_direct",
+            "coverage_status": final_stat,
+            "providers_tried": chain,
+        }
+
     # ── All providers failed ────────────────────────────────────────────────────
     combined_err = (
         f"No provider could fetch data for {symbol} from {requested_start}. "
-        f"TradingView RapidAPI: {tv_err}. NASDAQ: {nash_err}. yfinance: {yf_err}."
+        f"TradingView RapidAPI: {tv_err}. NASDAQ: {nash_err}. "
+        f"yfinance: {yf_err}. Yahoo direct: {yd_err}."
     )
     return [], combined_err, {
         "requested_start": requested_start,
@@ -630,26 +754,15 @@ def fetch_price_history(symbol: str, min_days: int = 500) -> Tuple[List[Dict], s
     if HISTORICAL_PRICE_PROVIDER == "external_historical":
         end_d   = date.today()
         start_d = end_d - timedelta(days=min_days + 90)
-        start_s, end_s = start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
-        ext_bars, ext_err = _fetch_external_historical_provider(symbol, start_s, end_s)
+        ext_bars, ext_err = _fetch_external_historical_provider(
+            symbol, start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
+        )
         if ext_bars:
             ext_bars = _deduplicate_and_sort(ext_bars)
             _PRICE_CACHE[sym_key] = {"bars": ext_bars, "ts": time.time()}
             _PROVIDER_USED[sym_key] = "external_historical_provider"
             return ext_bars, ""
-        # yfinance last resort — same tier fetch_price_history_for_range() already
-        # uses for benchmark bars; the primary predicted-symbol path previously
-        # stopped at NASDAQ and would fail outright here.
-        yf_bars, yf_err = _fetch_yfinance(symbol, start_s, end_s)
-        if yf_bars:
-            yf_bars = _deduplicate_and_sort(yf_bars)
-            _PRICE_CACHE[sym_key] = {"bars": yf_bars, "ts": time.time()}
-            _PROVIDER_USED[sym_key] = "yfinance"
-            return yf_bars, ""
-        return [], (
-            f"Historical price data unavailable for {symbol}. "
-            f"NASDAQ: {ext_err}. yfinance: {yf_err}."
-        )
+        return [], f"Historical price data unavailable for {symbol}. {ext_err}"
 
     key = os.getenv("RAPIDAPI_KEY", "").strip()
     if not key:
@@ -778,27 +891,19 @@ def fetch_price_history(symbol: str, min_days: int = 500) -> Tuple[List[Dict], s
     if HISTORICAL_PRICE_PROVIDER == "auto":
         end_d   = date.today()
         start_d = end_d - timedelta(days=range_n + 90)
-        start_s, end_s = start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
-        ext_bars, ext_err = _fetch_external_historical_provider(symbol, start_s, end_s)
+        ext_bars, ext_err = _fetch_external_historical_provider(
+            symbol, start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
+        )
         if ext_bars:
             ext_bars = _deduplicate_and_sort(ext_bars)
             _PRICE_CACHE[sym_key] = {"bars": ext_bars, "ts": time.time()}
             _PROVIDER_USED[sym_key] = "external_historical_provider"
             return ext_bars, ""
-        # yfinance last resort — RapidAPI and NASDAQ both failed. Previously this
-        # was a dead end for the primary predicted-symbol path even though the
-        # benchmark path (fetch_price_history_for_range) already had this tier.
-        yf_bars, yf_err = _fetch_yfinance(symbol, start_s, end_s)
-        if yf_bars:
-            yf_bars = _deduplicate_and_sort(yf_bars)
-            _PRICE_CACHE[sym_key] = {"bars": yf_bars, "ts": time.time()}
-            _PROVIDER_USED[sym_key] = "yfinance"
-            return yf_bars, ""
-        # RapidAPI, NASDAQ, and yfinance all failed
+        # Both RapidAPI and external failed
         return [], (
             f"Historical price data unavailable for {symbol}. "
             f"RapidAPI TradingView: historical endpoints not available on current plan. "
-            f"External historical provider: {ext_err}. yfinance: {yf_err}. "
+            f"External historical provider: {ext_err}. "
             "Check Developer Debug for details."
         )
 

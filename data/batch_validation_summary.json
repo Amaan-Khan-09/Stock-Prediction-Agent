@@ -1,0 +1,67 @@
+{
+  "generated_at": "2026-07-19T12:07:04.942713",
+  "symbols": [
+    "SPY",
+    "TSLA"
+  ],
+  "horizons": [
+    7,
+    14,
+    30,
+    45
+  ],
+  "total_runs": 5,
+  "valid_runs": 5,
+  "failed_runs": 0,
+  "decision_match_pct": 40.0,
+  "direction_match_pct": 40.0,
+  "avg_return_error_pp": 2.3631,
+  "hold_rate_pct": 100.0,
+  "false_buy_count": 0,
+  "false_sell_count": 0,
+  "over_hold_count": 3,
+  "match_by_symbol": {
+    "SPY": {
+      "runs": 5,
+      "matches": 2,
+      "match_pct": 40.0
+    },
+    "TSLA": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    }
+  },
+  "match_by_horizon": {
+    "7": {
+      "runs": 5,
+      "matches": 2,
+      "match_pct": 40.0
+    },
+    "14": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    },
+    "30": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    },
+    "45": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    }
+  },
+  "top_failure_reasons": [
+    {
+      "reason": "OVER_HOLD",
+      "count": 3
+    }
+  ],
+  "recommended_prompt_changes": [
+    "OVER_HOLD detected: widen BUY/SELL thresholds or add stronger signal requirement before HOLD.",
+    "HOLD rate is 100% — prompt over-selects HOLD. Add confidence requirement for HOLD."
+  ]
+}

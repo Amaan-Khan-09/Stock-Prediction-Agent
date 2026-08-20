@@ -1,0 +1,39 @@
+{
+  "generated_at": "2026-07-20T00:00:00",
+  "tag": "pre_calibration",
+  "note": "From stock_prediction_evaluation_runs.jsonl \u2014 46 records, old stock_prediction_agent code",
+  "symbols": [
+    "SPY",
+    "TSLA",
+    "UNH",
+    "AAPL",
+    "MSFT",
+    "QQQ"
+  ],
+  "horizons": [
+    30
+  ],
+  "total_runs": 46,
+  "valid_runs": 46,
+  "failed_runs": 0,
+  "data_unavailable_count": 0,
+  "symbols_failed": [],
+  "decision_match_pct": 26.1,
+  "direction_match_pct": 41.3,
+  "avg_return_error_pp": 21.66,
+  "hold_rate_pct": 54.3,
+  "false_buy_count": 0,
+  "false_sell_count": 0,
+  "over_hold_count": 0,
+  "match_by_symbol": {},
+  "match_by_horizon": {},
+  "top_failure_reasons": [
+    {
+      "reason": "OVER_HOLD",
+      "count": 25
+    }
+  ],
+  "recommended_prompt_changes": [
+    "OVER_HOLD is primary failure mode"
+  ]
+}

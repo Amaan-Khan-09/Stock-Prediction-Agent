@@ -1,0 +1,25 @@
+[
+  {
+    "trade_id": "11210FDA",
+    "date": "2099-01-15",
+    "message_id": "OPEN1",
+    "reply_to": null,
+    "user_label": null,
+    "underlying": "SPY",
+    "asset_type": "OPTION",
+    "option_type": "CALL",
+    "strike": 620.0,
+    "expiry": "2099-01-15",
+    "entry_price": 1.4,
+    "contracts_opened": 2,
+    "contracts_closed": 0,
+    "remaining_contracts": 2,
+    "exit_prices": [],
+    "exit_contracts": [],
+    "realized_pnl": null,
+    "status": "OPEN",
+    "raw_messages": [
+      "Entered SPY 620C 0DTE @ 1.40, 2 contracts"
+    ]
+  }
+]

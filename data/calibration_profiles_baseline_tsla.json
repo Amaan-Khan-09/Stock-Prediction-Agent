@@ -1,0 +1,51 @@
+{
+  "profiles": {
+    "TSLA": {
+      "symbol": "TSLA",
+      "runs_available": 10,
+      "calibration_available": true,
+      "data_quality": "SUFFICIENT",
+      "match_pct": 40.0,
+      "hold_rate_pct": 20.0,
+      "false_buy_rate_pct": 10.0,
+      "false_sell_rate_pct": 10.0,
+      "avg_return_error_pp": 4.1232,
+      "top_failure_categories": [],
+      "volatility_warning": false,
+      "news_earnings_warning": false,
+      "calibration_summary": "TSLA: 10 validation runs. Match rate 40.0%. AI makes 1 false BUY calls — be more cautious on upside. AI makes 1 false SELL calls — avoid early bearish calls."
+    }
+  },
+  "global": {
+    "n": 10,
+    "decision_match_pct": 40.0,
+    "direction_match_pct": 40.0,
+    "avg_return_error_pp": 4.12,
+    "hold_rate": 20.0,
+    "buy_rate": 20.0,
+    "sell_rate": 30.0,
+    "false_buy_rate": 10.0,
+    "false_sell_rate": 10.0,
+    "over_hold_rate": 10.0,
+    "best_horizon": "7",
+    "worst_horizon": "7"
+  },
+  "by_horizon": {
+    "7": {
+      "runs": 10,
+      "decision_match_pct": 40.0,
+      "hold_rate": 20.0,
+      "avg_return_error_pp": 4.12
+    }
+  },
+  "prompt_guidance": [
+    "No dominant failure patterns detected. Continue monitoring."
+  ],
+  "symbols_profiled": [
+    "TSLA"
+  ],
+  "total_profiles": 1,
+  "profiles_with_data": 1,
+  "generated_at": "2026-07-20T13:33:35.984454",
+  "tag": "baseline_tsla"
+}

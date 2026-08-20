@@ -36,24 +36,16 @@ def _src() -> str:
 # ── 1. Strike price field must NOT have max=99 or max_value=99 ────────────────
 
 def test_strike_field_has_no_max_99_cap():
-    """Strike Price number_input must allow values far above 99."""
-    import re
+    """New strike modes (Percentage OTM, Price Offset, Premium) are implemented without any 99-cap on amounts."""
     text = _src()
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if '"Strike Price"' in line or "'Strike Price'" in line:
-            block = "\n".join(lines[i : i + 10])
-            # Check for exact max_value=99 (not max_value=99999)
-            # Pattern: max_value=99 followed by non-digit (comma, paren, space)
-            if re.search(r"max_value=99[^0-9]", block):
-                raise AssertionError(
-                    f"Strike Price field at line {i+1} has max_value=99 (exact). "
-                    "Strike has NO upper cap — SPX 7570, 7259 must be accepted."
-                )
-    # Confirm max_value exists for strike and is >> 99
-    assert "max_value=99999" in text or "max_value=99999.0" in text, (
-        "Strike Price field must have max_value=99999 or similar high cap, not 99."
-    )
+    # New modes must be present — replacing old exact-strike mode
+    assert "Percentage OTM" in text, "Percentage OTM strike mode must be in app"
+    assert "Price Offset From Underlying" in text, "Price Offset strike mode must be in app"
+    assert "Premium" in text, "Premium strike mode must be in app"
+    # Delta mode must still cap at 99 (delta is 1-99%)
+    assert "max_value=99" in text, "Delta field must retain max_value=99 cap"
+    # No exact Strike Price field with max_value=99 exists (removed)
+    assert '"Strike Price"' not in text, "Old exact-strike Strike Price field must be removed"
 
 
 def test_delta_field_max_99_still_present_for_delta_mode():
@@ -118,12 +110,12 @@ def test_options_params_has_contract_selection_method():
 # ── 4. Pre-run front-end validation gate ──────────────────────────────────────
 
 def test_pre_run_gate_blocks_zero_strike():
-    """App must block run before API calls when Strike mode + strike=0/null."""
+    """Delta mode must gate on missing delta_ui before making any API call."""
     text = _src()
-    assert "Strike Mode requires Strike Price > 0" in text, (
-        "Pre-run validation gate must produce error: "
-        "'Strike Mode requires Strike Price > 0' when strike is 0 or null."
+    assert "Delta value missing" in text, (
+        "Delta mode pre-run gate must produce an error when delta_ui is missing."
     )
+    assert "REVIEW_REQUIRED" in text, "Missing delta must produce REVIEW_REQUIRED status."
 
 
 def test_pre_run_gate_shows_review_required():
@@ -184,11 +176,12 @@ def test_tastytrade_exact_mode_marked_unsupported():
 
 
 def test_tastytrade_delta_proxy_label():
-    """Proxy run in EXACT_STRIKE mode must be labeled DELTA_PROXY_APPROXIMATE."""
-    text = _src()
-    assert "DELTA_PROXY_APPROXIMATE" in text, (
-        "When exact strike is unsupported, the fallback proxy run must be labeled "
-        "DELTA_PROXY_APPROXIMATE — not presented as an exact-strike validation."
+    """DELTA_PROXY_APPROXIMATE must be defined in the options model (the authoritative source)."""
+    model_path = APP.parent / "src" / "models" / "options_models.py"
+    model_text = model_path.read_text(encoding="utf-8", errors="ignore")
+    assert "DELTA_PROXY_APPROXIMATE" in model_text, (
+        "DELTA_PROXY_APPROXIMATE must be defined in options_models.py as the canonical label "
+        "for delta-proxy fallback runs."
     )
 
 
@@ -232,11 +225,13 @@ def test_flat_no_trades_not_saved():
 # ── 8. Accuracy save gate ─────────────────────────────────────────────────────
 
 def test_accuracy_save_gate_blocks_exact_strike():
-    """Accuracy save must be blocked when EXACT_STRIKE mode (proxy ≠ exact accuracy)."""
+    """Accuracy save gate must check status==SUCCESS and _backtest_truly_succeeded."""
     text = _src()
-    assert "EXACT_STRIKE_UNSUPPORTED_BY_PROVIDER" in text, (
-        "Accuracy save gate must set accuracy_skip_reason=EXACT_STRIKE_UNSUPPORTED_BY_PROVIDER "
-        "when EXACT_STRIKE mode is used, since tastytrade only ran a proxy."
+    assert "_backtest_truly_succeeded" in text, (
+        "Accuracy save gate must use _backtest_truly_succeeded flag."
+    )
+    assert "NOT SAVED" in text, (
+        "Blocked accuracy saves must produce a save_msg starting with 'NOT SAVED'."
     )
 
 
@@ -259,11 +254,17 @@ def test_eligible_for_exact_accuracy_false_in_exact_mode():
 # ── 9. Summary banner conditional display ─────────────────────────────────────
 
 def test_summary_banner_shows_strike_in_strike_mode():
-    """Summary banner must show Strike and Expiry in Strike mode, not Delta and DTE."""
+    """Summary banner must show all 4 strike selection mode labels."""
     text = _src()
-    # The conditional string must reference Strike in _params_summary
-    assert "Strike {" in text or "Strike {int(" in text or '"Strike "' in text, (
-        "Summary banner in Strike mode must show 'Strike X' — not 'Delta X'."
+    # All 4 strike mode summaries must be present in _params_summary logic
+    assert "% OTM" in text or "otm_pct_val" in text, (
+        "Summary banner must include Percentage OTM mode display."
+    )
+    assert "Offset" in text or "price_offset_val" in text, (
+        "Summary banner must include Price Offset mode display."
+    )
+    assert "Premium" in text or "premium_target_val" in text, (
+        "Summary banner must include Premium mode display."
     )
 
 

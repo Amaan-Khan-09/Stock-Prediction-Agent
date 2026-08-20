@@ -51,16 +51,18 @@ class TestBuildShortPutPayload:
         for leg in payload.legs:
             assert leg.type == "equity-option"
 
-    def test_end_date_formatted_as_iso_datetime(self):
+    def test_end_date_formatted_as_date_only(self):
+        # TastyTrade website uses date-only format (no time suffix) — must NOT include "T"
         payload = build_equity_option_short_put_payload("SPY", "2021-01-01", "2024-06-01")
         d = payload.to_dict()
-        assert "T" in d["endDate"], "endDate must include time component"
-        assert d["endDate"].endswith("Z"), "endDate must end with Z"
+        assert "T" not in d["endDate"], "endDate must be date-only (no T time component — matches TastyTrade website)"
+        assert len(d["endDate"]) == 10, f"endDate must be 10 chars (YYYY-MM-DD), got: {d['endDate']}"
 
     def test_to_dict_has_required_keys(self):
         payload = build_equity_option_short_put_payload("SPY", "2021-01-01", "2024-01-01")
         d = payload.to_dict()
-        for key in ("startDate", "endDate", "symbol", "status", "entryConditions", "exitConditions", "legs"):
+        # "status" field was removed from payload to match TastyTrade website format
+        for key in ("startDate", "endDate", "symbol", "entryConditions", "exitConditions", "legs"):
             assert key in d, f"Missing key: {key}"
 
     def test_custom_dte_and_delta_propagate(self):

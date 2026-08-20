@@ -1,0 +1,59 @@
+{
+  "generated_at": "2026-07-20T13:32:34.724404",
+  "symbols": [
+    "TSLA"
+  ],
+  "horizons": [
+    7,
+    30
+  ],
+  "total_runs": 10,
+  "valid_runs": 10,
+  "failed_runs": 0,
+  "data_unavailable_count": 0,
+  "symbols_failed": [],
+  "decision_match_pct": 40.0,
+  "direction_match_pct": 40.0,
+  "avg_return_error_pp": 4.1232,
+  "hold_rate_pct": 20.0,
+  "false_buy_count": 1,
+  "false_sell_count": 1,
+  "over_hold_count": 1,
+  "match_by_symbol": {
+    "TSLA": {
+      "runs": 10,
+      "matches": 4,
+      "match_pct": 40.0
+    }
+  },
+  "match_by_horizon": {
+    "7": {
+      "runs": 10,
+      "matches": 4,
+      "match_pct": 40.0
+    },
+    "30": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    }
+  },
+  "top_failure_reasons": [
+    {
+      "reason": "UNKNOWN_FAILURE",
+      "count": 3
+    },
+    {
+      "reason": "WRONG_MAGNITUDE",
+      "count": 2
+    },
+    {
+      "reason": "OVER_HOLD",
+      "count": 1
+    }
+  ],
+  "recommended_prompt_changes": [
+    "OVER_HOLD detected: widen BUY/SELL thresholds or add stronger signal requirement before HOLD.",
+    "WRONG_MAGNITUDE: recalibrate predicted_return_pct scaling vs actual by horizon."
+  ]
+}

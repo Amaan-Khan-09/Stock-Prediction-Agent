@@ -1,0 +1,35 @@
+{
+  "csv_analyzed": "C:\\Users\\nithi\\OneDrive\\Desktop\\AI FINANCIAL ANALYST SYSTEM\\data\\batch_validation_results.csv",
+  "rows_analyzed": 5,
+  "valid_runs": 5,
+  "data_unavailable_runs": 0,
+  "matches": 2,
+  "mismatches": 3,
+  "match_pct": 40.0,
+  "top_failure_categories": [
+    {
+      "category": "OVER_HOLD",
+      "count": 3,
+      "description": "AI called HOLD when market moved strongly.",
+      "fix": "Lower HOLD threshold; add momentum confirmation gate."
+    }
+  ],
+  "by_symbol": {
+    "SPY": {
+      "valid_runs": 5,
+      "matches": 2,
+      "match_pct": 40.0,
+      "top_failures": {
+        "OVER_HOLD": 3
+      }
+    }
+  },
+  "by_horizon": {
+    "7": {
+      "valid_runs": 5,
+      "matches": 2,
+      "match_pct": 40.0
+    }
+  },
+  "symbols_with_data_unavailable": []
+}

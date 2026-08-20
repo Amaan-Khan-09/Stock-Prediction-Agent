@@ -1,0 +1,78 @@
+{
+  "generated_at": "2026-07-20T13:24:45.328197",
+  "symbols": [
+    "SPY",
+    "TSLA"
+  ],
+  "horizons": [
+    7,
+    14,
+    30,
+    45
+  ],
+  "total_runs": 5,
+  "valid_runs": 5,
+  "failed_runs": 0,
+  "data_unavailable_count": 0,
+  "symbols_failed": [],
+  "decision_match_pct": 20.0,
+  "direction_match_pct": 20.0,
+  "avg_return_error_pp": 2.2566,
+  "hold_rate_pct": 0.0,
+  "false_buy_count": 1,
+  "false_sell_count": 1,
+  "over_hold_count": 0,
+  "match_by_symbol": {
+    "SPY": {
+      "runs": 5,
+      "matches": 1,
+      "match_pct": 20.0
+    },
+    "TSLA": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    }
+  },
+  "match_by_horizon": {
+    "7": {
+      "runs": 5,
+      "matches": 1,
+      "match_pct": 20.0
+    },
+    "14": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    },
+    "30": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    },
+    "45": {
+      "runs": 0,
+      "matches": 0,
+      "match_pct": 0.0
+    }
+  },
+  "top_failure_reasons": [
+    {
+      "reason": "UNKNOWN_FAILURE",
+      "count": 2
+    },
+    {
+      "reason": "FALSE_BUY",
+      "count": 1
+    },
+    {
+      "reason": "FALSE_SELL",
+      "count": 1
+    }
+  ],
+  "recommended_prompt_changes": [
+    "FALSE_BUY: add reversal_risk and RSI overbought guard to buy logic.",
+    "FALSE_SELL: add RSI oversold check before SELL to prevent false downside calls.",
+    "Match rate below 30% — investigate feature quality and prompt clarity."
+  ]
+}
