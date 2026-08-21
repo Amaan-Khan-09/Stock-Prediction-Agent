@@ -4410,7 +4410,7 @@ def _render_options_results():
             + (
                 f'Options P&L: <b style="color:{"#10B981" if float(opts.get("profit_loss",0) or 0)>=0 else "#EF4444"}">'
                 f'${float(opts.get("profit_loss",0) or 0):+,.2f}</b><br>'
-                f'Win Rate: <b>{f"{float(opts.get("win_rate",0) or 0)*100:.1f}%"}</b><br>'
+                f'Win Rate: <b>{float(opts.get("win_rate",0) or 0)*100:.1f}%</b><br>'
                 f'Trials / Trades: <b>{opts.get("total_trades","---")}</b><br>'
                 f'Result Source: <b style="color:{"#FCD34D" if opts.get("bs_fallback") else "#10B981"}">'
                 f'{"Black-Scholes (TT API failed)" if opts.get("bs_fallback") else "TastyTrade API (real data)"}</b><br>'

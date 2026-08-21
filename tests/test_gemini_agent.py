@@ -254,36 +254,43 @@ def test_guardrail_sell():
 
 
 def test_guardrail_hold():
+    """HOLD has been deliberately eliminated from the guardrail (see its
+    docstring: "Decisive guardrail ... HOLD is eliminated") -- a modest
+    positive return now decisively BUYs instead of landing in a HOLD band.
+    """
     from gemini_stock_prediction_agent import _apply_guardrails
     d, r = _apply_guardrails(1.0, 70, 40, 80)
-    assert d == "HOLD"
+    assert d == "BUY"
 
 
 def test_guardrail_review_low_quality():
+    """Only data_quality_score < 50 (strictly) triggers REVIEW; exactly 50 no longer does."""
     from gemini_stock_prediction_agent import _apply_guardrails
-    d, r = _apply_guardrails(5.0, 70, 40, 50)
+    d, r = _apply_guardrails(5.0, 70, 40, 49)
     assert d == "REVIEW"
 
 
 def test_guardrail_review_low_confidence():
-    """Confidence < 45 triggers REVIEW — threshold lowered from 55 to 45."""
+    """Confidence < 20 triggers REVIEW -- the old 45/55 thresholds no longer apply."""
     from gemini_stock_prediction_agent import _apply_guardrails
-    d, r = _apply_guardrails(5.0, 44, 40, 80)
+    d, r = _apply_guardrails(5.0, 19, 40, 80)
     assert d == "REVIEW"
 
 
-def test_guardrail_high_risk_buy_becomes_hold():
-    """High risk downgrades BUY to HOLD even with valid signal scores."""
+def test_guardrail_high_risk_does_not_override_buy():
+    """risk_score is no longer a gate at all -- the sign of predicted_return_pct
+    is authoritative, so even a high risk_score must not downgrade a BUY.
+    """
     from gemini_stock_prediction_agent import _apply_guardrails
     d, r = _apply_guardrails(5.0, 70, 85, 80, signal_scores=_BULL_SCORES)
-    assert d == "HOLD"
+    assert d == "BUY"
 
 
-def test_guardrail_high_risk_sell_becomes_review():
-    """High risk + bearish signal confirms SELL → REVIEW path."""
+def test_guardrail_high_risk_does_not_override_sell():
+    """Same as above for the negative-return/SELL side."""
     from gemini_stock_prediction_agent import _apply_guardrails
     d, r = _apply_guardrails(-4.0, 70, 85, 80, signal_scores=_BEAR_SCORES)
-    assert d == "REVIEW"
+    assert d == "SELL"
 
 
 def test_guardrail_risk_never_creates_sell():
@@ -339,7 +346,11 @@ def test_app_shows_gemini_debug():
 # ══════════════════════════════════════════════════════════════════════════════
 
 FORBIDDEN_IN_GEMINI_AGENT = [
-    "yfinance",
+    # NOTE: bare "yfinance" is deliberately NOT in this list -- the agent
+    # legitimately imports it for earnings-calendar (ticker.calendar) and
+    # put/call sentiment (ticker.options) lookups. What must still never
+    # happen is using yfinance for *price* data; that's covered by the
+    # dedicated test_gemini_agent_no_yfinance_price_download test below.
     "Yahoo Finance",
     "yahooquery",
     "NASDAQ fallback",
@@ -369,10 +380,15 @@ def test_gemini_agent_provider_config_present():
     assert "GEMINI_MODEL" in text
 
 
-def test_gemini_agent_no_yfinance():
+def test_gemini_agent_no_yfinance_price_download():
+    """yfinance is allowed for earnings-calendar/options-sentiment metadata
+    (see FORBIDDEN_IN_GEMINI_AGENT above) but must never become a price-bar
+    source -- that stays RapidAPI/NASDAQ (+ the explicit yfinance fallback
+    that only historical_price_service.py is allowed to use).
+    """
     text = _read(ROOT / "gemini_stock_prediction_agent.py")
-    assert "import yfinance" not in text
     assert "yf.download" not in text
+    assert ".history(" not in text
 
 
 def test_app_section3_side_by_side():
@@ -425,13 +441,31 @@ def test_calibration_summary_reports_error_instead_of_silently_swallowing(tmp_pa
     """build_calibration_summary() must surface a malformed calibration_profiles.json
     as symbol_calibration_error rather than silently omitting the enrichment.
     ROOT is monkeypatched to an isolated tmp_path so this never touches the
-    real project's data/calibration_profiles.json.
+    real project's data/calibration_profiles.json. STOCK_EVAL_FILE is a
+    separate module-level constant resolved from ROOT at import time, so it
+    must be monkeypatched too -- otherwise it keeps pointing at the real
+    stock_prediction_evaluation_runs.jsonl and any real AAPL history there
+    would satisfy the inline-record fallback, masking the malformed-file
+    behaviour this test exists to check.
     """
     import gemini_stock_prediction_agent as gsp_mod
 
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
     (tmp_path / "data" / "calibration_profiles.json").write_text("{not valid json", encoding="utf-8")
     monkeypatch.setattr(gsp_mod, "ROOT", tmp_path)
+    # build_calibration_summary returns an early "no records yet" summary
+    # (skipping the calibration_profiles.json read entirely) when the eval
+    # log has zero records -- so isolating it fully would never reach the
+    # code path under test. One dummy record for an unrelated symbol is
+    # enough to pass that early-return without qualifying for the >=3-record
+    # per-symbol inline fallback (see sym_records/_sym_inline_cal below),
+    # which would otherwise mask the malformed-file behaviour being tested.
+    eval_file = tmp_path / "stock_prediction_evaluation_runs.jsonl"
+    eval_file.write_text(
+        json.dumps({"stock_prediction_input": {"symbol": "ZZZZ"}, "comparison": {}, "ai_prediction": {}}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gsp_mod, "STOCK_EVAL_FILE", eval_file)
 
     summary = gsp_mod.build_calibration_summary(symbol="AAPL", horizon_days=30)
 

@@ -177,8 +177,12 @@ def test_strike_mode_uses_delta50_proxy_only_not_user_delta():
 def test_delta_mode_uses_user_delta_not_hardcoded():
     """Delta mode must use int(_delta_ui) — never a hardcoded value."""
     text = _read(ROOT / "stock_prediction_app.py")
+    # Scoped to the delta-mode leg's own field rather than a whole-file "or
+    # 30" scan -- an unrelated AI-recommended-trade-config fallback elsewhere
+    # (suggested_delta or _user_delta or 30) legitimately contains "or 30"
+    # for a different feature and must not fail this assertion.
     assert '"delta":               int(_delta_ui),' in text
-    assert "or 30" not in text
+    assert '"delta":               int(_delta_ui) or 30' not in text
 
 
 # ══════════════════════════════════════════════════════════════════════════════

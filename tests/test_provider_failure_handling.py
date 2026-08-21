@@ -221,8 +221,13 @@ def test_delta_mode_user_value_used():
     """Delta mode leg must use user's actual delta_ui, not a hardcoded default."""
     text = _read(ROOT / "stock_prediction_app.py")
     assert "int(_delta_ui)" in text
-    # The 'or 30' default must NOT exist (was removed)
-    assert "or 30" not in text
+    # The delta-mode leg's own "delta" field must be a bare int(_delta_ui) with
+    # no "or <default>" fallback -- scoped to that exact line rather than a
+    # whole-file "or 30" scan, since an unrelated AI-recommended-trade-config
+    # fallback elsewhere in the file (suggested_delta or _user_delta or 30)
+    # legitimately contains "or 30" for a different feature entirely.
+    assert '"delta":               int(_delta_ui),' in text
+    assert '"delta":               int(_delta_ui) or 30' not in text
 
 
 # ══════════════════════════════════════════════════════════════════════════════

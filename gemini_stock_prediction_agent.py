@@ -752,7 +752,12 @@ def build_calibration_summary(symbol: str = "", horizon_days: int = 0) -> dict:
                     cal_summary["symbol_calibration"] = _static_cal
             elif _sym_inline_cal:
                 cal_summary["symbol_calibration"] = _sym_inline_cal
-        except Exception:
+        except Exception as exc:
+            # Degrade gracefully (a malformed calibration file must never
+            # break prediction) but don't hide that this enrichment was
+            # skipped -- callers can surface it instead of silently looking
+            # complete.
+            cal_summary["symbol_calibration_error"] = f"{type(exc).__name__}: {exc}"
             if _sym_inline_cal:
                 cal_summary["symbol_calibration"] = _sym_inline_cal
     elif _sym_inline_cal:
@@ -2538,6 +2543,12 @@ def run_gemini_stock_prediction(spi: dict, price_history_context: List[dict]) ->
     if origin_price is None:
         return _error_result(spi, input_hash, f"Cannot get origin price on {origin_str}: {price_err}")
 
+    # Failures below are recorded here instead of silently swallowed -- a
+    # transient fetch error must not look identical to "this symbol genuinely
+    # has no earnings/benchmark/movers data." Returned in the final result
+    # under context_enrichment_warnings.
+    _context_enrichment_warnings: dict = {}
+
     # Fetch benchmark bars so relative strength is computed for Gemini
     benchmark_sym = str(spi.get("benchmark", "") or "").strip().upper()
     _benchmark_bars: Optional[List[dict]] = None
@@ -2547,8 +2558,11 @@ def run_gemini_stock_prediction(spi: dict, price_history_context: List[dict]) ->
             _bm_bars, _bm_err, _bm_cov = _fpr(benchmark_sym, ctx_start, origin_str)
             if _bm_bars:
                 _benchmark_bars = [b for b in _bm_bars if b["date"] <= origin_str]
-        except Exception:
+            else:
+                _context_enrichment_warnings["benchmark_bars"] = _bm_err or "No benchmark bars returned."
+        except Exception as exc:
             _benchmark_bars = None
+            _context_enrichment_warnings["benchmark_bars"] = f"{type(exc).__name__}: {exc}"
 
     # Build feature packet
     feature_packet = build_stock_feature_packet(spi, history, benchmark_bars=_benchmark_bars)
@@ -2557,6 +2571,8 @@ def run_gemini_stock_prediction(spi: dict, price_history_context: List[dict]) ->
 
     # Calibration summary
     calibration_summary = build_calibration_summary(symbol=symbol, horizon_days=horizon_days)
+    if calibration_summary.get("symbol_calibration_error"):
+        _context_enrichment_warnings["symbol_calibration"] = calibration_summary["symbol_calibration_error"]
 
     # Fetch earnings calendar for prediction window
     _earnings_warning = ""
@@ -2573,8 +2589,10 @@ def run_gemini_stock_prediction(spi: dict, price_history_context: List[dict]) ->
                 if _sym_earnings:
                     _earn_dates = [str(e.get("date","") or e.get("time",""))[:10] for e in _sym_earnings]
                     _earnings_warning = f"EARNINGS WARNING: {symbol} has earnings in prediction window on {', '.join(_earn_dates)}. Earnings events cause high volatility and often invalidate technical predictions. Raise risk_score by 15-20 and lower confidence_score accordingly."
-    except Exception:
-        pass
+        else:
+            _context_enrichment_warnings["earnings_calendar"] = str(_earn_data.get("message") or _earn_data.get("status") or "unavailable")
+    except Exception as exc:
+        _context_enrichment_warnings["earnings_calendar"] = f"{type(exc).__name__}: {exc}"
 
     # Phase 4 — yfinance earnings gate (supplement tradingview calendar)
     if not _earnings_warning:
@@ -2603,8 +2621,10 @@ def run_gemini_stock_prediction(spi: dict, price_history_context: List[dict]) ->
             _movers_result = fetch_top_movers_for_gemini()
             if _movers_result.get("status") == "SUCCESS":
                 _market_movers_context = _movers_result.get("context_text", "")
-    except Exception:
-        pass
+            else:
+                _context_enrichment_warnings["market_movers"] = str(_movers_result.get("message") or _movers_result.get("status") or "unavailable")
+    except Exception as exc:
+        _context_enrichment_warnings["market_movers"] = f"{type(exc).__name__}: {exc}"
 
     # Call Gemini consensus engine (Phase 1 — triple call with majority vote)
     gemini_result = _call_gemini_consensus(
@@ -2716,6 +2736,7 @@ def run_gemini_stock_prediction(spi: dict, price_history_context: List[dict]) ->
         "consensus_calls":                  gemini_result.get("consensus_calls", []),
         "technical_override_score":         gemini_result.get("technical_override_score", {}),
         "market_movers_used":           bool(_market_movers_context),
+        "context_enrichment_warnings":  _context_enrichment_warnings,
         "_feature_packet":              feature_packet,
         "_calibration_summary":         calibration_summary,
         "_gemini_raw_json":             gemini_result.get("gemini_raw_json", {}),
