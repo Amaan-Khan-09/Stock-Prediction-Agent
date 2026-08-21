@@ -166,7 +166,14 @@ def test_position_sizing_scales_with_account_equity() -> None:
         # vs. 10 sh at the 50k default used elsewhere in this file.
         assert fake.submissions[0]["qty"] == "20"
 
-    predictions = {discord_agent.config.automate_agent_watchlist[0]: "BUY"}
+    # confidence_score=75 is the exact midpoint of confidence_scaled_risk_multiplier
+    # (see test_automate_agent.py), which resolves to a neutral 1.0x multiplier --
+    # keeps this test isolated to equity-based scaling only, not conflated with
+    # the separate confidence-based scaling covered by
+    # test_position_sizing_scales_with_confidence.
+    predictions = {
+        discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75},
+    }
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
@@ -313,6 +320,32 @@ def test_at_cap_evicts_oldest_automate_position_before_buying() -> None:
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
+def test_position_sizing_scales_with_confidence() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        watchlist = discord_agent.config.automate_agent_watchlist
+        high_conf_symbol, low_conf_symbol = watchlist[0], watchlist[1]
+        fake.prices[high_conf_symbol] = 100.0
+        fake.prices[low_conf_symbol] = 100.0
+        fake.equity = 50_000.0
+
+        await discord_agent._build_automate_agent_text()
+
+        submitted = {o["symbol"]: int(o["qty"]) for o in fake.submissions}
+        # risk_pct=2% of 50,000 = 1,000 base budget @ $100/sh = 10 sh baseline.
+        # confidence 95 -> x1.2 multiplier -> 12 sh; confidence 55 -> x0.8 -> 8 sh.
+        assert submitted[high_conf_symbol] == 12, submitted
+        assert submitted[low_conf_symbol] == 8, submitted
+        assert submitted[high_conf_symbol] > submitted[low_conf_symbol], (
+            "higher-conviction pick must get a larger position, not an identical one"
+        )
+
+    predictions = {
+        discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 95},
+        discord_agent.config.automate_agent_watchlist[1]: {"decision": "BUY", "confidence_score": 55},
+    }
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
 def test_needs_human_review_candidate_is_not_bought() -> None:
     async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
         watchlist = discord_agent.config.automate_agent_watchlist
@@ -384,6 +417,7 @@ if __name__ == "__main__":
     test_no_buy_candidates_places_no_trades()
     test_open_market_buys_a_boom_candidate_and_tags_it()
     test_at_cap_evicts_oldest_automate_position_before_buying()
+    test_position_sizing_scales_with_confidence()
     test_needs_human_review_candidate_is_not_bought()
     test_buy_summary_shows_confidence_and_predicted_return()
     test_a_failed_symbol_lookup_does_not_abort_the_whole_scan()

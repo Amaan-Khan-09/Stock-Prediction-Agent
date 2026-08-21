@@ -51,6 +51,28 @@ def rank_boom_candidates(candidates: list[BoomCandidate]) -> list[BoomCandidate]
     return sorted(buys, key=lambda c: (c.confidence, c.predicted_return_pct), reverse=True)
 
 
+def confidence_scaled_risk_multiplier(confidence: float, floor: float = 0.75, cap: float = 1.25) -> float:
+    """Scales a candidate's position size by model conviction, within a
+    deliberately narrow +/-25% band -- not full Kelly sizing (too aggressive
+    for the one execution path in this whole project with no human review),
+    just a conservative tilt toward higher-confidence picks. Comparable
+    autonomous trading agents size this way too (e.g. a documented pattern
+    of +15% position size above 85% confidence) rather than treating every
+    BUY the same regardless of how sure the model actually is.
+
+    confidence is on run_project_prediction's native 0-100 scale. Linearly
+    interpolates between floor (at confidence<=50) and cap (at
+    confidence>=100); clamped outside that range so a malformed/negative
+    confidence value can never blow past the band.
+    """
+    if confidence <= 50:
+        return floor
+    if confidence >= 100:
+        return cap
+    frac = (confidence - 50) / 50.0
+    return floor + frac * (cap - floor)
+
+
 def oldest_automate_position(open_positions: list[dict]) -> Optional[str]:
     """Returns the symbol of the oldest automate_agent-tagged open position,
     or None if there isn't one. Used to free a slot when at the cap -- only

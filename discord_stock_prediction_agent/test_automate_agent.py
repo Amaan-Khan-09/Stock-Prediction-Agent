@@ -13,6 +13,7 @@ from __future__ import annotations
 from .automate_agent import (
     AUTOMATE_AGENT_TAG,
     BoomCandidate,
+    confidence_scaled_risk_multiplier,
     count_automate_positions,
     oldest_automate_position,
     plan_automate_trades,
@@ -87,6 +88,27 @@ def test_rank_excludes_needs_human_review() -> None:
         "AAPL excluded despite higher confidence -- needs_human_review is a hard filter, not a ranking input",
         str(ranked),
     )
+
+
+def test_confidence_scaled_risk_multiplier_floor_at_low_confidence() -> None:
+    print("\nTest: confidence-scaled sizing floors out at/below confidence 50")
+    _assert(confidence_scaled_risk_multiplier(50) == 0.75, "exactly at the floor threshold")
+    _assert(confidence_scaled_risk_multiplier(10) == 0.75, "well below floor threshold, still clamped")
+    _assert(confidence_scaled_risk_multiplier(-5) == 0.75, "negative/malformed input never goes below floor")
+
+
+def test_confidence_scaled_risk_multiplier_caps_at_high_confidence() -> None:
+    print("\nTest: confidence-scaled sizing caps out at/above confidence 100")
+    _assert(confidence_scaled_risk_multiplier(100) == 1.25, "exactly at the cap threshold")
+    _assert(confidence_scaled_risk_multiplier(150) == 1.25, "above 100 still clamped to the cap")
+
+
+def test_confidence_scaled_risk_multiplier_interpolates_linearly() -> None:
+    print("\nTest: confidence-scaled sizing interpolates between floor and cap")
+    mid = confidence_scaled_risk_multiplier(75)
+    _assert(abs(mid - 1.0) < 1e-9, "confidence 75 (midpoint) is exactly the neutral 1.0x", str(mid))
+    high = confidence_scaled_risk_multiplier(90)
+    _assert(0.75 < mid < high < 1.25, "monotonically increasing between floor and cap", f"mid={mid} high={high}")
 
 
 def test_oldest_automate_position_ignores_user_trades() -> None:
@@ -187,6 +209,9 @@ def run_all() -> None:
     test_rank_orders_by_confidence_descending()
     test_rank_tiebreaks_by_predicted_return_pct()
     test_rank_excludes_needs_human_review()
+    test_confidence_scaled_risk_multiplier_floor_at_low_confidence()
+    test_confidence_scaled_risk_multiplier_caps_at_high_confidence()
+    test_confidence_scaled_risk_multiplier_interpolates_linearly()
     test_oldest_automate_position_ignores_user_trades()
     test_oldest_automate_position_none_when_all_user_owned()
     test_count_automate_positions()

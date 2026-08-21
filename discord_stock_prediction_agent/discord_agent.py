@@ -47,7 +47,12 @@ from .pending_market_orders import (
     queue_summary as market_order_queue_summary,
     remove_queued_market_order,
 )
-from .automate_agent import AUTOMATE_AGENT_TAG, BoomCandidate, plan_automate_trades
+from .automate_agent import (
+    AUTOMATE_AGENT_TAG,
+    BoomCandidate,
+    confidence_scaled_risk_multiplier,
+    plan_automate_trades,
+)
 from .prediction_bridge import run_project_prediction
 from .protection_policy import build_protection_levels, evaluate_protection
 from .runtime_lock import acquire_runtime_lock
@@ -5906,8 +5911,13 @@ async def _build_automate_agent_text() -> str:
                 # not a hardcoded dollar figure, so sizing scales with the
                 # account and automatically shrinks after a drawdown. Falls
                 # back to the fixed notional only if equity wasn't available.
+                # On top of that, tilt the size (+/-25%) by the candidate's
+                # own confidence score, so a 95-confidence pick and a
+                # barely-cleared-the-bar pick don't get identical risk.
+                picked = candidates_by_symbol.get(symbol.upper())
+                size_multiplier = confidence_scaled_risk_multiplier(picked.confidence) if picked is not None else 1.0
                 risk_budget = (
-                    equity * config.automate_agent_risk_pct_per_trade / 100.0
+                    equity * config.automate_agent_risk_pct_per_trade / 100.0 * size_multiplier
                     if equity > 0
                     else config.automate_agent_notional_per_trade
                 )
@@ -5926,9 +5936,9 @@ async def _build_automate_agent_text() -> str:
                         AUTOMATE_AGENT_TAG, True,
                     )
                     bought.append(symbol)
-                    picked = candidates_by_symbol.get(symbol.upper())
                     conviction = (
-                        f" [confidence {picked.confidence:.0f}, predicted return {picked.predicted_return_pct:+.2f}%]"
+                        f" [confidence {picked.confidence:.0f}, predicted return {picked.predicted_return_pct:+.2f}%, "
+                        f"size x{size_multiplier:.2f}]"
                         if picked is not None
                         else ""
                     )
