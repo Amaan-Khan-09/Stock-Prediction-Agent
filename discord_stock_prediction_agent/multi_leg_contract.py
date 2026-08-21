@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from .options_symbol import reduce_ratios_by_gcd
+from .options_symbol import default_expiry_date, reduce_ratios_by_gcd
 
 
 ACTION_MAP = {
@@ -33,8 +33,13 @@ _DATE_RE = re.compile(r"\b(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\b")
 _SYMBOL_IGNORE = {
     "CALL", "CALLS", "PUT", "PUTS", "C", "P", "CE", "PE", "FOR", "MAX",
     "OPEN", "CLOSE", "SHORT", "LONG", "SAME", "EXPIRY", "SPREAD", "IRON",
-    "CONDOR", "CONDORS", "BUTTERFLY", "ROLL", "FROM", "TO", "ONLY", "THE",
+    "CONDOR", "CONDORS", "BUTTERFLY", "FLY", "FLIES", "ROLL", "FROM", "TO", "ONLY", "THE",
 }
+_FLY_SHORTHAND_RE = re.compile(
+    r"\b(\d{2,6})(C|P)?\s*/\s*(\d{1,6})(C|P)?\s*/\s*(\d{1,6})(C|P)?\b",
+    re.IGNORECASE,
+)
+_FLY_KEYWORD_RE = re.compile(r"\bFLYS?\b|\bFLIES\b|\bBUTTERFLY\b", re.IGNORECASE)
 
 
 def _number(value: str) -> int | float:
@@ -151,6 +156,68 @@ def _compact_iron_butterfly(text: str) -> dict[str, Any]:
         **_price_fields(text),
     }
     return contract
+
+
+def _expand_shorthand_strike(full: str, abbreviated: str) -> str:
+    """Trading-room shorthand drops the shared leading digits on the later
+    legs of a compact strike list (e.g. "7725/20/15" means 7725/7720/7715).
+    Only expands when the token is actually shorter -- an already-full
+    strike (e.g. "7550" in "7600/7550/7500") is used as-is.
+    """
+    if len(abbreviated) >= len(full):
+        return abbreviated
+    return full[: len(full) - len(abbreviated)] + abbreviated
+
+
+def _compact_fly_legs(text: str, root: str) -> list[dict[str, Any]]:
+    """Parse the common retail-room "FLY" shorthand for a plain (non-iron)
+    butterfly: three slash-separated strikes, same option type throughout,
+    where only one token typically carries the C/P side letter and later
+    strikes are often abbreviated to their trailing digits (see
+    _expand_shorthand_strike). _regular_legs() can't handle this -- it
+    requires each leg to independently look like "<strike><side>", but
+    only the last (or outer) tokens in "7725/20/15P" or "7780C/7790/7800C"
+    do.
+
+    Standard long-butterfly construction: the outer two strikes are the
+    wings (ratio 1), the middle strike is the body (ratio 2), all bought
+    to open together unless the message explicitly says this was sold to
+    open. Returns [] rather than guessing wrong when the side letter is
+    missing/ambiguous or the FLY/BUTTERFLY keyword isn't actually present
+    -- a bare N/N/N (e.g. part of a date) must never be mistaken for this.
+    """
+    if not _FLY_KEYWORD_RE.search(text):
+        return []
+    match = _FLY_SHORTHAND_RE.search(text)
+    if not match:
+        return []
+    raw_strikes = [match.group(1), match.group(3), match.group(5)]
+    side_tokens = [match.group(2), match.group(4), match.group(6)]
+    sides = {token.upper() for token in side_tokens if token}
+    if len(sides) != 1:
+        return []
+    side = "PUT" if next(iter(sides)).startswith("P") else "CALL"
+    full = raw_strikes[0]
+    try:
+        strikes = [float(full)] + [
+            float(_expand_shorthand_strike(full, token)) for token in raw_strikes[1:]
+        ]
+    except ValueError:
+        return []
+    if len(set(strikes)) != 3:
+        return []
+    sold_to_open = bool(re.search(r"\bSOLD\b|\bSELL\b|\bSTO\b", text, re.IGNORECASE)) and not bool(
+        re.search(r"\bBOUGHT\b|\bBUY\b|\bBTO\b|\bADD(?:ING|ED)?\b", text, re.IGNORECASE)
+    )
+    wing_action = "SELL_TO_OPEN" if sold_to_open else "BUY_TO_OPEN"
+    body_action = "BUY_TO_OPEN" if sold_to_open else "SELL_TO_OPEN"
+    expiry = default_expiry_date("0dte").strftime("%m/%d/%Y")
+    root_upper = (root or "").upper()
+    return [
+        {"action": wing_action, "option_type": side, "strike": _number(str(strikes[0])), "expiration": expiry, "ratio": 1, "_root": root_upper},
+        {"action": body_action, "option_type": side, "strike": _number(str(strikes[1])), "expiration": expiry, "ratio": 2, "_root": root_upper},
+        {"action": wing_action, "option_type": side, "strike": _number(str(strikes[2])), "expiration": expiry, "ratio": 1, "_root": root_upper},
+    ]
 
 
 def _price_fields(text: str) -> dict[str, Any]:
@@ -375,9 +442,16 @@ def build_multi_leg_contract(text: str, option: object = None) -> dict[str, Any]
     complex_contract = _complex_contract(raw)
     if complex_contract:
         return complex_contract
-    root = _root_from_text(raw)
+    # _root_from_text() needs a root word directly adjacent to a strike+side
+    # match; the compact FLY shorthand's root (if any) usually isn't
+    # adjacent to the one token that carries a side letter, so fall back to
+    # the root options_parser.py's own (more thorough) extractor already
+    # resolved on the caller's ParsedOptionSignal.
+    root = _root_from_text(raw) or str(getattr(option, "root", "") or "").upper()
     stock_leg = _stock_leg(raw)
     legs = _regular_legs(raw, root)
+    if len(legs) < 2 and not stock_leg:
+        legs = _compact_fly_legs(raw, root) or legs
     if len(legs) < 2 and not stock_leg:
         return {}
     if not root or any(not leg.get("_root") for leg in legs):

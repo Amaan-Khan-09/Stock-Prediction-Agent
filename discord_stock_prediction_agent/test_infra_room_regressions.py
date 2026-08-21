@@ -26,6 +26,19 @@ and surfaced several real bugs, fixed alongside this file:
      resolve through the symbol cache to an unrelated real equity ticker
      (SPX -> SPXC, "SPX Technologies") instead of correctly falling
      through to NO_TRADE.
+  6. "FLY" -- the near-universal retail shorthand for "butterfly" -- was
+     never recognized anywhere, so "Put FLY"/"Calls FLY" style messages
+     with no real strike misread the lotto fill price as the strike
+     (".50" -> strike $50), and compact multi-strike shorthand like
+     "7725/20/15P FLY" (meaning 7725/7720/7715) collapsed to a single
+     wrong-strike leg instead of a proper 3-leg butterfly, silently
+     dropping the defined-risk structure entirely. Fixed by recognizing
+     FLY as a butterfly-structure keyword (gated on an explicit side
+     reference so bare references like "Holding FLY" stay NO_TRADE) and
+     adding a compact-shorthand leg expander in multi_leg_contract.py.
+  7. "@here"/"@everyone"/"@channel" mention tokens survived normalization
+     and could leak through the root-token scan as a literal (nonexistent)
+     guessed ticker root.
 
 Run (from the project root):
     venv\\Scripts\\python.exe -m discord_stock_prediction_agent.test_infra_room_regressions
@@ -236,6 +249,74 @@ def test_commentary_words_do_not_leak_as_equity_tickers() -> None:
         _assert(kind == "NO_TRADE", f"{text!r} classifies as NO_TRADE", f"got {kind}")
 
 
+def test_fly_shorthand_expands_to_correct_butterfly_legs() -> None:
+    print("\nTest: compact 'FLY' shorthand strikes expand to a correct 3-leg butterfly")
+    cases = [
+        # (text, expected [strike, ratio, action] triples in leg order)
+        (
+            "SPX : Bought SPX 7600/7550/7500P FLY around 1.80",
+            [(7600.0, 1, "open_long"), (7550.0, 2, "open_short"), (7500.0, 1, "open_long")],
+        ),
+        (
+            "SPX : Bought SPX 7725/20/15P FLY at .80",  # abbreviated middle/last strikes
+            [(7725.0, 1, "open_long"), (7720.0, 2, "open_short"), (7715.0, 1, "open_long")],
+        ),
+        (
+            "SPX : Bought SPX 7780C/7790/7800C FLY Lotto at .50",  # side letters on outer legs only
+            [(7780.0, 1, "open_long"), (7790.0, 2, "open_short"), (7800.0, 1, "open_long")],
+        ),
+    ]
+    for text, expected in cases:
+        routed = classify_and_parse(text)
+        _assert(routed.kind == "OPTION", f"{text!r} routes to OPTION", str(routed.kind))
+        option = routed.option
+        _assert(option is not None and option.valid, f"{text!r} parses as valid", str(routed.reason))
+        _assert(option.is_multi_leg and len(option.legs) == 3, f"{text!r} builds exactly 3 legs", str(option.legs))
+        actual = [(leg.strike, leg.ratio_qty, leg.order_action) for leg in option.legs]
+        _assert(actual == expected, f"{text!r} legs match expected wing/body/wing", f"got {actual}")
+
+
+def test_fly_with_no_strikes_rejected_not_misparsed() -> None:
+    print("\nTest: a FLY mention with no real strikes is rejected, not misread as one with the lotto price as strike")
+    cases = [
+        "SPX : Bought Put FLY Lotto at .50",
+        "SPX : Calls FLY around 1",
+        "SPX : EOD Call FLY Lotto at .70",
+        "SPX : EOD Put FLY Lotto around 1.10.  No stoploss",
+    ]
+    for text in cases:
+        routed = classify_and_parse(text)
+        option = routed.option
+        _assert(
+            option is not None and not option.valid,
+            f"{text!r} is recognized as an incomplete options signal, not silently accepted",
+            str(routed),
+        )
+        _assert(
+            option is None or option.strike != 50.0 and option.strike != 1.0,
+            f"{text!r} never mistakes the lotto price for a strike",
+            str(option.strike if option else None),
+        )
+
+
+def test_bare_fly_reference_without_side_stays_no_trade() -> None:
+    print("\nTest: a bare 'FLY' reference to an existing position (no side word) stays NO_TRADE")
+    cases = [
+        "Sold last 2 runners at 7.80 Holding FLY",
+        "SPX : Adding cheap FLY",
+    ]
+    for text in cases:
+        kind = classify_and_parse(text).kind
+        _assert(kind == "NO_TRADE", f"{text!r} classifies as NO_TRADE", f"got {kind}")
+
+
+def test_here_mention_does_not_leak_as_root() -> None:
+    print("\nTest: '@here' never resolves to a literal (nonexistent) ticker root")
+    routed = classify_and_parse("@here Calls up 40% incase want to take profit")
+    root = routed.option.root if routed.option else ""
+    _assert(root != "HERE", "'@here' is not guessed as the options root", root)
+
+
 def run_all() -> None:
     print("=" * 60)
     print("TRADING-ALERT-ROOM REGRESSION TEST HARNESS")
@@ -257,6 +338,10 @@ def run_all() -> None:
     test_bare_spread_commentary_single_leg_not_forced_multi_leg()
     test_genuine_two_leg_spread_still_builds_multi_leg()
     test_commentary_words_do_not_leak_as_equity_tickers()
+    test_fly_shorthand_expands_to_correct_butterfly_legs()
+    test_fly_with_no_strikes_rejected_not_misparsed()
+    test_bare_fly_reference_without_side_stays_no_trade()
+    test_here_mention_does_not_leak_as_root()
 
     print("\n" + "=" * 60)
     print(f"Results: {PASS} passed, {FAIL} failed")

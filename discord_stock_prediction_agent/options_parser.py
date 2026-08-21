@@ -154,17 +154,29 @@ _ROOT_IGNORE_WORDS = {
     "WE", "NEED", "OPTION", "OPTIONS", "STRIKE", "RATE", "EXPIRY", "EXPIRES",
     "EXPIRATION", "DATE", "SAME", "DAY", "PREMIUM", "PRICE", "LIMIT", "MARKET",
     "GRABBED", "GRAB", "STARTER", "OPENING", "ADD", "ADDING", "SCALE", "SCALING",
-    "INTO", "TO", "CLOSE", "OPEN", "DEBIT", "CREDIT", "CASH", "SECURED", "COVERED",
+    "INTO", "TO", "FROM", "CLOSE", "OPEN", "DEBIT", "CREDIT", "CASH", "SECURED", "COVERED",
     "COLLAR", "ROLL", "ROLLING", "TRIM", "POSITION", "MANAGEMENT", "SIGNALS",
     "EARNINGS", "PROFITS", "RUNNERS", "VWAP", "DELTA", "ON", "OF", "ABOVE", "BELOW",
     "TP", "PT", "TGT", "TARGET", "TARGETS", "SL", "BY", "RR",
+    "FLY", "FLIES", "BUTTERFLY",
+    # Discord @mention tokens (@here/@everyone/@channel) survive normalization
+    # (it keeps "@" as an allowed character) and the token scan below then
+    # sees the bare word after it -- without this, "@here Sold 50% ..."
+    # resolves the option's root to the literal (nonexistent) ticker "HERE".
+    "HERE", "EVERYONE", "CHANNEL",
     # These are ordinary trading-signal syntax words that also happen to
     # resolve as real symbols/company names in the live Alpaca directory
     # (ALL=Allstate, GO=Grocery Outlet, HOLD, MAX, MOVE, NOW=ServiceNow,
-    # OR=Overstock/Oregon-linked names, ...). Without excluding them here,
-    # a phrase like "if target not hit" or "hold this one" can resolve the
+    # OR=Overstock/Oregon-linked names, SO=Southern Company, ...). Without
+    # excluding them here, a phrase like "if target not hit" or "so left
+    # with approx 25% position" (real corpus wording) can resolve the
     # option's underlying to the wrong real company.
-    "ALL", "GO", "HOLD", "MAX", "MOVE", "NOW", "OR", "BLOCK",
+    "ALL", "GO", "HOLD", "MAX", "MOVE", "NOW", "OR", "BLOCK", "SO",
+    # UP=Wheels Up Experience -- "rolled UP the strike"/"moved UP" are
+    # ordinary roll/management phrasing, not a ticker mention. DOWN isn't a
+    # real ticker today but is excluded defensively for the same reason
+    # (paired directional word, same phrasing pattern).
+    "UP", "DOWN",
     # Bare "C"/"P" are almost always the leftover CALL/PUT side-letter from a
     # strike like "7770C" once the strike digits are stripped out by the
     # token scan below, not a genuine root mention -- but both are also real
@@ -483,6 +495,24 @@ def _extract_structure(text: str) -> tuple[Optional[str], bool]:
                 and structure not in {"covered_call", "protective_put"}
             )
             return structure, option_only_multi_leg
+    # "FLY" is the near-universal retail shorthand for "butterfly" (e.g.
+    # "Put FLY", "7725/20/15P FLY") but was never in _STRUCTURE_KEYWORDS,
+    # so real corpus messages using it fell through to weaker single-leg
+    # heuristics that misread the fill price as the strike. Checked as its
+    # own word-boundary pattern rather than added to _STRUCTURE_KEYWORDS'
+    # plain substring scan, since "fly" is also a substring of real tickers
+    # (e.g. FLYW) that must not be forced into multi-leg validation.
+    #
+    # Also requires an explicit side reference (a standalone CALL/PUT word,
+    # or a strike glued to a C/P letter like the compact "7725/20/15P"
+    # shorthand) -- a bare mention like "Holding FLY" or "Covered most FLY"
+    # is a reference to an *existing* position, not an attempt to specify a
+    # new one, and must stay NO_TRADE/commentary rather than get force-
+    # classified as an incomplete options signal.
+    if re.search(r"\bFLYS?\b|\bFLIES\b", text, re.IGNORECASE) and (
+        _SIDE_ONLY_RE.search(text) or _STRIKE_SIDE_RE.search(text)
+    ):
+        return "butterfly_spread", True
     upper = text.upper()
     option_leg_count = len(_MULTI_LEG_RE.findall(text))
     if option_leg_count >= 2:
