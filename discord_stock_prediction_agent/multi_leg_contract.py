@@ -194,9 +194,19 @@ def _compact_fly_legs(text: str, root: str) -> list[dict[str, Any]]:
     raw_strikes = [match.group(1), match.group(3), match.group(5)]
     side_tokens = [match.group(2), match.group(4), match.group(6)]
     sides = {token.upper() for token in side_tokens if token}
-    if len(sides) != 1:
+    if len(sides) > 1:
         return []
-    side = "PUT" if next(iter(sides)).startswith("P") else "CALL"
+    if sides:
+        side = "PUT" if next(iter(sides)).startswith("P") else "CALL"
+    else:
+        # None of the three compact strikes carry their own C/P letter --
+        # e.g. "5800/5850/5900 calls", where the side is a separate trailing
+        # word instead of glued to a strike. Fall back to that before
+        # giving up, rather than only ever handling the glued-letter form.
+        trailing_side = re.search(r"\bCALLS?\b|\bPUTS?\b", text[match.end():match.end() + 20], re.IGNORECASE)
+        if not trailing_side:
+            return []
+        side = "PUT" if trailing_side.group(0).upper().startswith("P") else "CALL"
     full = raw_strikes[0]
     try:
         strikes = [float(full)] + [

@@ -109,6 +109,8 @@ _STRUCTURE_KEYWORDS = [
     ("ratio backspread", "ratio_backspread"),
     ("ratio spread", "ratio_spread"),
     ("butterfly spread", "butterfly_spread"),
+    ("broken wing butterfly", "butterfly_spread"),
+    ("butterfly", "butterfly_spread"),
     ("protective put", "protective_put"),
     ("downside protection", "protective_put"),
     ("cash secured put", "cash_secured_put"),
@@ -144,7 +146,7 @@ _NEW_ORDER_VERBS = {
 }
 _OPEN_LONG_TOKENS = {"BUY", "BTO", "LONG", "PURCHASE", "GRABBED", "GRAB", "STARTER", "OPENING", "OPENED", "ENTERED", "ADD", "ADDING", "SCALE", "SCALING"}
 _OPEN_SHORT_TOKENS = {"STO"}
-_CLOSE_LONG_TOKENS = {"STC", "TRIM", "SOLD", "CLOSED", "EXITED"}
+_CLOSE_LONG_TOKENS = {"STC", "TRIM", "TRIMMING", "SOLD", "SELLING", "CLOSED", "CLOSING", "EXITED", "EXITING"}
 _CLOSE_SHORT_TOKENS = {"BTC"}
 _MANAGEMENT_RE = re.compile(
     r"\b(?:MOVE\s+STOP|BREAKEVEN|TAKE\s+\d+%|CLOSE\s+REMAINING|HOLD\s+OVERNIGHT|"
@@ -594,7 +596,19 @@ def _extract_option_legs(text: str, default_root: str) -> tuple[ParsedOptionLeg,
             action = _extract_order_action(text)
         if action != "unknown":
             inherited_action = action
-        root = str(root_token or inherited_root).upper()
+        candidate_root = str(root_token or "").upper()
+        # A calendar/diagonal leg like "sell Nov 140C" or a roll like
+        # "240C to 250C" has the multi-leg regex's optional root-token slot
+        # capture the connector word ("TO") or month abbreviation ("NOV")
+        # instead of a real ticker, since both are 1-6 all-caps letters just
+        # like a symbol. Without this check the leg gets a bogus, distinct
+        # "root" instead of inheriting the signal's actual (shared) symbol,
+        # and the whole strategy is then wrongly rejected as spanning
+        # multiple underlyings.
+        if not candidate_root or candidate_root in _ROOT_IGNORE_WORDS or candidate_root.lower()[:3] in _MONTH_NAMES:
+            root = inherited_root
+        else:
+            root = candidate_root
         root = SYMBOL_ALIASES.get(root, root)
         if root:
             inherited_root = root
@@ -689,6 +703,28 @@ def _extract_management_fields(text: str) -> dict:
     )
     trail = re.search(r"\bTRAIL(?:ING)?\s+STOP\s*(\d+(?:\.\d+)?)\s*%", text, re.IGNORECASE)
     close_pct = re.search(r"\b(?:STC|TRIM|SELL|TAKE)\s+(\d+(?:\.\d+)?)\s*%", text, re.IGNORECASE)
+    close_pct_value = float(close_pct.group(1)) if close_pct else None
+    if close_pct_value is None:
+        # Real partial-exit phrasing is often a word, not a numeric percent:
+        # "trimming a third", "scaling out of half", "sold another half".
+        # Word-fraction wasn't recognized at all before this -- close_percent
+        # stayed None for very common trim/scale-out language.
+        fraction_word = re.search(
+            r"\b(?:STC|TRIM(?:MING)?|SELL(?:ING)?|SOLD|TAKE|SCAL(?:E|ING)\s+OUT(?:\s+OF)?|CLOS(?:E|ING)(?:\s+OUT)?)\b"
+            r"(?:\s+(?:OFF|OUT|ANOTHER|MY|THE|A|ONE))*\s*(HALF|THIRD|QUARTER)\b",
+            text,
+            re.IGNORECASE,
+        )
+        if fraction_word:
+            close_pct_value = {"HALF": 50.0, "THIRD": 33.34, "QUARTER": 25.0}[fraction_word.group(1).upper()]
+        else:
+            # "STC 2 of 5", "sold 2 of 5" -- a real alert-room convention for
+            # a fractional partial exit expressed as a small ratio.
+            fraction_ratio = re.search(r"\b(\d{1,3})\s+OF\s+(\d{1,3})\b", text, re.IGNORECASE)
+            if fraction_ratio:
+                numerator, denominator = float(fraction_ratio.group(1)), float(fraction_ratio.group(2))
+                if denominator > 0:
+                    close_pct_value = round(numerator / denominator * 100, 2)
     add = re.search(
         r"\bADD\s+(\d+(?:\.\d+)?)\s+MORE\s+IF\s+PREMIUM\s+(?:FALLS|DROPS)\s+TO\s+\$?(\d+(?:\.\d+)?)",
         text,
@@ -756,7 +792,7 @@ def _extract_management_fields(text: str) -> dict:
     return {
         "target_prices": targets,
         "trailing_stop_pct": float(trail.group(1)) if trail else None,
-        "close_percent": float(close_pct.group(1)) if close_pct else None,
+        "close_percent": close_pct_value,
         "add_quantity": (
             float(add.group(1))
             if add else
