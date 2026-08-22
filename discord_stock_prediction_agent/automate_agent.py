@@ -32,7 +32,9 @@ class BoomCandidate:
     needs_human_review: bool = False  # the model's OWN flag that this call is uncertain
 
 
-def rank_boom_candidates(candidates: list[BoomCandidate]) -> list[BoomCandidate]:
+def rank_boom_candidates(
+    candidates: list[BoomCandidate], min_confidence: float = 0.0
+) -> list[BoomCandidate]:
     """Keeps only BUY-decision candidates that the prediction engine itself
     didn't flag as needing human review, strongest conviction first.
 
@@ -43,10 +45,18 @@ def rank_boom_candidates(candidates: list[BoomCandidate]) -> list[BoomCandidate]
     to ignore it. Excluding those candidates keeps this consistent with
     the rest of the system's "when the model says it's unsure, a human (or
     here, extra caution) is required" design.
+
+    min_confidence additionally drops BUY calls the model itself didn't flag
+    as uncertain, but that still cleared the BUY bar by a thin margin --
+    without this, a 51-confidence BUY and a 95-confidence BUY were treated
+    identically (aside from sizing/ranking order), which is a lower quality
+    bar than the rest of this function's "extra caution" intent implies.
     """
     buys = [
         c for c in candidates
-        if c.decision.upper() == "BUY" and not c.needs_human_review
+        if c.decision.upper() == "BUY"
+        and not c.needs_human_review
+        and c.confidence >= min_confidence
     ]
     return sorted(buys, key=lambda c: (c.confidence, c.predicted_return_pct), reverse=True)
 
@@ -107,6 +117,7 @@ def plan_automate_trades(
     open_positions: list[dict],
     min_positions: int,
     max_positions: int,
+    min_confidence: float = 0.0,
 ) -> TradePlan:
     """Decides what to buy and what to evict first, given ranked candidates
     and the currently open automate_agent-tagged positions.
@@ -116,7 +127,7 @@ def plan_automate_trades(
     Symbols already held (by automate_agent) are skipped -- no point
     "buying" something already open.
     """
-    ranked = rank_boom_candidates(candidates)
+    ranked = rank_boom_candidates(candidates, min_confidence)
     held_symbols = {
         str(p.get("symbol") or "").upper()
         for p in open_positions

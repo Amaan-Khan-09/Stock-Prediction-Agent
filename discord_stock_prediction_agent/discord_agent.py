@@ -368,7 +368,7 @@ async def _trade_guard(
             "quantity_limit",
         )
         return False
-    if count_today_order_events() >= config.max_daily_paper_trades:
+    if config.max_daily_paper_trades > 0 and count_today_order_events() >= config.max_daily_paper_trades:
         await _block_trade(
             message,
             symbol,
@@ -3762,6 +3762,8 @@ async def on_ready() -> None:
         signal_queue_worker.start()
     if not stop_loss_monitor.is_running():
         stop_loss_monitor.start()
+    if config.automate_agent_autoscan_enabled and not automate_agent_autoscan.is_running():
+        automate_agent_autoscan.start()
     if config.whatsapp_webhook_enabled:
         try:
             start_whatsapp_webhook_server()
@@ -3946,6 +3948,9 @@ async def stop_loss_monitor() -> None:
         if held_qty <= 0:
             await asyncio.to_thread(remove_position, symbol)
             continue
+        if current_price <= 0:
+            latest_price, _ = await asyncio.to_thread(alpaca.get_latest_price, symbol)
+            current_price = _as_float(latest_price)
         trigger = evaluate_protection(current_price, levels, short_position=short_position)
         eod_forced = False
         if not trigger.triggered:
@@ -4350,17 +4355,25 @@ async def _process_multi_leg_exit_monitor(market_open: bool) -> None:
             continue
         current_net_signed = 0.0
         complete_quote = True
+        stalled_leg = ""
         for leg in position.get("legs") or []:
             symbol = str(leg.get("symbol") or "").upper()
             price, _ = await asyncio.to_thread(alpaca.get_latest_option_price, symbol)
             observed = _as_float(price)
             if observed <= 0:
                 complete_quote = False
+                stalled_leg = symbol
                 break
             ratio = max(1, int(_as_float(leg.get("ratio_qty"), 1)))
             sign = 1.0 if str(leg.get("side_order") or "").lower() == "buy" else -1.0
             current_net_signed += sign * observed * ratio
         if not complete_quote or abs(current_net_signed) <= 0:
+            if not complete_quote:
+                logging.getLogger("discord_stock_prediction_agent").warning(
+                    "multi-leg protection skipped for %s: no usable quote for leg %s "
+                    "this cycle (position/market-data snapshot both unavailable).",
+                    strategy_id, stalled_leg,
+                )
             continue
         current_net = abs(current_net_signed)
         short_strategy = str(position.get("price_effect") or "debit").lower() == "credit"
@@ -5866,6 +5879,7 @@ async def _build_automate_agent_text() -> str:
             open_positions,
             config.automate_agent_min_positions,
             config.automate_agent_max_positions,
+            config.automate_agent_min_confidence,
         )
 
         if not plan.to_buy:
@@ -5975,6 +5989,40 @@ async def automate_agent(ctx: commands.Context) -> None:
         )
         return
     await _send_context_output(ctx, await _build_automate_agent_text())
+
+
+@tasks.loop(seconds=max(60, config.automate_agent_autoscan_interval_seconds))
+async def automate_agent_autoscan() -> None:
+    """Optional recurring trigger for the same scan-and-trade cycle as
+    !automate_agent, so the feature is actually automated instead of only
+    running when a human re-types the command. Every existing safety check
+    inside _build_automate_agent_text (agent mode ON, market open, the
+    per-cycle cooldown, the daily-loss circuit breaker) still applies
+    unchanged -- this loop is just an alternate trigger, not a bypass.
+    """
+    if not config.automate_agent_autoscan_enabled:
+        return
+    try:
+        await _build_automate_agent_text()
+    except Exception:
+        logging.getLogger("discord_stock_prediction_agent").exception(
+            "automate_agent autoscan cycle failed; will retry next interval."
+        )
+
+
+@automate_agent_autoscan.before_loop
+async def before_automate_agent_autoscan() -> None:
+    await bot.wait_until_ready()
+
+
+@automate_agent_autoscan.error
+async def automate_agent_autoscan_error(error: BaseException) -> None:
+    logging.getLogger("discord_stock_prediction_agent").error(
+        "automate_agent autoscan task failed and will be restarted.",
+        exc_info=(type(error), error, error.__traceback__),
+    )
+    await asyncio.sleep(5)
+    automate_agent_autoscan.restart()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

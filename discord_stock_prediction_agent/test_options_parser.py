@@ -208,6 +208,42 @@ def test_option_stop_target_parse() -> None:
     _assert(opt is not None and opt.target_price == 5.80, "TP == 5.80", f"got {getattr(opt, 'target_price', None)}")
 
 
+def test_trailing_stop_percent_is_not_misread_as_an_absolute_stop_loss() -> None:
+    print("\nTest: 'trailing stop N%' / 'trail stop N%' sets trailing_stop_pct only")
+    for text in (
+        "BTO AAPL 190C 9/19 @2.50 trailing stop 20%",
+        "BTO NFLX 1450C 10/17 @18.40 TRAIL STOP 15%",
+    ):
+        opt = classify_and_parse(text).option
+        _assert(opt is not None and opt.valid, f"{text!r} parses as a valid option")
+        _assert(
+            opt is not None and opt.stop_loss is None,
+            f"{text!r}: stop_loss stays None, not the trailing percentage misread as a dollar price",
+            f"got stop_loss={getattr(opt, 'stop_loss', None)}",
+        )
+        _assert(
+            opt is not None and opt.trailing_stop_pct is not None,
+            f"{text!r}: trailing_stop_pct is still captured correctly",
+            f"got {getattr(opt, 'trailing_stop_pct', None)}",
+        )
+
+
+def test_numbered_pt_targets_alongside_tp_targets() -> None:
+    print("\nTest: PT1/PT2 numbered targets are recognized like TP1/TP2")
+    opt = classify_and_parse("BTO AAPL 190C 9/19 @2.50 PT1: 3.50 PT2: 4.50 SL: 1.80").option
+    _assert(opt is not None and opt.valid, "parses as a valid option")
+    _assert(
+        opt is not None and opt.target_prices == (3.5, 4.5),
+        "PT1/PT2 populate target_prices in order",
+        f"got {getattr(opt, 'target_prices', None)}",
+    )
+    _assert(
+        opt is not None and opt.stop_loss == 1.8,
+        "SL still parses correctly alongside PT-style targets",
+        f"got {getattr(opt, 'stop_loss', None)}",
+    )
+
+
 def test_multi_leg_no_strike() -> None:
     print("\nTest: multi-leg structure without a concrete strike/side is tracked-only")
     text = "Sell an iron condor on SPY"
@@ -441,6 +477,8 @@ def run_all() -> None:
     test_real_world_discord_option_variants()
     test_btc_stc_shorthand()
     test_option_stop_target_parse()
+    test_trailing_stop_percent_is_not_misread_as_an_absolute_stop_loss()
+    test_numbered_pt_targets_alongside_tp_targets()
     test_multi_leg_no_strike()
     test_executable_multi_leg_signals()
     test_no_trade_commentary()

@@ -65,7 +65,13 @@ def run_all() -> None:
 
     assert [len(parsed[i - 1].legs) for i in (1, 2, 3, 4, 5, 6)] == [2, 2, 2, 2, 4, 4]
     assert [parsed[i - 1].quantity for i in (1, 2, 3, 4, 5, 6)] == [5, 3, 2, 4, 10, 5]
-    assert parsed[6].contains_equity_leg and not parsed[6].is_multi_leg
+    # A stock+option combo (e.g. a covered call) is routed like a multi-leg
+    # signal -- Alpaca can't submit equity+option as one atomic order, so it
+    # needs the same "combo" handling. test_options_parser.py's own covered
+    # call combo case asserts is_multi_leg == True; this pre-existing
+    # assertion had it backwards and (since this file has no pytest-collected
+    # test_* function) was never actually run to catch the mismatch.
+    assert parsed[6].contains_equity_leg and parsed[6].is_multi_leg
     assert parsed[7].order_action == "open_short" and parsed[7].quantity == 2
     assert [leg.expiry_date for leg in parsed[8].legs] == ["2026-09-19", "2026-10-17"]
     assert [leg.order_action for leg in parsed[8].legs] == ["close_long", "open_long"]

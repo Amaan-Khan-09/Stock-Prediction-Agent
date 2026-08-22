@@ -87,7 +87,10 @@ class AgentConfig:
     stop_monitor_seconds: int = _int_env("PROTECTION_MONITOR_SECONDS", 15)
     max_equity_qty: float = _float_env("MAX_EQUITY_QTY", 1_000_000.0)
     max_option_qty: float = _float_env("MAX_OPTION_QTY", 1_000.0)
-    max_daily_paper_trades: int = _int_env("MAX_DAILY_PAPER_TRADES", 20)
+    # 0 (the default) means unlimited -- paper trading has no real capital at
+    # risk, so this throttle only exists for whoever explicitly opts into it
+    # via MAX_DAILY_PAPER_TRADES in .env.
+    max_daily_paper_trades: int = _int_env("MAX_DAILY_PAPER_TRADES", 0)
     allow_duplicate_paper_orders: bool = _bool_env("ALLOW_DUPLICATE_PAPER_ORDERS", True)
     per_symbol_cooldown_minutes: int = _int_env("PER_SYMBOL_COOLDOWN_MINUTES", 10)
     debug_output_enabled: bool = _bool_env("DEBUG_OUTPUT_ENABLED", False)
@@ -134,6 +137,19 @@ class AgentConfig:
     # rapid re-triggering from burning API calls/rate limits for no benefit,
     # since the market doesn't meaningfully change signal in a few seconds.
     automate_agent_cooldown_seconds: int = _int_env("AUTOMATE_AGENT_COOLDOWN_SECONDS", 60)
+    # A BUY the model itself didn't flag as needing review can still be a
+    # thin, barely-cleared-the-bar call. This drops anything below the
+    # threshold from consideration entirely, on top of the existing
+    # needs_human_review exclusion.
+    automate_agent_min_confidence: float = _float_env("AUTOMATE_AGENT_MIN_CONFIDENCE", 60.0)
+    # Off by default: !automate_agent otherwise only runs when a human types
+    # the command. Turning this on lets it scan-and-trade on its own interval
+    # during market hours, still gated by every existing safety check (agent
+    # mode ON, market open, per-cycle cooldown, daily-loss circuit breaker).
+    automate_agent_autoscan_enabled: bool = _bool_env("AUTOMATE_AGENT_AUTOSCAN_ENABLED", False)
+    automate_agent_autoscan_interval_seconds: int = _int_env(
+        "AUTOMATE_AGENT_AUTOSCAN_INTERVAL_SECONDS", 900
+    )
     automate_agent_watchlist: tuple[str, ...] = tuple(
         s.strip().upper()
         for s in os.getenv(

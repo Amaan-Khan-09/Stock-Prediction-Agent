@@ -42,6 +42,14 @@ _STOP_LOSS_RE = re.compile(
     r"\s*(?:BELOW|UNDER|AT|@|[:=\-])?\s*\$?(\d+(?:\.\d+)?)\b",
     re.IGNORECASE,
 )
+# The bare "STOP" alternative above must not swallow "trailing stop 20%" /
+# "trail stop 15%" -- that's a trailing_stop_pct, not an absolute dollar
+# stop-loss, and the two look deceptively similar once a number follows
+# ("...trailing stop 20%" reads to the regex as "stop [at] 20"). Strip that
+# phrase out before running _STOP_LOSS_RE against the text.
+_TRAILING_STOP_PHRASE_RE = re.compile(
+    r"\bTRAIL(?:ING)?\s+STOP\s*\d+(?:\.\d+)?\s*%?", re.IGNORECASE
+)
 _TARGET_RE = re.compile(
     r"\b(?:TP|PT|TARGETS?|TGT|PROFIT\s+TARGET|TAKE\s+PROFIT|"
     r"BUY\s+BACK(?:\s+AT)?|BTC(?:\s+AT)?)\b"
@@ -671,7 +679,10 @@ def _normalize_leg_ratios(
 def _extract_management_fields(text: str) -> dict:
     targets = tuple(
         float(value) for value in re.findall(
-            r"\b(?:TP|TARGET|TAKE\s+PROFIT)\s*\d*\s*(?:AT|@|[:=\-])?\s*\$?(\d+(?:\.\d+)?)",
+            # PT1/PT2/PT3 is a real, common alert-room convention alongside
+            # TP1/TP2/TP3 -- some rooms use "profit target", others "take
+            # profit" as the words behind the abbreviation.
+            r"\b(?:TP|PT|TARGET|TAKE\s+PROFIT)\s*\d*\s*(?:AT|@|[:=\-])?\s*\$?(\d+(?:\.\d+)?)",
             text,
             re.IGNORECASE,
         )
@@ -903,7 +914,9 @@ def parse_option_signal(text: str) -> ParsedOptionSignal:
     if side is None and delta_target is not None:
         side = _extract_side_only(raw)
     fill_price = _extract_fill_price(raw)
-    stop_loss = _extract_optional_price(_STOP_LOSS_RE, raw)
+    stop_loss = _extract_optional_price(
+        _STOP_LOSS_RE, _TRAILING_STOP_PHRASE_RE.sub(" ", raw)
+    )
     target_price = _extract_optional_price(_TARGET_RE, raw)
     risk_reward = _extract_risk_reward(raw)
     stop_loss, target_price = _derive_missing_exit_from_rr(fill_price, stop_loss, target_price, risk_reward)

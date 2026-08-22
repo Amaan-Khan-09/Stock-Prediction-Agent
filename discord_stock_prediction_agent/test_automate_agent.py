@@ -90,6 +90,30 @@ def test_rank_excludes_needs_human_review() -> None:
     )
 
 
+def test_rank_excludes_below_min_confidence() -> None:
+    print("\nTest: ranking drops BUY candidates below an explicit min_confidence floor")
+    candidates = [
+        BoomCandidate("AAPL", "BUY", confidence=90),
+        BoomCandidate("MSFT", "BUY", confidence=59),
+        BoomCandidate("NVDA", "BUY", confidence=60),
+    ]
+    ranked = rank_boom_candidates(candidates, min_confidence=60)
+    _assert(
+        [c.symbol for c in ranked] == ["AAPL", "NVDA"],
+        "MSFT (below 60) excluded, NVDA (exactly at 60) kept",
+        str(ranked),
+    )
+
+
+def test_plan_respects_min_confidence() -> None:
+    print("\nTest: plan_automate_trades threads min_confidence through to ranking")
+    candidates = [BoomCandidate("AAPL", "BUY", confidence=90), BoomCandidate("MSFT", "BUY", confidence=10)]
+    plan = plan_automate_trades(
+        candidates, open_positions=[], min_positions=1, max_positions=5, min_confidence=60
+    )
+    _assert(plan.to_buy == ["AAPL"], "only the >=60-confidence candidate survives", str(plan.to_buy))
+
+
 def test_confidence_scaled_risk_multiplier_floor_at_low_confidence() -> None:
     print("\nTest: confidence-scaled sizing floors out at/below confidence 50")
     _assert(confidence_scaled_risk_multiplier(50) == 0.75, "exactly at the floor threshold")
@@ -209,6 +233,8 @@ def run_all() -> None:
     test_rank_orders_by_confidence_descending()
     test_rank_tiebreaks_by_predicted_return_pct()
     test_rank_excludes_needs_human_review()
+    test_rank_excludes_below_min_confidence()
+    test_plan_respects_min_confidence()
     test_confidence_scaled_risk_multiplier_floor_at_low_confidence()
     test_confidence_scaled_risk_multiplier_caps_at_high_confidence()
     test_confidence_scaled_risk_multiplier_interpolates_linearly()

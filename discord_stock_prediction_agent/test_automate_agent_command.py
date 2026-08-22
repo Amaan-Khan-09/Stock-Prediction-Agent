@@ -150,7 +150,7 @@ def test_daily_loss_circuit_breaker_ignores_a_real_users_losses() -> None:
         assert "circuit breaker" not in text.lower()
         assert len(fake.submissions) == 1, "automate_agent should still trade normally"
 
-    predictions = {discord_agent.config.automate_agent_watchlist[0]: "BUY"}
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
@@ -202,7 +202,7 @@ def test_cooldown_blocks_immediate_re_run() -> None:
         assert "cooling down" in second.lower()
         assert len(fake.submissions) == 1, "no second order placed during cooldown"
 
-    predictions = {discord_agent.config.automate_agent_watchlist[0]: "BUY"}
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
@@ -244,7 +244,10 @@ def test_one_symbol_erroring_during_buy_does_not_abort_the_cycle() -> None:
         assert bad_symbol not in symbols_bought, "the erroring symbol is skipped, not crashing the cycle"
         assert "unexpected error" in text.lower()
 
-    predictions = {discord_agent.config.automate_agent_watchlist[0]: "BUY", discord_agent.config.automate_agent_watchlist[1]: "BUY"}
+    predictions = {
+        discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75},
+        discord_agent.config.automate_agent_watchlist[1]: {"decision": "BUY", "confidence_score": 75},
+    }
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
@@ -292,7 +295,7 @@ def test_open_market_buys_a_boom_candidate_and_tags_it() -> None:
         # Summary must reach the stock-review channel, not stay silent.
         assert any(symbol in content for _, content in sent)
 
-    predictions = {discord_agent.config.automate_agent_watchlist[0]: "BUY"}
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
@@ -316,7 +319,11 @@ def test_at_cap_evicts_oldest_automate_position_before_buying() -> None:
         assert watchlist[0] not in symbols_after, "the oldest automate position was evicted"
         assert len(symbols_after) == max_positions, "still at, not above, the cap"
 
-    predictions = {discord_agent.config.automate_agent_watchlist[discord_agent.config.automate_agent_max_positions]: "BUY"}
+    predictions = {
+        discord_agent.config.automate_agent_watchlist[discord_agent.config.automate_agent_max_positions]: {
+            "decision": "BUY", "confidence_score": 75,
+        },
+    }
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
@@ -332,7 +339,8 @@ def test_position_sizing_scales_with_confidence() -> None:
 
         submitted = {o["symbol"]: int(o["qty"]) for o in fake.submissions}
         # risk_pct=2% of 50,000 = 1,000 base budget @ $100/sh = 10 sh baseline.
-        # confidence 95 -> x1.2 multiplier -> 12 sh; confidence 55 -> x0.8 -> 8 sh.
+        # confidence 95 -> x1.2 multiplier -> 12 sh; confidence 60 (the
+        # min-confidence floor itself, so it's still eligible) -> x0.85 -> 8 sh.
         assert submitted[high_conf_symbol] == 12, submitted
         assert submitted[low_conf_symbol] == 8, submitted
         assert submitted[high_conf_symbol] > submitted[low_conf_symbol], (
@@ -341,7 +349,7 @@ def test_position_sizing_scales_with_confidence() -> None:
 
     predictions = {
         discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 95},
-        discord_agent.config.automate_agent_watchlist[1]: {"decision": "BUY", "confidence_score": 55},
+        discord_agent.config.automate_agent_watchlist[1]: {"decision": "BUY", "confidence_score": 60},
     }
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
@@ -364,7 +372,7 @@ def test_needs_human_review_candidate_is_not_bought() -> None:
             "decision": "BUY", "confidence_score": 95, "needs_human_review": True,
         },
         discord_agent.config.automate_agent_watchlist[1]: {
-            "decision": "BUY", "confidence_score": 40, "needs_human_review": False,
+            "decision": "BUY", "confidence_score": 65, "needs_human_review": False,
         },
     }
     asyncio.run(_with_runtime(scenario, predictions=predictions))
@@ -401,8 +409,39 @@ def test_a_failed_symbol_lookup_does_not_abort_the_whole_scan() -> None:
     watchlist = None
     async def _run():
         wl = discord_agent.config.automate_agent_watchlist
-        await _with_runtime(scenario, predictions={wl[1]: "BUY"})
+        await _with_runtime(scenario, predictions={wl[1]: {"decision": "BUY", "confidence_score": 75}})
     asyncio.run(_run())
+
+
+def test_autoscan_task_is_a_noop_when_disabled() -> None:
+    """AUTOMATE_AGENT_AUTOSCAN_ENABLED defaults to False -- the recurring
+    task must not run the scan-and-trade cycle at all when it's off, even
+    if the loop object itself gets ticked."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+        assert discord_agent.config.automate_agent_autoscan_enabled is False
+        await discord_agent.automate_agent_autoscan.coro()
+        assert not fake.submissions, "disabled autoscan must not place any trade"
+        assert not state_store.list_positions()
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_autoscan_task_runs_the_cycle_when_enabled() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+        object.__setattr__(discord_agent.config, "automate_agent_autoscan_enabled", True)
+        try:
+            await discord_agent.automate_agent_autoscan.coro()
+        finally:
+            object.__setattr__(discord_agent.config, "automate_agent_autoscan_enabled", False)
+        assert len(fake.submissions) == 1, "enabled autoscan runs the same cycle as !automate_agent"
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
 if __name__ == "__main__":

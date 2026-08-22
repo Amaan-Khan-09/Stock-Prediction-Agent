@@ -174,6 +174,35 @@ def test_equity_profit_monitor_submits_at_ten_percent() -> None:
     asyncio.run(_with_runtime(scenario))
 
 
+def test_equity_stop_falls_back_to_latest_price_when_position_price_is_stale() -> None:
+    """Alpaca's /v2/positions current_price can read back as 0/missing even
+    while a position is genuinely held (e.g. a momentary data gap). The
+    monitor must retry via get_latest_price instead of silently skipping the
+    check for that cycle, mirroring the fallback the option monitor already
+    has."""
+    async def scenario(fake: ProtectionAlpaca) -> None:
+        state_store.upsert_position("AAPL", 2, 100.0, "buy", 1.0, 10.0)
+        fake.quantities["AAPL"] = 2
+        fake.prices["AAPL"] = 95.0  # past the 1% stop
+
+        # Position endpoint reports no usable current_price this cycle.
+        real_get_position = fake.get_position
+
+        def stale_position(symbol: str):
+            data, err = real_get_position(symbol)
+            if data is not None:
+                data["current_price"] = "0"
+            return data, err
+
+        fake.get_position = stale_position
+        await discord_agent.stop_loss_monitor.coro()
+        assert len(fake.submissions) == 1
+        assert fake.submissions[0]["symbol"] == "AAPL"
+        assert state_store.list_pending_exit_orders()[0]["reason"] == "protection_stop_loss"
+
+    asyncio.run(_with_runtime(scenario))
+
+
 def test_equity_closed_market_stop_is_durable_and_not_duplicated() -> None:
     async def scenario(fake: ProtectionAlpaca) -> None:
         state_store.upsert_position("MSFT", 3, 100.0, "buy", 1.0, 10.0)
@@ -599,5 +628,49 @@ def test_multi_leg_fill_activates_and_profit_exit_reconciles() -> None:
         await discord_agent._reconcile_pending_exit_orders()
         assert not state_store.list_multi_leg_positions()
         assert not state_store.list_pending_exit_orders()
+
+    asyncio.run(_with_runtime(scenario))
+
+
+def test_multi_leg_stalled_leg_quote_skips_silently_but_logs_a_warning(caplog) -> None:
+    """A thinly-traded wing with no fresh quote must not crash or falsely
+    trigger/hide an exit -- but it also must not go completely silent, or a
+    spread can sit unprotected indefinitely with no way to diagnose why."""
+    async def scenario(fake: ProtectionAlpaca) -> None:
+        long_leg = "AAPL260821C00240000"
+        short_leg = "AAPL260821C00250000"
+        legs = [
+            {"symbol": long_leg, "side_order": "buy", "position_intent": "buy_to_open", "ratio_qty": 1},
+            {"symbol": short_leg, "side_order": "sell", "position_intent": "sell_to_open", "ratio_qty": 1},
+        ]
+        fake.orders["mleg-entry-2"] = {
+            "id": "mleg-entry-2", "status": "filled", "filled_qty": "1", "filled_avg_price": "4.60",
+        }
+        state_store.add_pending_multi_leg_entry_order(
+            {
+                "order_id": "mleg-entry-2",
+                "strategy_id": "mleg-entry-2",
+                "requested_qty": 1,
+                "root": "AAPL",
+                "structure": "bull_call_spread",
+                "legs": legs,
+                "price_effect": "debit",
+                "protectable": True,
+            }
+        )
+        await discord_agent._reconcile_pending_multi_leg_entry_orders()
+
+        # Only the long leg has a quote this cycle; the short leg (thin wing)
+        # has none, so fake.get_latest_option_price falls back to its 0.0 default.
+        fake.prices.update({long_leg: 7.0})
+        with caplog.at_level("WARNING", logger="discord_stock_prediction_agent"):
+            await discord_agent._process_multi_leg_exit_monitor(True)
+
+        assert not fake.submissions
+        assert not state_store.list_pending_exit_orders()
+        assert any(
+            "multi-leg protection skipped" in record.message and short_leg in record.message
+            for record in caplog.records
+        )
 
     asyncio.run(_with_runtime(scenario))
