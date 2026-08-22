@@ -5930,6 +5930,20 @@ async def _automate_agent_buy_option(
     )
     if already_held:
         return f"- {root} (option): already holding an automate_agent option position, skipped."
+    # Also check for an entry already submitted-but-not-yet-reconciled this
+    # cooldown period -- option entries are tracked then reconciled on
+    # confirmed fill (like every other option entry in this codebase), so a
+    # slow-to-fill order from a recent cycle wouldn't show up in
+    # list_option_positions() yet, and without this check a second cycle
+    # could submit a duplicate buy for the same root before the first
+    # even confirms.
+    already_pending = any(
+        str(p.get("root") or "").upper() == root
+        and str(p.get("opened_by") or "") == AUTOMATE_AGENT_TAG
+        for p in list_pending_option_entry_orders()
+    )
+    if already_pending:
+        return f"- {root} (option): an automate_agent option entry is still pending confirmation, skipped."
 
     contract = await _automate_agent_pick_option_contract(root)
     if not contract:
@@ -6153,8 +6167,27 @@ async def _build_automate_agent_text() -> str:
                 "opened_by": p.get("opened_by"),
                 "updated_at": p.get("updated_at"),
                 "qty": p.get("qty"),
+                # oldest_automate_position must never pick one of these as an
+                # eviction target -- the eviction loop below can only
+                # sell-to-close equity, not options.
+                "asset_type": "option",
             }
             for p in await asyncio.to_thread(list_option_positions)
+            if str(p.get("opened_by") or "") == AUTOMATE_AGENT_TAG
+        ] + [
+            # Submitted-but-not-yet-reconciled option entries also count
+            # against the cap. Without this, a slow-to-fill order held over
+            # from a prior cycle wouldn't be counted at all here, and the
+            # next cycle could buy in believing there was more room than
+            # will actually exist once that pending entry confirms.
+            {
+                "symbol": str(p.get("root") or "").upper(),
+                "opened_by": p.get("opened_by"),
+                "updated_at": p.get("created_at"),
+                "qty": p.get("requested_qty"),
+                "asset_type": "option",
+            }
+            for p in await asyncio.to_thread(list_pending_option_entry_orders)
             if str(p.get("opened_by") or "") == AUTOMATE_AGENT_TAG
         ]
         plan = plan_automate_trades(

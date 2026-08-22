@@ -87,10 +87,20 @@ def oldest_automate_position(open_positions: list[dict]) -> Optional[str]:
     """Returns the symbol of the oldest automate_agent-tagged open position,
     or None if there isn't one. Used to free a slot when at the cap -- only
     ever looks at automate_agent's own positions, never a real user's.
+
+    Only ever selects an equity position: the eviction loop that acts on
+    this result can only sell-to-close equity today (there is no option
+    eviction path yet), so selecting an option position here would schedule
+    an eviction that silently never happens -- the "freed" slot never
+    actually frees, while the buy that assumed it would still proceeds,
+    letting the real position count exceed the intended cap. Option
+    positions are still counted by count_automate_positions; they just
+    can't be picked as the thing to evict.
     """
     tagged = [
         p for p in open_positions
         if str(p.get("opened_by") or "").lower() == AUTOMATE_AGENT_TAG
+        and str(p.get("asset_type") or "equity").lower() != "option"
     ]
     if not tagged:
         return None

@@ -146,6 +146,36 @@ def test_oldest_automate_position_ignores_user_trades() -> None:
     _assert(evict == "NVDA", "picks the oldest automate_agent position, not the user's older AAPL", str(evict))
 
 
+def test_oldest_automate_position_never_selects_an_option_position() -> None:
+    print("\nTest: eviction never picks an option position even if it's the oldest overall")
+    # Regression: the eviction loop that acts on this result can only
+    # sell-to-close equity today. If this picked the oldest option position,
+    # plan_automate_trades would schedule an eviction that silently never
+    # happens (the equity-only eviction loop can't find a matching equity
+    # position to sell), while the buy that assumed the slot was freed still
+    # proceeds -- letting the real position count exceed the cap.
+    positions = [
+        {"symbol": "TSLA", "opened_by": AUTOMATE_AGENT_TAG, "updated_at": "2026-01-01T00:00:00Z", "qty": 1, "asset_type": "option"},
+        _position("MSFT", updated_at="2026-01-02T00:00:00Z"),
+        _position("NVDA", updated_at="2026-01-03T00:00:00Z"),
+    ]
+    evict = oldest_automate_position(positions)
+    _assert(
+        evict == "MSFT",
+        "skips the older TSLA option position, picks the oldest equity position (MSFT) instead",
+        str(evict),
+    )
+
+
+def test_oldest_automate_position_none_when_only_options_are_held() -> None:
+    print("\nTest: eviction returns None (never forces a bad pick) when only option positions exist")
+    positions = [
+        {"symbol": "TSLA", "opened_by": AUTOMATE_AGENT_TAG, "updated_at": "2026-01-01T00:00:00Z", "qty": 1, "asset_type": "option"},
+    ]
+    evict = oldest_automate_position(positions)
+    _assert(evict is None, "no equity candidate exists to evict, so None is correct -- not a wrong pick")
+
+
 def test_oldest_automate_position_none_when_all_user_owned() -> None:
     print("\nTest: no eviction candidate when every open position is a real user's")
     positions = [_position("AAPL", opened_by=""), _position("MSFT", opened_by="")]

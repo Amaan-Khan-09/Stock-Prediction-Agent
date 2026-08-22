@@ -871,6 +871,101 @@ def test_both_mode_shares_the_position_cap_between_equity_and_options() -> None:
     _with_asset_mode("both", run)
 
 
+def test_options_mode_skips_duplicate_buy_while_entry_is_still_pending() -> None:
+    """Regression: option entries are tracked then reconciled on confirmed
+    fill (like every other option entry in this codebase), so a slow-to-fill
+    order held over from a prior cycle wouldn't show up in
+    list_option_positions() yet. Without an explicit pending-entry check, a
+    later cycle (after the cooldown elapses) could submit a second buy for
+    the same root before the first one even confirms."""
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            fake.prices[symbol] = 100.0
+            today = date.today().isoformat()
+            occ_symbol = f"{symbol}260101C00100000"
+            fake.option_contracts_by_expiry[today] = [{"symbol": occ_symbol, "strike_price": "100"}]
+            fake.option_premiums[occ_symbol] = 2.0
+
+            original_validate = discord_agent.run_options_strategy_validation
+            discord_agent.run_options_strategy_validation = lambda option: {
+                "status": "SUCCESS", "decision": "BUY",
+            }
+            try:
+                await discord_agent._build_automate_agent_text()
+                assert len(fake.submissions) == 1, "first cycle should submit the option buy"
+
+                # Simulate the next scan cycle -- same candidate, but the
+                # first entry has deliberately not been reconciled yet. The
+                # pending entry makes plan_automate_trades' own held_symbols
+                # filter treat the root as already-held before the cycle even
+                # reaches _automate_agent_buy_option's own pending check, so
+                # the resulting text is "no candidates," not a per-symbol
+                # skip message -- either way, the key guarantee is no second
+                # submission.
+                discord_agent._automate_agent_last_run = 0.0
+                text = await discord_agent._build_automate_agent_text()
+                assert len(fake.submissions) == 1, (
+                    "must not submit a second buy for the same root while its first entry is still pending"
+                )
+                assert "no buy-decision candidates" in text.lower()
+            finally:
+                discord_agent.run_options_strategy_validation = original_validate
+
+        predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("options", run)
+
+
+def test_pending_option_entries_count_toward_the_shared_cap() -> None:
+    """Regression: a submitted-but-not-yet-reconciled option entry from a
+    prior cycle must still count against automate_agent_max_positions, or a
+    slow-to-fill order could let a later cycle buy in believing there was
+    more room than will actually exist once that entry confirms."""
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            original_max = discord_agent.config.automate_agent_max_positions
+            object.__setattr__(discord_agent.config, "automate_agent_max_positions", 1)
+            try:
+                # A pending automate_agent option entry for a symbol NOT in
+                # play this cycle -- it alone should already fill the cap.
+                state_store.add_pending_option_entry_order({
+                    "order_id": "already-pending-1",
+                    "occ_symbol": "MSFT260101C00100000",
+                    "root": "MSFT",
+                    "requested_qty": 1,
+                    "opened_by": AUTOMATE_AGENT_TAG,
+                })
+
+                symbol = discord_agent.config.automate_agent_watchlist[0]
+                fake.prices[symbol] = 100.0
+                today = date.today().isoformat()
+                occ_symbol = f"{symbol}260101C00100000"
+                fake.option_contracts_by_expiry[today] = [{"symbol": occ_symbol, "strike_price": "100"}]
+                fake.option_premiums[occ_symbol] = 2.0
+
+                original_validate = discord_agent.run_options_strategy_validation
+                discord_agent.run_options_strategy_validation = lambda option: {
+                    "status": "SUCCESS", "decision": "BUY",
+                }
+                try:
+                    await discord_agent._build_automate_agent_text()
+                finally:
+                    discord_agent.run_options_strategy_validation = original_validate
+
+                assert not fake.submissions, (
+                    "the cap (1) is already consumed by the pending MSFT entry alone"
+                )
+            finally:
+                object.__setattr__(discord_agent.config, "automate_agent_max_positions", original_max)
+
+        predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("options", run)
+
+
 if __name__ == "__main__":
     test_daily_loss_circuit_breaker_blocks_new_positions()
     test_daily_loss_circuit_breaker_ignores_a_real_users_losses()
