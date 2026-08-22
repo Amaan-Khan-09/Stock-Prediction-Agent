@@ -117,7 +117,7 @@ class AgentConfig:
     # existing equity stop-loss/take-profit config above rather than a
     # separate knob, since both default to the same 1%/10% already.
     automate_agent_min_positions: int = _int_env("AUTOMATE_AGENT_MIN_POSITIONS", 1)
-    automate_agent_max_positions: int = _int_env("AUTOMATE_AGENT_MAX_POSITIONS", 5)
+    automate_agent_max_positions: int = _int_env("AUTOMATE_AGENT_MAX_POSITIONS", 10)
     # Caps how many existing positions can be swapped out in a single scan
     # cycle, even if enough higher-ranked fresh candidates exist to justify
     # more -- keeps portfolio churn gradual instead of flipping the whole
@@ -127,13 +127,6 @@ class AgentConfig:
     )
     automate_agent_exit_minutes_before_close: int = _int_env(
         "AUTOMATE_AGENT_EXIT_MINUTES_BEFORE_CLOSE", 15
-    )
-    # Fallback notional if account equity can't be fetched -- normal sizing
-    # is risk-based (automate_agent_risk_pct_per_trade), not this fixed
-    # figure. See automate_agent.py for why: fixed-dollar sizing doesn't
-    # scale with account size, which is a well-established anti-pattern.
-    automate_agent_notional_per_trade: float = _float_env(
-        "AUTOMATE_AGENT_NOTIONAL_PER_TRADE", 1000.0
     )
     # Fixed-fractional position sizing: risk a small, constant % of current
     # account equity per trade rather than a fixed dollar amount, so sizing
@@ -152,16 +145,35 @@ class AgentConfig:
     # rapid re-triggering from burning API calls/rate limits for no benefit,
     # since the market doesn't meaningfully change signal in a few seconds.
     automate_agent_cooldown_seconds: int = _int_env("AUTOMATE_AGENT_COOLDOWN_SECONDS", 60)
+    # A per-symbol ceiling on the prediction call during a scan. Without
+    # this, a single watchlist symbol whose data-fetch or AI call stalls
+    # (e.g. a hung network read) would block asyncio.gather forever --
+    # and since the scan runs inside _automate_agent_lock, that would
+    # silently freeze !automate_agent and the autoscan loop permanently,
+    # not just delay one cycle.
+    automate_agent_scan_timeout_seconds: int = _int_env(
+        "AUTOMATE_AGENT_SCAN_TIMEOUT_SECONDS", 90
+    )
+    # "equity" (default, unchanged behavior) | "options" | "both". Controls
+    # whether automate_agent's autonomous buys are shares, single-leg
+    # options, or both asset classes competing for the same position cap.
+    automate_agent_asset_mode: str = os.getenv("AUTOMATE_AGENT_ASSET_MODE", "equity").strip().lower()
+    # How many calendar days forward to search for a listed option expiry
+    # when a watchlist symbol has no same-day (0DTE) contracts listed.
+    automate_agent_option_expiry_fallback_days: int = _int_env(
+        "AUTOMATE_AGENT_OPTION_EXPIRY_FALLBACK_DAYS", 5
+    )
     # A BUY the model itself didn't flag as needing review can still be a
     # thin, barely-cleared-the-bar call. This drops anything below the
     # threshold from consideration entirely, on top of the existing
     # needs_human_review exclusion.
     automate_agent_min_confidence: float = _float_env("AUTOMATE_AGENT_MIN_CONFIDENCE", 60.0)
-    # Off by default: !automate_agent otherwise only runs when a human types
-    # the command. Turning this on lets it scan-and-trade on its own interval
-    # during market hours, still gated by every existing safety check (agent
-    # mode ON, market open, per-cycle cooldown, daily-loss circuit breaker).
-    automate_agent_autoscan_enabled: bool = _bool_env("AUTOMATE_AGENT_AUTOSCAN_ENABLED", False)
+    # On by default: the whole point of automate_agent is continuous,
+    # no-human-intervention monitoring during market hours, not a one-shot
+    # scan that only runs when someone happens to retype the command. Still
+    # gated by every existing safety check (agent mode ON, market open,
+    # per-cycle cooldown, daily-loss circuit breaker, min-confidence filter).
+    automate_agent_autoscan_enabled: bool = _bool_env("AUTOMATE_AGENT_AUTOSCAN_ENABLED", True)
     automate_agent_autoscan_interval_seconds: int = _int_env(
         "AUTOMATE_AGENT_AUTOSCAN_INTERVAL_SECONDS", 900
     )

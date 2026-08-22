@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from . import discord_agent, pending_market_orders, state_store
+from .automate_agent import AUTOMATE_AGENT_TAG
 from .options_parser import classify_and_parse
 
 
@@ -31,7 +32,10 @@ class ProtectionAlpaca:
     def get_position(self, symbol: str):
         qty = self.quantities.get(symbol, 0.0)
         if qty == 0:
-            return None, "not found"
+            # Matches AlpacaPaperClient.get_position's real 404 wording --
+            # _reconcile_pending_exit_orders's "fully closed" branch checks
+            # for "no position" in the error text specifically.
+            return None, "No position found."
         # Real Alpaca reports a short position's qty as negative -- keep the
         # sign here so tests can exercise that instead of always long qty.
         return {
@@ -384,6 +388,65 @@ def test_option_loss_and_profit_monitors_submit_at_boundaries() -> None:
         assert {x["symbol"] for x in fake.submissions} == {loss_symbol, profit_symbol}
         reasons = {x["reason"] for x in state_store.list_pending_exit_orders()}
         assert reasons == {"option_stop_loss", "option_target_price"}
+
+    asyncio.run(_with_runtime(scenario))
+
+
+def test_automate_agent_option_close_records_outcome_for_circuit_breaker() -> None:
+    """automate_agent-tagged option positions must record a trade_outcomes
+    entry on close (regular manual option positions never have) so
+    today_realized_pnl(AUTOMATE_AGENT_TAG) -- the daily-loss circuit breaker
+    -- can see option P&L, not just equity P&L."""
+    async def scenario(fake: ProtectionAlpaca) -> None:
+        occ_symbol = "AAPL260821C00100000"
+        state_store.upsert_option_position(
+            occ_symbol, "AAPL", "CALL", 100, "2026-08-21", 1, 2.0, "buy-1",
+            default_stop_loss_pct=1.0, opened_by=AUTOMATE_AGENT_TAG,
+        )
+        fake.quantities[occ_symbol] = 1
+        fake.prices[occ_symbol] = 1.9  # past the 1% stop (entry 2.0)
+        await discord_agent._process_option_exit_monitor(True)
+        pending = state_store.list_pending_exit_orders()
+        assert pending, "stop should have triggered an exit"
+
+        exit_order_id = pending[0]["order_id"]
+        fake.orders[exit_order_id].update(status="filled", filled_qty="1", filled_avg_price="1.9")
+        fake.quantities[occ_symbol] = 0  # broker now reports the position fully closed
+        await discord_agent._reconcile_pending_exit_orders()
+
+        assert not state_store.list_option_positions()
+        assert state_store.today_realized_pnl(AUTOMATE_AGENT_TAG) < 0, (
+            "the option loss must count toward automate_agent's own daily-loss circuit breaker"
+        )
+
+    asyncio.run(_with_runtime(scenario))
+
+
+def test_manual_option_close_does_not_record_an_outcome() -> None:
+    """Regression guard: only automate_agent-tagged option positions get the
+    new outcome-recording behavior -- a manual (untagged) option position
+    must close exactly as it always has, with no trade_outcomes entry."""
+    async def scenario(fake: ProtectionAlpaca) -> None:
+        occ_symbol = "MSFT260821C00500000"
+        state_store.upsert_option_position(
+            occ_symbol, "MSFT", "CALL", 500, "2026-08-21", 1, 10.0, "buy-m",
+        )
+        fake.quantities[occ_symbol] = 1
+        fake.prices[occ_symbol] = 9.5  # past the default 5% stop
+        await discord_agent._process_option_exit_monitor(True)
+        pending = state_store.list_pending_exit_orders()
+        assert pending
+
+        exit_order_id = pending[0]["order_id"]
+        fake.orders[exit_order_id].update(status="filled", filled_qty="1", filled_avg_price="9.5")
+        fake.quantities[occ_symbol] = 0  # broker now reports the position fully closed
+        before = state_store.today_realized_pnl("")
+        await discord_agent._reconcile_pending_exit_orders()
+
+        assert not state_store.list_option_positions()
+        assert state_store.today_realized_pnl("") == before, (
+            "manual option closes must not start recording outcomes as a side effect"
+        )
 
     asyncio.run(_with_runtime(scenario))
 

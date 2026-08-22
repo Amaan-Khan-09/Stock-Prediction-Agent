@@ -180,6 +180,35 @@ def set_agent_mode(mode: str, updated_by: str = "") -> Dict[str, Any]:
     return dict(control)
 
 
+def get_automate_agent_mode() -> str:
+    """automate_agent's own independent on/off switch -- separate from the
+    general agent_control mode (which gates manual/Discord-typed signal
+    processing). Defaults to ON so the feature runs out of the box; still
+    also gated by the general agent mode for safety (both must be ON).
+    """
+    control = load_state().get("automate_agent_control") or {}
+    mode = str(control.get("mode") or "ON").upper()
+    return mode if mode in {"ON", "OFF"} else "ON"
+
+
+@_state_mutation
+def set_automate_agent_mode(mode: str, updated_by: str = "") -> Dict[str, Any]:
+    normalized = str(mode or "").upper()
+    if normalized not in {"ON", "OFF"}:
+        raise ValueError("automate_agent mode must be ON or OFF.")
+    state = load_state()
+    control = state.setdefault("automate_agent_control", {})
+    control.update(
+        {
+            "mode": normalized,
+            "updated_at": _utcstamp(),
+            "updated_by": str(updated_by or ""),
+        }
+    )
+    save_state(state)
+    return dict(control)
+
+
 def _learning_key(features: Dict[str, Any]) -> str:
     asset = str(features.get("asset_type") or "unknown").lower()
     action = str(features.get("action") or "unknown").upper()
@@ -1007,6 +1036,7 @@ def upsert_option_position(
     stop_scope: str | None = None,
     default_stop_loss_pct: float = 5.0,
     default_take_profit_pct: float = 10.0,
+    opened_by: str = "",
 ) -> None:
     state = load_state()
     positions = state.setdefault("option_positions", {})
@@ -1097,6 +1127,7 @@ def upsert_option_position(
         "signal_quality": round(float(signal_quality), 2) if signal_quality is not None else previous.get("signal_quality"),
         "position_intent": intent,
         "last_order_id": order_id,
+        "opened_by": opened_by or previous.get("opened_by") or "",
         "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
     save_state(state)
@@ -1112,6 +1143,74 @@ def update_option_position(occ_symbol: str, **updates: Any) -> None:
     positions[symbol].update(updates)
     positions[symbol]["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     save_state(state)
+
+
+@_state_mutation
+def close_option_position_with_outcome(
+    occ_symbol: str,
+    qty: float,
+    exit_price: float,
+    reason: str = "",
+    limit: int = 500,
+) -> Dict[str, Any]:
+    """Option equivalent of close_position_with_outcome -- records a real
+    P&L outcome (contract multiplier 100) before a fully-closed option
+    position is dropped, so today_realized_pnl() can see it. Regular manual
+    option positions have never recorded outcomes; this exists specifically
+    so automate_agent's own option trades count toward its daily-loss
+    circuit breaker the same way its equity trades already do -- callers
+    should only invoke this for opened_by-tagged automate_agent positions,
+    to avoid changing learning-profile behavior for manual signals.
+    """
+    state = load_state()
+    positions = state.setdefault("option_positions", {})
+    current = positions.get(occ_symbol)
+    if not current:
+        save_state(state)
+        return {}
+
+    close_qty = min(float(qty), float(current.get("qty") or 0))
+    entry_price = float(current.get("entry_price") or 0)
+    exit_price = float(exit_price or 0)
+    if close_qty <= 0 or entry_price <= 0 or exit_price <= 0:
+        save_state(state)
+        return {}
+
+    short_position = str(current.get("position_intent") or "buy_to_open") == "sell_to_open"
+    pnl_pct = (
+        (entry_price - exit_price) if short_position else (exit_price - entry_price)
+    ) / entry_price * 100
+    pnl_value = (
+        (entry_price - exit_price) if short_position else (exit_price - entry_price)
+    ) * close_qty * 100.0
+    outcome = {
+        "symbol": occ_symbol,
+        "side": "buy_to_close_short" if short_position else "sell_to_close_long",
+        "qty": round(close_qty, 6),
+        "entry_price": round(entry_price, 6),
+        "exit_price": round(exit_price, 6),
+        "pnl_pct": round(pnl_pct, 6),
+        "pnl_value": round(pnl_value, 6),
+        "profitable": pnl_pct > 0,
+        "reason": reason,
+        "opened_by": str(current.get("opened_by") or ""),
+        "closed_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+    remaining = float(current.get("qty") or 0) - close_qty
+    if remaining <= 0:
+        positions.pop(occ_symbol, None)
+    else:
+        current["qty"] = round(remaining, 6)
+        current["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    outcomes = state.setdefault("trade_outcomes", [])
+    outcomes.append(outcome)
+    if len(outcomes) > limit:
+        state["trade_outcomes"] = outcomes[-limit:]
+
+    save_state(state)
+    return outcome
 
 
 @_state_mutation

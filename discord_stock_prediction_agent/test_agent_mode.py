@@ -75,6 +75,54 @@ def test_mode_commands_registered() -> None:
     )
 
 
+def test_automate_agent_mode_persistence() -> None:
+    """automate_agent's own on/off switch is independent state, separate
+    from agent_control -- toggling it must not touch the general agent
+    mode, and vice versa."""
+    with TemporaryDirectory() as tmp:
+        original_path = state_store.STATE_PATH
+        state_store.STATE_PATH = Path(tmp) / "agent_state.json"
+        try:
+            _check(
+                state_store.get_automate_agent_mode() == "ON",
+                "new state must default to automate_agent ON",
+            )
+            control = state_store.set_automate_agent_mode("off", "admin-1")
+            _check(control["mode"] == "OFF", "automate_agent OFF must be stored")
+            _check(control["updated_by"] == "admin-1", "mode author must be stored")
+            _check(state_store.get_automate_agent_mode() == "OFF", "automate_agent OFF must persist")
+            _check(
+                state_store.get_agent_mode() == "ON",
+                "toggling automate_agent's switch must not touch the general agent mode",
+            )
+            state_store.set_automate_agent_mode("ON", "admin-2")
+            _check(state_store.get_automate_agent_mode() == "ON", "automate_agent ON must persist")
+        finally:
+            state_store.STATE_PATH = original_path
+
+
+def test_automate_agent_invalid_mode_rejected() -> None:
+    with TemporaryDirectory() as tmp:
+        original_path = state_store.STATE_PATH
+        state_store.STATE_PATH = Path(tmp) / "agent_state.json"
+        try:
+            try:
+                state_store.set_automate_agent_mode("MAYBE")
+            except ValueError:
+                return
+            raise AssertionError("invalid automate_agent mode was accepted")
+        finally:
+            state_store.STATE_PATH = original_path
+
+
+def test_automate_agent_mode_commands_registered() -> None:
+    commands = {command.name for command in discord_agent.bot.commands}
+    _check(
+        {"automate_agent_on", "automate_agent_off", "automate_agent_mode"}.issubset(commands),
+        "automate_agent mode commands are not all registered",
+    )
+
+
 def run_all() -> None:
     test_mode_persistence()
     test_invalid_mode_rejected()
@@ -82,6 +130,9 @@ def run_all() -> None:
     test_direct_option_mapping()
     test_tick_reaction_removed()
     test_mode_commands_registered()
+    test_automate_agent_mode_persistence()
+    test_automate_agent_invalid_mode_rejected()
+    test_automate_agent_mode_commands_registered()
     print("AGENT MODE TESTS PASSED")
 
 

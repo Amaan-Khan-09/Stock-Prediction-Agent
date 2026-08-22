@@ -7,7 +7,7 @@ import logging
 import re
 import uuid
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -51,6 +51,7 @@ from .automate_agent import (
     AUTOMATE_AGENT_TAG,
     BoomCandidate,
     confidence_scaled_risk_multiplier,
+    count_automate_positions,
     plan_automate_trades,
 )
 from .prediction_bridge import run_project_prediction
@@ -83,6 +84,7 @@ from .state_store import (
     list_pending_option_orders,
     list_positions,
     list_pending_sells,
+    close_option_position_with_outcome,
     reduce_or_remove_position,
     reduce_or_remove_multi_leg_position,
     record_order_event,
@@ -105,6 +107,8 @@ from .state_store import (
     close_position_with_outcome,
     count_today_order_events,
     get_agent_mode,
+    get_automate_agent_mode,
+    set_automate_agent_mode,
     get_daily_summary,
     get_learning_profile,
     get_option_validation_summary,
@@ -241,6 +245,14 @@ class DecisionResult:
 
 def _agent_is_enabled() -> bool:
     return get_agent_mode() == "ON"
+
+
+def _automate_agent_is_enabled() -> bool:
+    """automate_agent's own independent switch, controlled by
+    !automate_agent_on / !automate_agent_off -- separate from the general
+    agent mode that !agent_on / !agent_off control for manual signals.
+    """
+    return get_automate_agent_mode() == "ON"
 
 
 def _direct_signal_decision(action: str, score: float = 100.0) -> DecisionResult:
@@ -4697,6 +4709,8 @@ async def _reconcile_pending_option_entry_orders() -> None:
             # populated. Keep the durable tracker and retry next cycle.
             continue
         if newly_filled > 0 and fill_price > 0:
+            opened_by = str(pending.get("opened_by") or "")
+            is_automate_agent = opened_by == AUTOMATE_AGENT_TAG
             await asyncio.to_thread(
                 upsert_option_position,
                 occ_symbol,
@@ -4723,6 +4737,12 @@ async def _reconcile_pending_option_entry_orders() -> None:
                 pending.get("exit_underlying_price"),
                 pending.get("time_in_force"),
                 pending.get("stop_scope"),
+                # automate_agent's own option positions use the same 1%/10%
+                # as its equity positions (explicit user choice); every other
+                # option position keeps the normal option defaults.
+                config.equity_stop_loss_pct if is_automate_agent else config.option_stop_loss_pct,
+                config.equity_take_profit_pct if is_automate_agent else config.option_take_profit_pct,
+                opened_by,
             )
             await asyncio.to_thread(
                 update_pending_option_entry_order,
@@ -4815,7 +4835,28 @@ async def _reconcile_pending_exit_orders() -> None:
                 elif status == "filled" and (
                     not position_err or "no position" in position_err.lower()
                 ):
-                    await asyncio.to_thread(remove_option_position, symbol)
+                    tracked = next(
+                        (
+                            item for item in list_option_positions()
+                            if str(item.get("occ_symbol") or "").upper() == symbol
+                        ),
+                        {},
+                    )
+                    if str(tracked.get("opened_by") or "") == AUTOMATE_AGENT_TAG and fill_price > 0:
+                        # Only automate_agent's own option positions get a
+                        # trade_outcomes entry recorded on close -- manual
+                        # option positions never have, and this exists
+                        # specifically so today_realized_pnl(AUTOMATE_AGENT_TAG)
+                        # (the daily-loss circuit breaker) sees option P&L too.
+                        await asyncio.to_thread(
+                            close_option_position_with_outcome,
+                            symbol,
+                            newly_filled,
+                            fill_price,
+                            str(pending.get("reason") or "broker_exit_fill"),
+                        )
+                    else:
+                        await asyncio.to_thread(remove_option_position, symbol)
             elif fill_price > 0:
                 outcome = await asyncio.to_thread(
                     close_position_with_outcome,
@@ -5530,6 +5571,7 @@ async def _build_agent_status_text() -> str:
     market_queue = await asyncio.to_thread(market_order_queue_summary)
     return (
         f"{config.agent_name} is online. Agent mode: {get_agent_mode()}. "
+        f"automate_agent mode: {get_automate_agent_mode()}. "
         f"Alpaca paper trading: {alpaca_status}. "
         f"Tracked equity positions: {len(tracked)}. Tracked option positions: {len(tracked_options)}. "
         f"Signal queue: {queue['queued']} waiting, {queue['processing']} processing, "
@@ -5608,6 +5650,56 @@ async def _build_agent_mode_text() -> str:
         else "valid incoming BUY/SELL signals go directly to paper-order handling"
     )
     return f"Agent mode: {mode}. {detail}."
+
+
+async def _build_automate_agent_mode_change_text(mode: str, changed_by: str) -> str:
+    control = await asyncio.to_thread(set_automate_agent_mode, mode, changed_by)
+    detail = (
+        "automate_agent will scan and trade on its own during market hours "
+        "(still gated by agent_on/agent_off, market hours, the cooldown, min-confidence "
+        "filter, and the daily-loss circuit breaker)."
+        if control["mode"] == "ON"
+        else "automate_agent will not scan or trade until turned back on with "
+        "!automate_agent_on. Manual BUY/SELL signals are unaffected."
+    )
+    return f"automate_agent mode is now {control['mode']}. {detail}"
+
+
+async def _set_automate_agent_mode_from_command(ctx: commands.Context, mode: str) -> None:
+    if not await _can_manage_agent_mode(ctx):
+        await _send_context_output(
+            ctx,
+            "You need Administrator or Manage Server permission to change automate_agent mode.",
+        )
+        return
+    await _send_context_output(
+        ctx, await _build_automate_agent_mode_change_text(mode, str(ctx.author.id))
+    )
+
+
+@bot.command(name="automate_agent_on")
+async def automate_agent_on(ctx: commands.Context) -> None:
+    await _set_automate_agent_mode_from_command(ctx, "ON")
+
+
+@bot.command(name="automate_agent_off")
+async def automate_agent_off(ctx: commands.Context) -> None:
+    await _set_automate_agent_mode_from_command(ctx, "OFF")
+
+
+async def _build_automate_agent_mode_text() -> str:
+    mode = get_automate_agent_mode()
+    detail = (
+        "it will scan and trade on its own during market hours"
+        if mode == "ON"
+        else "it will not scan or trade until turned back on with !automate_agent_on"
+    )
+    return f"automate_agent mode: {mode}. {detail}."
+
+
+@bot.command(name="automate_agent_mode")
+async def automate_agent_mode(ctx: commands.Context) -> None:
+    await _send_context_output(ctx, await _build_automate_agent_mode_text())
 
 
 @bot.command(name="agent_mode")
@@ -5784,6 +5876,138 @@ async def agent_option_validation(ctx: commands.Context) -> None:
     await _send_context_output(ctx, await _build_agent_option_validation_text())
 
 
+async def _automate_agent_pick_option_contract(root: str) -> Optional[dict]:
+    """Pick a same-day (0DTE) at-the-money CALL for `root`, falling back to
+    the nearest later listed expiry within
+    config.automate_agent_option_expiry_fallback_days if nothing is listed
+    today.
+
+    There is no options-greeks/delta data source anywhere in this codebase
+    (Alpaca's contract-listing endpoint returns no greeks, and nothing wraps
+    a snapshot-based delta estimate) -- ATM (nearest listed strike to the
+    live underlying price) is used as the closest buildable proxy for a
+    balanced, non-extreme delta, rather than inventing an unvalidated
+    greeks estimator for a no-human-review path.
+    """
+    price, price_err = await asyncio.to_thread(alpaca.get_latest_price, root)
+    if not price or price <= 0:
+        return None
+
+    for offset in range(0, max(0, config.automate_agent_option_expiry_fallback_days) + 1):
+        expiry = (date.today() + timedelta(days=offset)).isoformat()
+        contracts, _ = await asyncio.to_thread(
+            alpaca.get_option_contracts, root, expiry, None, "call"
+        )
+        if contracts:
+            nearest = min(
+                contracts,
+                key=lambda c: abs(_as_float(c.get("strike_price")) - price),
+            )
+            strike = _as_float(nearest.get("strike_price"))
+            if strike <= 0:
+                continue
+            return {
+                "occ_symbol": str(nearest.get("symbol") or ""),
+                "strike": strike,
+                "expiry_date": expiry,
+                "root": root,
+            }
+    return None
+
+
+async def _automate_agent_buy_option(
+    root: str, picked: Optional[BoomCandidate], equity: float
+) -> str:
+    """Autonomously validate and place a single-leg CALL for `root`, reusing
+    the same tastytrade backtest gate (run_options_strategy_validation) every
+    manually-typed option signal already goes through -- never placed
+    without that same validation passing.
+    """
+    already_held = any(
+        str(p.get("root") or "").upper() == root
+        and str(p.get("opened_by") or "") == AUTOMATE_AGENT_TAG
+        for p in list_option_positions()
+    )
+    if already_held:
+        return f"- {root} (option): already holding an automate_agent option position, skipped."
+
+    contract = await _automate_agent_pick_option_contract(root)
+    if not contract:
+        return (
+            f"- {root} (option): no listed CALL contract found within "
+            f"{config.automate_agent_option_expiry_fallback_days} day(s), skipped."
+        )
+    occ_symbol = contract["occ_symbol"]
+
+    premium, _ = await asyncio.to_thread(alpaca.get_latest_option_price, occ_symbol)
+    premium = _as_float(premium)
+
+    synthetic = ParsedOptionSignal(
+        valid=True,
+        root=root,
+        strike=contract["strike"],
+        side="CALL",
+        expiry_date=contract["expiry_date"],
+        expiry_mode="explicit",
+        fill_price=premium if premium > 0 else None,
+        quantity=1.0,
+        order_action="open_long",
+        tense="new_order",
+        raw_text=f"automate_agent synthetic BUY {root} {contract['strike']}C {contract['expiry_date']}",
+    )
+    strategy_validation = await asyncio.to_thread(run_options_strategy_validation, synthetic)
+    if str(strategy_validation.get("decision") or "").upper() != "BUY":
+        return (
+            f"- {occ_symbol}: strategy validation did not confirm BUY "
+            f"({strategy_validation.get('status')}), skipped."
+        )
+
+    enabled, options_err = await asyncio.to_thread(alpaca.has_options_trading)
+    if not enabled:
+        return f"- {occ_symbol}: {_public_error(options_err)}"
+
+    if premium <= 0:
+        return f"- {occ_symbol}: could not get a live option premium, skipped."
+
+    size_multiplier = confidence_scaled_risk_multiplier(picked.confidence) if picked is not None else 1.0
+    risk_budget = equity * config.automate_agent_risk_pct_per_trade / 100.0 * size_multiplier
+    per_contract_cost = premium * 100.0
+    if per_contract_cost > risk_budget:
+        return (
+            f"- {occ_symbol}: premium ${premium:.2f} (${per_contract_cost:.2f}/contract) exceeds "
+            f"the ${risk_budget:.2f} risk budget; even 1 contract would oversize the position, skipped."
+        )
+    contracts = max(1, int(risk_budget // per_contract_cost))
+
+    order, err = await asyncio.to_thread(
+        alpaca.submit_option_order,
+        occ_symbol, "buy", contracts, "market", None, "buy_to_open",
+        _client_order_id("automate_option_buy", f"{occ_symbol}:{contracts}:{premium}"),
+    )
+    if not order:
+        return f"- {occ_symbol}: option order was not placed: {_public_error(err)}"
+
+    await asyncio.to_thread(_record_order, occ_symbol, "buy", contracts, "submitted", str(order.get("id") or ""), "option", "automate_agent_buy")
+    await _track_submitted_option_entry(
+        order, occ_symbol, contracts,
+        {
+            "root": root,
+            "side": "CALL",
+            "strike": contract["strike"],
+            "expiry_date": contract["expiry_date"],
+            "position_intent": "buy_to_open",
+            "opened_by": AUTOMATE_AGENT_TAG,
+            "exit_before_market_close": True,
+            "exit_minutes_before_close": config.automate_agent_exit_minutes_before_close,
+        },
+    )
+    conviction = f" [confidence {picked.confidence:.0f}]" if picked is not None else ""
+    return (
+        f"- Bought {occ_symbol}: {contracts:g} contract(s) @ ~${premium:.2f} "
+        f"(stop {config.equity_stop_loss_pct:g}%, target {config.equity_take_profit_pct:g}%).{conviction}"
+    )
+
+
 async def _scan_automate_agent_watchlist() -> list[BoomCandidate]:
     """Runs the existing prediction engine across the configured watchlist.
 
@@ -5796,6 +6020,17 @@ async def _scan_automate_agent_watchlist() -> list[BoomCandidate]:
     independent, real historical-data-fetch-plus-AI-call that can take real
     time, and there's no reason to make a user wait N times as long as a
     single lookup just because the watchlist has N symbols.
+
+    The whole scan is bounded by automate_agent_scan_timeout_seconds. This
+    runs inside _automate_agent_lock, so without a bound, one symbol whose
+    data-fetch/AI call stalls would hold that lock (and the autoscan loop)
+    hostage indefinitely. asyncio.wait_for around an individual
+    asyncio.to_thread call can't actually help here -- once a thread-pool
+    call is running, Python cannot preempt it, so wait_for on it just waits
+    out the real duration before raising. asyncio.wait(..., timeout=...)
+    is used instead: it genuinely returns control after the deadline with
+    whatever results are already in, leaving any stragglers to finish
+    (or hang) unobserved in the background rather than blocking this cycle.
     """
     async def _predict_one(symbol: str) -> Optional[BoomCandidate]:
         try:
@@ -5816,9 +6051,20 @@ async def _scan_automate_agent_watchlist() -> list[BoomCandidate]:
             needs_human_review=bool(ai_prediction.get("needs_human_review")),
         )
 
-    results = await asyncio.gather(
-        *(_predict_one(symbol) for symbol in config.automate_agent_watchlist)
+    tasks = [
+        asyncio.ensure_future(_predict_one(symbol))
+        for symbol in config.automate_agent_watchlist
+    ]
+    done, pending = await asyncio.wait(
+        tasks, timeout=config.automate_agent_scan_timeout_seconds
     )
+    if pending:
+        logging.getLogger("discord_stock_prediction_agent").warning(
+            "automate_agent: scan timed out after %ss waiting on %d watchlist "
+            "symbol(s); proceeding with %d completed result(s) this cycle.",
+            config.automate_agent_scan_timeout_seconds, len(pending), len(done),
+        )
+    results = [task.result() for task in done if not task.cancelled()]
     return [c for c in results if c is not None]
 
 
@@ -5830,12 +6076,18 @@ async def _build_automate_agent_text() -> str:
     if not alpaca.ready():
         return "automate_agent: Alpaca paper trading is not configured."
 
-    # Consistency with the rest of the system: if an admin has explicitly
-    # turned the agent OFF, an autonomous trigger shouldn't start placing
-    # trades either -- OFF should mean OFF everywhere, not just for
-    # human-originated signals.
-    if not _agent_is_enabled():
-        return "automate_agent: agent mode is OFF. Run !agent_on first if this is intentional."
+    # automate_agent is deliberately independent of the general agent mode:
+    # agent_on/agent_off governs whether manual/human-typed signals go
+    # through the prediction decision gate (ON) or straight to paper-order
+    # handling (OFF) -- that's a single either/or switch for that one path.
+    # automate_agent is a separate subsystem with its own switch
+    # (!automate_agent_on / !automate_agent_off) and is not gated by
+    # agent_on/agent_off at all.
+    if not _automate_agent_is_enabled():
+        return (
+            "automate_agent: automate_agent mode is OFF. Run !automate_agent_on first "
+            "if this is intentional."
+        )
 
     market_open, _ = await asyncio.to_thread(alpaca.is_market_open)
     if not market_open:
@@ -5853,8 +6105,20 @@ async def _build_automate_agent_text() -> str:
             return f"automate_agent: cooling down, try again in {wait_left}s."
         _automate_agent_last_run = now
 
-        account, _ = await asyncio.to_thread(alpaca.get_account)
+        account, account_err = await asyncio.to_thread(alpaca.get_account)
         equity = _as_float((account or {}).get("equity"))
+        if equity <= 0:
+            # Fail safe, not open: if account equity can't be verified, the
+            # daily-loss circuit breaker below can't be evaluated either --
+            # proceeding anyway (as this used to, falling back to a fixed
+            # notional size) would mean the one guard against a runaway
+            # autonomous trading day is silently skipped exactly when
+            # account state is most in question.
+            return (
+                "automate_agent: could not verify account equity "
+                f"({_public_error(account_err) or 'no account data returned'}); "
+                "skipping this cycle for safety."
+            )
 
         # Account-level circuit breaker: independent of any single
         # position's stop-loss, checked before spending time/API calls on
@@ -5864,21 +6128,38 @@ async def _build_automate_agent_text() -> str:
         # closed normally by stop_loss_monitor -- this only blocks *new*
         # entries.
         realized_today = await asyncio.to_thread(today_realized_pnl, AUTOMATE_AGENT_TAG)
-        if equity > 0:
-            loss_limit = -abs(equity * config.automate_agent_max_daily_loss_pct / 100.0)
-            if realized_today <= loss_limit:
-                return (
-                    f"automate_agent: daily loss circuit breaker tripped "
-                    f"(realized P&L today: ${realized_today:,.2f}, limit: ${loss_limit:,.2f}). "
-                    "No new positions will be opened for the rest of the day; existing positions "
-                    "are still protected by the normal stop-loss/take-profit monitor."
-                )
+        loss_limit = -abs(equity * config.automate_agent_max_daily_loss_pct / 100.0)
+        if realized_today <= loss_limit:
+            return (
+                f"automate_agent: daily loss circuit breaker tripped "
+                f"(realized P&L today: ${realized_today:,.2f}, limit: ${loss_limit:,.2f}). "
+                "No new positions will be opened for the rest of the day; existing positions "
+                "are still protected by the normal stop-loss/take-profit monitor."
+            )
 
         candidates = await _scan_automate_agent_watchlist()
         open_positions = await asyncio.to_thread(list_positions)
+        # automate_agent option positions share the same 1-10 slot cap as its
+        # equity positions (both asset classes compete for the same
+        # AUTOMATE_AGENT_MAX_POSITIONS ceiling) -- normalize them to the same
+        # {symbol, opened_by, updated_at, qty} shape plan_automate_trades
+        # already expects so count_automate_positions/oldest_automate_position
+        # see the combined book. Eviction itself still only ever targets
+        # equity positions (see the eviction loop below) -- teaching it to
+        # also sell-to-close an option position is deferred.
+        automate_option_positions = [
+            {
+                "symbol": str(p.get("root") or "").upper(),
+                "opened_by": p.get("opened_by"),
+                "updated_at": p.get("updated_at"),
+                "qty": p.get("qty"),
+            }
+            for p in await asyncio.to_thread(list_option_positions)
+            if str(p.get("opened_by") or "") == AUTOMATE_AGENT_TAG
+        ]
         plan = plan_automate_trades(
             candidates,
-            open_positions,
+            open_positions + automate_option_positions,
             config.automate_agent_min_positions,
             config.automate_agent_max_positions,
             config.automate_agent_min_confidence,
@@ -5893,7 +6174,15 @@ async def _build_automate_agent_text() -> str:
 
         lines = ["automate_agent cycle summary"]
 
-        for symbol in plan.to_evict:
+        # "options"-only mode skips equity entirely -- eviction's whole
+        # purpose is freeing a slot for a *new equity* pick, so it's gated
+        # the same way rather than evicting equity positions for no reason
+        # when the agent isn't buying equity this cycle.
+        equity_enabled = config.automate_agent_asset_mode in {"equity", "both"}
+        equity_to_evict = plan.to_evict if equity_enabled else []
+        equity_to_buy = plan.to_buy if equity_enabled else []
+
+        for symbol in equity_to_evict:
             try:
                 position = next((p for p in open_positions if p.get("symbol") == symbol), None)
                 held_qty = _as_float((position or {}).get("qty"))
@@ -5928,7 +6217,7 @@ async def _build_automate_agent_text() -> str:
 
         candidates_by_symbol = {c.symbol.upper(): c for c in candidates}
         bought: list[str] = []
-        for symbol in plan.to_buy:
+        for symbol in equity_to_buy:
             try:
                 price, price_err = await asyncio.to_thread(alpaca.get_latest_price, symbol)
                 if not price or price <= 0:
@@ -5936,18 +6225,15 @@ async def _build_automate_agent_text() -> str:
                     continue
                 # Fixed-fractional sizing: a constant % of *current* equity,
                 # not a hardcoded dollar figure, so sizing scales with the
-                # account and automatically shrinks after a drawdown. Falls
-                # back to the fixed notional only if equity wasn't available.
-                # On top of that, tilt the size (+/-25%) by the candidate's
-                # own confidence score, so a 95-confidence pick and a
-                # barely-cleared-the-bar pick don't get identical risk.
+                # account and automatically shrinks after a drawdown. equity
+                # is guaranteed > 0 here -- the whole cycle already bailed
+                # out above if it couldn't be verified. On top of that, tilt
+                # the size (+/-25%) by the candidate's own confidence score,
+                # so a 95-confidence pick and a barely-cleared-the-bar pick
+                # don't get identical risk.
                 picked = candidates_by_symbol.get(symbol.upper())
                 size_multiplier = confidence_scaled_risk_multiplier(picked.confidence) if picked is not None else 1.0
-                risk_budget = (
-                    equity * config.automate_agent_risk_pct_per_trade / 100.0 * size_multiplier
-                    if equity > 0
-                    else config.automate_agent_notional_per_trade
-                )
+                risk_budget = equity * config.automate_agent_risk_pct_per_trade / 100.0 * size_multiplier
                 if price > risk_budget:
                     # Whole shares only below -- max(1, ...) would otherwise
                     # force a 1-share buy that blows straight past the
@@ -5994,6 +6280,28 @@ async def _build_automate_agent_text() -> str:
                     "automate_agent: buy failed for %s: %s", symbol, exc
                 )
                 lines.append(f"- Tried to buy {symbol} but hit an unexpected error; skipped.")
+
+        if config.automate_agent_asset_mode in {"options", "both"}:
+            # The equity loop above already consumed equity_to_buy/
+            # equity_to_evict against the shared cap (empty in "options"-only
+            # mode, since no equity buys/evictions happened at all there) --
+            # re-derive how many slots are actually left before attempting
+            # options for the same ranked candidates, so "both" mode can
+            # never push the combined equity+option count past
+            # automate_agent_max_positions.
+            projected_combined_count = (
+                count_automate_positions(open_positions + automate_option_positions)
+                + len(equity_to_buy) - len(equity_to_evict)
+            )
+            remaining_slots = max(0, config.automate_agent_max_positions - projected_combined_count)
+            for symbol in plan.to_buy[:remaining_slots]:
+                try:
+                    lines.append(await _automate_agent_buy_option(symbol, candidates_by_symbol.get(symbol.upper()), equity))
+                except Exception as exc:  # noqa: BLE001 -- one symbol's failure must not abort the cycle
+                    logging.getLogger("discord_stock_prediction_agent").error(
+                        "automate_agent: option buy failed for %s: %s", symbol, exc
+                    )
+                    lines.append(f"- Tried to buy an option on {symbol} but hit an unexpected error; skipped.")
 
         lines.append(
             f"Scanned {len(config.automate_agent_watchlist)} watchlist symbol(s); "
@@ -6090,7 +6398,9 @@ async def symbol_cache_refresh_monitor_error(error: BaseException) -> None:
 # _process_queued_signal_message.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_WHATSAPP_ADMIN_COMMANDS = {"agent_on", "agent_off", "agent_retry_dead"}
+_WHATSAPP_ADMIN_COMMANDS = {
+    "agent_on", "agent_off", "agent_retry_dead", "automate_agent_on", "automate_agent_off",
+}
 _WHATSAPP_NOT_AUTHORIZED_TEXT = (
     "You are not authorized to run this command from WhatsApp. "
     "Ask an operator to add your sender ID to WHATSAPP_ADMIN_SENDER_IDS."
@@ -6099,7 +6409,7 @@ _WHATSAPP_NOT_AUTHORIZED_TEXT = (
 
 async def _dispatch_whatsapp_command_text(name: str, args: list[str], sender_id: str) -> Optional[str]:
     """Return the response text for a recognized command name, or None if
-    `name` isn't one of the 12 known commands (caller should then treat the
+    `name` isn't one of the 15 known commands (caller should then treat the
     message as a normal signal instead).
     """
     if name in _WHATSAPP_ADMIN_COMMANDS and not _is_whatsapp_admin(sender_id):
@@ -6130,12 +6440,19 @@ async def _dispatch_whatsapp_command_text(name: str, args: list[str], sender_id:
         return await _build_agent_learning_text()
     if name == "agent_option_validation":
         return await _build_agent_option_validation_text()
+    if name == "automate_agent_on":
+        return await _build_automate_agent_mode_change_text("ON", sender_id)
+    if name == "automate_agent_off":
+        return await _build_automate_agent_mode_change_text("OFF", sender_id)
+    if name == "automate_agent_mode":
+        return await _build_automate_agent_mode_text()
     return None
 
 
 async def _try_dispatch_whatsapp_command(message) -> bool:
-    """If this WhatsApp message is one of the 12 !agent_* commands, handle it
-    and reply; return True so the caller skips normal signal processing.
+    """If this WhatsApp message is one of the 15 !agent_*/!automate_agent_*
+    commands, handle it and reply; return True so the caller skips normal
+    signal processing.
     Returns False for anything else (including unrecognized !words), leaving
     it to flow through classify_and_parse as a normal signal.
     """

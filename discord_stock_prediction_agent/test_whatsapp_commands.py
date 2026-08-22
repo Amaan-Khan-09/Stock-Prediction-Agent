@@ -66,7 +66,7 @@ def test_read_only_commands_return_nonempty_text():
     for command in (
         "agent_status", "agent_mode", "agent_positions", "agent_option_positions",
         "agent_summary", "agent_health", "agent_dead_letters", "agent_learning",
-        "agent_option_validation",
+        "agent_option_validation", "automate_agent_mode",
     ):
         handled, sent = _run_dispatch(f"!{command}")
         _check(handled, f"!{command} was not recognized as a command")
@@ -132,6 +132,54 @@ def test_admin_can_change_agent_mode():
         tmp.cleanup()
 
 
+def test_non_admin_cannot_change_automate_agent_mode():
+    tmp, original_path = _isolated_state()
+    try:
+        original_admins = getattr(agent.config, "whatsapp_admin_sender_ids")
+        object.__setattr__(agent.config, "whatsapp_admin_sender_ids", "")
+        try:
+            handled, sent = _run_dispatch("!automate_agent_on", sender="15550009999")
+            _check(handled, "!automate_agent_on must still be recognized as a command")
+            _check(agent._WHATSAPP_NOT_AUTHORIZED_TEXT in sent[0], "non-admin must be rejected")
+            _check(
+                state_store.get_automate_agent_mode() == "ON",
+                "automate_agent mode must be unchanged (was already ON by default)",
+            )
+        finally:
+            object.__setattr__(agent.config, "whatsapp_admin_sender_ids", original_admins)
+    finally:
+        state_store.STATE_PATH = original_path
+        tmp.cleanup()
+
+
+def test_admin_can_change_automate_agent_mode_independently_of_agent_mode():
+    tmp, original_path = _isolated_state()
+    try:
+        admin_id = "15550003333"
+        original_admins = getattr(agent.config, "whatsapp_admin_sender_ids")
+        object.__setattr__(agent.config, "whatsapp_admin_sender_ids", admin_id)
+        try:
+            handled, sent = _run_dispatch("!automate_agent_off", sender=admin_id)
+            _check(handled, "!automate_agent_off must be recognized")
+            _check("now OFF" in sent[0], f"expected OFF confirmation, got: {sent[0]!r}")
+            _check(state_store.get_automate_agent_mode() == "OFF", "automate_agent mode must actually change to OFF")
+            _check(
+                state_store.get_agent_mode() == "ON",
+                "the general agent mode (manual signals) must be untouched by this switch",
+            )
+
+            handled2, sent2 = _run_dispatch("!automate_agent_mode", sender=admin_id)
+            _check(handled2 and "OFF" in sent2[0], "automate_agent_mode must reflect the change")
+
+            handled3, sent3 = _run_dispatch("!automate_agent_on", sender=admin_id)
+            _check(handled3 and "now ON" in sent3[0], "admin must be able to turn it back ON")
+        finally:
+            object.__setattr__(agent.config, "whatsapp_admin_sender_ids", original_admins)
+    finally:
+        state_store.STATE_PATH = original_path
+        tmp.cleanup()
+
+
 def test_retry_dead_requires_admin_and_accepts_optional_limit():
     original_admins = getattr(agent.config, "whatsapp_admin_sender_ids")
     object.__setattr__(agent.config, "whatsapp_admin_sender_ids", "")
@@ -161,6 +209,8 @@ def run_all() -> None:
     test_plain_signal_is_not_intercepted()
     test_non_admin_cannot_change_agent_mode()
     test_admin_can_change_agent_mode()
+    test_non_admin_cannot_change_automate_agent_mode()
+    test_admin_can_change_automate_agent_mode_independently_of_agent_mode()
     test_retry_dead_requires_admin_and_accepts_optional_limit()
     print("WHATSAPP COMMAND PARITY TESTS PASSED")
 
