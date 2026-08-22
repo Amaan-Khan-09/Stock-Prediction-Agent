@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from . import discord_agent, pending_market_orders, state_store
+from .config import config
 
 
 class FakeAlpaca:
@@ -237,6 +238,106 @@ async def _run_tests() -> None:
             )
             _check(abs(googl["stop_price"] - 99.0) < 1e-9, "startup loss protection active")
             _check(abs(googl["target_price"] - 110.0) < 1e-9, "startup profit protection active")
+
+            # Re-submitting the same manual signal while the market stays
+            # closed reuses the same deterministic queue_id instead of
+            # piling up a duplicate row.
+            first = pending_market_orders.enqueue_market_order(
+                "AAPL", "buy", 1, "market_closed", 1.0, "BUY:AAPL"
+            )
+            second = pending_market_orders.enqueue_market_order(
+                "AAPL", "buy", 1, "market_closed", 1.0, "BUY:AAPL"
+            )
+            _check(first["_inserted"] is True, "first AAPL enqueue inserted a new row")
+            _check(second["_inserted"] is False, "duplicate AAPL enqueue reused the same row")
+            _check(
+                len([o for o in pending_market_orders.list_queued_market_orders() if o["symbol"] == "AAPL"]) == 1,
+                "duplicate enqueue did not create a second AAPL row",
+            )
+            pending_market_orders.remove_queued_market_order(first["queue_id"])
+
+            # A queued order that can never legitimately succeed (position no
+            # longer matches what was requested) is dropped after too many
+            # attempts instead of retrying forever.
+            original_max_attempts = config.pending_order_max_attempts
+            try:
+                object.__setattr__(config, "pending_order_max_attempts", 1)
+                fake.position_qty = 0  # nothing sellable -- every attempt fails the same way
+                pending_market_orders.enqueue_market_order("IBM", "sell", 5, "market_closed", 0.5)
+                await discord_agent._process_pending_sells()
+                retained = [o for o in pending_market_orders.list_queued_market_orders() if o["symbol"] == "IBM"]
+                _check(len(retained) == 1 and retained[0]["attempts"] == 1, "first failed attempt recorded, not yet expired")
+                await discord_agent._process_pending_sells()
+                _check(
+                    not [o for o in pending_market_orders.list_queued_market_orders() if o["symbol"] == "IBM"],
+                    "queued SELL expired and was removed after exceeding max attempts",
+                )
+                _check(any("expired after" in item for item in messages), "expiry announced")
+            finally:
+                object.__setattr__(config, "pending_order_max_attempts", original_max_attempts)
+                fake.position_qty = 10.0
+
+            # A queued order that has simply sat too long is dropped on age
+            # alone, even with zero failed attempts yet.
+            original_max_age = config.pending_order_max_age_hours
+            try:
+                object.__setattr__(config, "pending_order_max_age_hours", 0.0)
+                pending_market_orders.enqueue_market_order("ORCL", "buy", 1, "market_closed", 1.0)
+                await discord_agent._process_pending_market_buys()
+                _check(
+                    not [o for o in pending_market_orders.list_queued_market_orders() if o["symbol"] == "ORCL"],
+                    "queued BUY expired on age alone",
+                )
+            finally:
+                object.__setattr__(config, "pending_order_max_age_hours", original_max_age)
+
+            # The same age-based safety net applies to the option queue for
+            # plain waiting reasons (market_closed, no contract listed yet, etc).
+            original_max_age = config.pending_order_max_age_hours
+            try:
+                object.__setattr__(config, "pending_order_max_age_hours", 0.0)
+                state_store.add_pending_option_order(
+                    {
+                        "pending_key": "option:stale-msft",
+                        "occ_symbol": "MSFT260918C00420000",
+                        "root": "MSFT",
+                        "side": "CALL",
+                        "qty": 1,
+                        "order_side": "buy",
+                        "reason": "market_closed",
+                    }
+                )
+                await discord_agent._process_pending_option_orders()
+                _check(
+                    not any(item["pending_key"] == "option:stale-msft" for item in state_store.list_pending_option_orders()),
+                    "queued option order expired on age alone",
+                )
+                _check(any("expired after" in item for item in messages), "option expiry announced")
+
+                # A price-conditional entry ("buy once SPX crosses 6000") is
+                # meant to wait indefinitely for its own trigger, so it must
+                # survive the same age cutoff untouched.
+                state_store.add_pending_option_order(
+                    {
+                        "pending_key": "option:waiting-spx",
+                        "occ_symbol": "SPX261016C06000000",
+                        "root": "SPX",
+                        "side": "CALL",
+                        "qty": 1,
+                        "order_side": "buy",
+                        "reason": "waiting_for_underlying_price_condition",
+                        "underlying_trigger_direction": "above",
+                        "underlying_trigger_price": 999999.0,
+                    }
+                )
+                await discord_agent._process_pending_option_orders()
+                _check(
+                    any(item["pending_key"] == "option:waiting-spx" for item in state_store.list_pending_option_orders()),
+                    "price-conditional option entry survives the age cutoff",
+                )
+                state_store.remove_pending_option_order("option:waiting-spx")
+            finally:
+                object.__setattr__(config, "pending_order_max_age_hours", original_max_age)
         finally:
             discord_agent.alpaca = original_alpaca
             discord_agent._send_channel = original_send

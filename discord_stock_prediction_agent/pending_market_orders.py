@@ -119,7 +119,7 @@ def enqueue_market_order(
     client_id = _client_order_id(key, normalized_side)
     now = _utcstamp()
     with _DB_LOCK, _database() as connection:
-        connection.execute(
+        cursor = connection.execute(
             """
             INSERT INTO pending_market_orders (
                 queue_id, symbol, side, qty, reason, stop_loss_pct, status,
@@ -145,11 +145,19 @@ def enqueue_market_order(
                 str(time_in_force or "DAY").upper(),
             ),
         )
+        # rowcount is 0 when ON CONFLICT DO NOTHING suppressed the insert --
+        # i.e. an order with this same deterministic queue_id was already
+        # queued, so this call is a duplicate resubmission rather than a new
+        # order. Callers use this to tell the user "already queued" instead
+        # of silently no-op-ing.
+        inserted = cursor.rowcount > 0
         row = connection.execute(
             "SELECT * FROM pending_market_orders WHERE queue_id = ?", (key,)
         ).fetchone()
         connection.commit()
-    return _row(row)
+    result = _row(row)
+    result["_inserted"] = inserted
+    return result
 
 
 def list_queued_market_orders(limit: Optional[int] = None) -> List[Dict[str, Any]]:

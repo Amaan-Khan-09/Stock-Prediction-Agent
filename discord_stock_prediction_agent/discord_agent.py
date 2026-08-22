@@ -452,6 +452,31 @@ def _is_transient_broker_error(err: str) -> bool:
     )
 
 
+def _pending_order_age_hours(created_at: object) -> float:
+    try:
+        created = datetime.fromisoformat(str(created_at or "").replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=ZoneInfo("UTC"))
+    return (datetime.now(ZoneInfo("UTC")) - created).total_seconds() / 3600.0
+
+
+def _pending_order_expired(attempts: object, created_at: object) -> tuple[bool, str]:
+    """A queued order (waiting for the market to open) that has retried too
+    many times or sat too long can never legitimately succeed -- e.g. the
+    position it was meant to sell no longer exists. Without this cutoff it
+    silently retries forever instead of ever being surfaced or resolved.
+    """
+    attempt_count = int(_as_float(attempts))
+    if attempt_count >= config.pending_order_max_attempts:
+        return True, f"{attempt_count} attempts"
+    age_hours = _pending_order_age_hours(created_at)
+    if age_hours >= config.pending_order_max_age_hours:
+        return True, f"{age_hours:.0f}h old"
+    return False, ""
+
+
 def _rotating_batch(items: list, queue_name: str) -> list:
     if not items:
         return []
@@ -1541,21 +1566,29 @@ def _equity_decision_action(action: str) -> str:
     }.get(str(action or "").upper(), str(action or "").upper())
 
 
-async def _enqueue_parsed_equity(parsed: ParsedSignal, side: str, qty: float, reason: str) -> None:
-    await asyncio.to_thread(
+async def _enqueue_parsed_equity(parsed: ParsedSignal, side: str, qty: float, reason: str) -> bool:
+    """Queue a manual signal for submission once the market opens. Returns
+    True if this created a new queue entry, False if an equity order for the
+    same symbol/action was already queued (and this call was a no-op) --
+    callers use this to tell the user "already queued" instead of silently
+    doing nothing, so repeated signals while the market is closed don't pile
+    up duplicate orders.
+    """
+    queued = await asyncio.to_thread(
         enqueue_market_order,
         parsed.symbol,
         side,
         qty,
         reason,
         config.stop_loss_pct,
-        "",
+        f"{parsed.action}:{parsed.symbol}",
         parsed.action,
         parsed.order_type,
         parsed.limit_price,
         parsed.stop_price,
         parsed.time_in_force,
     )
+    return bool(queued.get("_inserted"))
 
 
 async def _submit_parsed_equity(
@@ -1745,11 +1778,14 @@ async def _handle_buy(message: discord.Message, parsed: ParsedSignal, prediction
 
     market_open, market_err = await asyncio.to_thread(alpaca.is_market_open)
     if not market_open:
-        await _enqueue_parsed_equity(parsed, "buy", quantity, market_err or "market_closed")
+        newly_queued = await _enqueue_parsed_equity(parsed, "buy", quantity, market_err or "market_closed")
         await asyncio.to_thread(_record_order, parsed.symbol, "buy", quantity, "queued", "", "equity", "market_closed")
         await _send_review_or_reply(
             message,
-            f"{parsed.symbol}: paper BUY approved, but the market is closed. "
+            f"{parsed.symbol}: a paper BUY is already queued and waiting for market open; "
+            "not adding a duplicate."
+            if not newly_queued
+            else f"{parsed.symbol}: paper BUY approved, but the market is closed. "
             "It has been queued and will be submitted when Alpaca reports the market is open."
         )
         return
@@ -1759,11 +1795,14 @@ async def _handle_buy(message: discord.Message, parsed: ParsedSignal, prediction
     )
     if not order:
         if _is_market_closed_order_error(err) or _is_transient_broker_error(err):
-            await _enqueue_parsed_equity(parsed, "buy", quantity, err)
+            newly_queued = await _enqueue_parsed_equity(parsed, "buy", quantity, err)
             await asyncio.to_thread(_record_order, parsed.symbol, "buy", quantity, "queued", "", "equity", "broker_retry")
             await _send_review_or_reply(
                 message,
-                f"{parsed.symbol}: paper BUY approved and queued because Alpaca is temporarily "
+                f"{parsed.symbol}: a paper BUY is already queued and waiting for market open; "
+                "not adding a duplicate."
+                if not newly_queued
+                else f"{parsed.symbol}: paper BUY approved and queued because Alpaca is temporarily "
                 "unavailable or the market is closed. The agent will retry safely."
             )
             return
@@ -1886,10 +1925,13 @@ async def _handle_sell(message: discord.Message, parsed: ParsedSignal, predictio
 
     market_open, clock_err = await asyncio.to_thread(alpaca.is_market_open)
     if not market_open:
-        await _enqueue_parsed_equity(parsed, "sell", quantity, "manual_sell_market_closed")
+        newly_queued = await _enqueue_parsed_equity(parsed, "sell", quantity, "manual_sell_market_closed")
         await _send_review_or_reply(
             message,
-            f"{parsed.symbol}: market is closed, so the SELL is queued. "
+            f"{parsed.symbol}: a paper SELL is already queued and waiting for market open; "
+            "not adding a duplicate."
+            if not newly_queued
+            else f"{parsed.symbol}: market is closed, so the SELL is queued. "
             "The agent will attempt it when Alpaca market opens."
         )
         return
@@ -1916,7 +1958,7 @@ async def _handle_sell(message: discord.Message, parsed: ParsedSignal, predictio
     )
     if not order:
         if _is_market_closed_order_error(err) or _is_transient_broker_error(err):
-            await _enqueue_parsed_equity(parsed, "sell", quantity, err or "broker_retry")
+            newly_queued = await _enqueue_parsed_equity(parsed, "sell", quantity, err or "broker_retry")
             await asyncio.to_thread(
                 _record_order,
                 parsed.symbol,
@@ -1929,7 +1971,10 @@ async def _handle_sell(message: discord.Message, parsed: ParsedSignal, predictio
             )
             await _send_review_or_reply(
                 message,
-                f"{parsed.symbol}: paper SELL approved and queued for a safe Alpaca retry.",
+                f"{parsed.symbol}: a paper SELL is already queued and waiting for market open; "
+                "not adding a duplicate."
+                if not newly_queued
+                else f"{parsed.symbol}: paper SELL approved and queued for a safe Alpaca retry.",
             )
             return
         await _block_trade(message, parsed.symbol, f"Paper SELL was not placed. {_public_error(err)}", "alpaca_reject")
@@ -4917,6 +4962,20 @@ async def _process_pending_sells() -> None:
                 mark_market_order_failed, pending_key, "Invalid queued SELL data."
             )
             continue
+        expired, expiry_detail = _pending_order_expired(pending.get("attempts"), pending.get("created_at"))
+        if expired:
+            await asyncio.to_thread(remove_queued_market_order, pending_key)
+            await asyncio.to_thread(
+                record_safety_block,
+                {"symbol": symbol, "category": "queued_sell_expired", "reason": str(pending.get("last_error") or "")},
+            )
+            await _send_channel(
+                config.discord_paper_log_channel_id or config.discord_review_channel_id,
+                f"{symbol}: queued SELL expired after {expiry_detail} "
+                f"(last error: {str(pending.get('last_error') or 'none')}). "
+                "Removed -- please check manually.",
+            )
+            continue
         is_short = str(pending.get("action") or "").upper() == "SELL_SHORT"
         held = 0.0
         if not is_short:
@@ -4994,6 +5053,20 @@ async def _process_pending_market_buys() -> None:
         if not symbol or qty <= 0:
             await asyncio.to_thread(
                 mark_market_order_failed, pending_key, "Invalid queued BUY data."
+            )
+            continue
+        expired, expiry_detail = _pending_order_expired(pending.get("attempts"), pending.get("created_at"))
+        if expired:
+            await asyncio.to_thread(remove_queued_market_order, pending_key)
+            await asyncio.to_thread(
+                record_safety_block,
+                {"symbol": symbol, "category": "queued_buy_expired", "reason": str(pending.get("last_error") or "")},
+            )
+            await _send_channel(
+                config.discord_paper_log_channel_id or config.discord_review_channel_id,
+                f"{symbol}: queued BUY expired after {expiry_detail} "
+                f"(last error: {str(pending.get('last_error') or 'none')}). "
+                "Removed -- please check manually.",
             )
             continue
         if str(pending.get("action") or "").upper() == "BUY_TO_COVER":
@@ -5314,6 +5387,32 @@ async def _process_pending_option_orders() -> None:
                 f"{occ_symbol or root}: conditional entry deadline passed. The queued signal was removed without submitting an order.",
             )
             continue
+
+        # A price-conditional entry ("buy once SPX crosses 6000") is meant to
+        # wait indefinitely for its own trigger, not a fixed age cutoff --
+        # _option_cancel_deadline_passed above is the intended way to bound
+        # those, via the user's own stated deadline. Everything else here
+        # (plain market-closed signals, contract/position not found yet, and
+        # protective exits re-derived fresh every cycle from a live position)
+        # has no legitimate reason to sit for weeks, so it gets the same
+        # bounded-retry safety net as the equity queue.
+        is_price_conditional = bool(
+            str(pending.get("underlying_trigger_direction") or "") and _as_float(pending.get("underlying_trigger_price")) > 0
+        )
+        if not is_price_conditional:
+            expired, expiry_detail = _pending_order_expired(pending.get("attempts"), pending.get("created_at"))
+            if expired:
+                await asyncio.to_thread(remove_pending_option_order, pending_key)
+                await asyncio.to_thread(
+                    record_safety_block,
+                    {"symbol": occ_symbol or root, "category": f"queued_option_{reason}_expired", "reason": ""},
+                )
+                await _send_channel(
+                    config.discord_paper_log_channel_id or config.discord_review_channel_id,
+                    f"{occ_symbol or root}: queued option {order_side} ({reason}) expired after "
+                    f"{expiry_detail}. Removed -- please check manually.",
+                )
+                continue
 
         if pending.get("contract_pending"):
             contracts = None

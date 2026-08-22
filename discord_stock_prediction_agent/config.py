@@ -109,6 +109,12 @@ class AgentConfig:
     signal_retry_base_seconds: int = _int_env("SIGNAL_RETRY_BASE_SECONDS", 5)
     signal_claim_timeout_seconds: int = _int_env("SIGNAL_CLAIM_TIMEOUT_SECONDS", 600)
     pending_order_batch_size: int = _int_env("PENDING_ORDER_BATCH_SIZE", 100)
+    # A queued order (waiting for the market to open) is dropped instead of
+    # retried again once either threshold is crossed -- without this, an
+    # order that can never legitimately succeed (e.g. the position it was
+    # meant to sell no longer exists) retries silently forever.
+    pending_order_max_attempts: int = _int_env("PENDING_ORDER_MAX_ATTEMPTS", 20)
+    pending_order_max_age_hours: int = _int_env("PENDING_ORDER_MAX_AGE_HOURS", 48)
     runtime_log_level: str = os.getenv("RUNTIME_LOG_LEVEL", "INFO").strip().upper()
     runtime_log_max_bytes: int = _int_env("RUNTIME_LOG_MAX_BYTES", 5_000_000)
     runtime_log_backup_count: int = _int_env("RUNTIME_LOG_BACKUP_COUNT", 5)
@@ -315,6 +321,10 @@ def production_config_errors() -> list[str]:
         errors.append("PROTECTION_MONITOR_SECONDS must be at least 15")
     if not 1 <= config.pending_order_batch_size <= 1_000:
         errors.append("PENDING_ORDER_BATCH_SIZE must be between 1 and 1000")
+    if config.pending_order_max_attempts < 1:
+        errors.append("PENDING_ORDER_MAX_ATTEMPTS must be at least 1")
+    if config.pending_order_max_age_hours < 1:
+        errors.append("PENDING_ORDER_MAX_AGE_HOURS must be at least 1")
     if config.whatsapp_webhook_enabled:
         if not config.has_whatsapp:
             errors.append(
