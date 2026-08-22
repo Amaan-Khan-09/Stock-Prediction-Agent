@@ -40,6 +40,15 @@ _FLY_SHORTHAND_RE = re.compile(
     re.IGNORECASE,
 )
 _FLY_KEYWORD_RE = re.compile(r"\bFLYS?\b|\bFLIES\b|\bBUTTERFLY\b", re.IGNORECASE)
+_VERTICAL_SPREAD_SHORTHAND_RE = re.compile(
+    r"\b(\d{2,6})(C|P)?\s*/\s*(\d{1,6})(C|P)?\b",
+    re.IGNORECASE,
+)
+_SPREAD_KEYWORD_RE = re.compile(r"\bSPREAD\b|\bVERTICAL\b", re.IGNORECASE)
+_STRADDLE_SINGLE_STRIKE_RE = re.compile(r"(\d{1,6}(?:\.\d+)?)\s+STRADDLES?\b", re.IGNORECASE)
+_STRANGLE_TWO_STRIKE_RE = re.compile(
+    r"(\d{1,6}(?:\.\d+)?)\s*/\s*(\d{1,6}(?:\.\d+)?)\s+STRANGLES?\b", re.IGNORECASE
+)
 
 
 def _number(value: str) -> int | float:
@@ -216,8 +225,8 @@ def _compact_fly_legs(text: str, root: str) -> list[dict[str, Any]]:
         return []
     if len(set(strikes)) != 3:
         return []
-    sold_to_open = bool(re.search(r"\bSOLD\b|\bSELL\b|\bSTO\b", text, re.IGNORECASE)) and not bool(
-        re.search(r"\bBOUGHT\b|\bBUY\b|\bBTO\b|\bADD(?:ING|ED)?\b", text, re.IGNORECASE)
+    sold_to_open = bool(re.search(r"\bSOLD\b|\bSELL(?:ING)?\b|\bSTO\b", text, re.IGNORECASE)) and not bool(
+        re.search(r"\bBOUGHT\b|\bBUY(?:ING)?\b|\bBTO\b|\bADD(?:ING|ED)?\b", text, re.IGNORECASE)
     )
     wing_action = "SELL_TO_OPEN" if sold_to_open else "BUY_TO_OPEN"
     body_action = "BUY_TO_OPEN" if sold_to_open else "SELL_TO_OPEN"
@@ -228,6 +237,118 @@ def _compact_fly_legs(text: str, root: str) -> list[dict[str, Any]]:
         {"action": body_action, "option_type": side, "strike": _number(str(strikes[1])), "expiration": expiry, "ratio": 2, "_root": root_upper},
         {"action": wing_action, "option_type": side, "strike": _number(str(strikes[2])), "expiration": expiry, "ratio": 1, "_root": root_upper},
     ]
+
+
+def _compact_vertical_spread_legs(text: str, root: str) -> list[dict[str, Any]]:
+    """Parse the common retail-room 2-strike vertical spread shorthand:
+    "220/210 put spread" or "170/180 call spread" -- two slash-separated
+    strikes, one shared side, usually no per-leg action token.
+    _regular_legs() can't handle this since it needs each leg to
+    independently look like "<strike><side>", and typically only the
+    second (adjacent-to-"put"/"call") token here does.
+
+    A vertical spread is always one long + one short leg on the same side
+    and expiry. The action for the first-listed strike comes from whatever
+    action word is already in the message (SELL/BUY/STO/BTO/SOLD/BOUGHT),
+    falling back to SELL if "credit" is mentioned or BUY if "debit" is
+    mentioned (a credit spread's first-quoted leg is conventionally the one
+    sold), defaulting to BUY_TO_OPEN if neither is present. The second
+    strike always gets the opposite action. Returns [] when the spread
+    keyword is missing or the side can't be determined -- a bare N/N (e.g.
+    a date or ratio) must never be mistaken for this.
+    """
+    if not _SPREAD_KEYWORD_RE.search(text):
+        return []
+    match = _VERTICAL_SPREAD_SHORTHAND_RE.search(text)
+    if not match:
+        return []
+    first_raw, first_side_token, second_raw, second_side_token = match.groups()
+    sides = {token.upper() for token in (first_side_token, second_side_token) if token}
+    if len(sides) > 1:
+        return []
+    if sides:
+        side = "PUT" if next(iter(sides)).startswith("P") else "CALL"
+    else:
+        trailing_side = re.search(r"\bCALLS?\b|\bPUTS?\b", text[match.end():match.end() + 20], re.IGNORECASE)
+        if not trailing_side:
+            return []
+        side = "PUT" if trailing_side.group(0).upper().startswith("P") else "CALL"
+    try:
+        first_strike = float(first_raw)
+        second_strike = float(_expand_shorthand_strike(first_raw, second_raw))
+    except ValueError:
+        return []
+    if first_strike == second_strike:
+        return []
+    sold_first = bool(re.search(r"\bSOLD\b|\bSELL(?:ING)?\b|\bSTO\b", text, re.IGNORECASE))
+    bought_first = bool(re.search(r"\bBOUGHT\b|\bBUY(?:ING)?\b|\bBTO\b|\bADD(?:ING|ED)?\b", text, re.IGNORECASE))
+    if sold_first and not bought_first:
+        first_action = "SELL_TO_OPEN"
+    elif bought_first and not sold_first:
+        first_action = "BUY_TO_OPEN"
+    elif re.search(r"\bCREDIT\b", text, re.IGNORECASE):
+        first_action = "SELL_TO_OPEN"
+    elif re.search(r"\bDEBIT\b", text, re.IGNORECASE):
+        first_action = "BUY_TO_OPEN"
+    else:
+        first_action = "BUY_TO_OPEN"
+    second_action = "BUY_TO_OPEN" if first_action == "SELL_TO_OPEN" else "SELL_TO_OPEN"
+    expiry = default_expiry_date("0dte").strftime("%m/%d/%Y")
+    root_upper = (root or "").upper()
+    return [
+        {"action": first_action, "option_type": side, "strike": _number(str(first_strike)), "expiration": expiry, "ratio": 1, "_root": root_upper},
+        {"action": second_action, "option_type": side, "strike": _number(str(second_strike)), "expiration": expiry, "ratio": 1, "_root": root_upper},
+    ]
+
+
+def _compact_straddle_strangle_legs(text: str, root: str) -> list[dict[str, Any]]:
+    """Parse straddle/strangle alerts, which unlike every other multi-leg
+    shorthand here inherently have NO per-leg (or even message-level) C/P
+    side word -- a straddle/strangle IS one call leg + one put leg by
+    definition, so _regular_legs()'s "each leg needs its own side letter"
+    requirement can never be satisfied, no matter how the strikes are
+    written. "STO TSLA 250 straddle at 18.50" and "Bought QQQ 400/410
+    strangle for 6.20" both have a real strike/structure but zero side
+    letters anywhere in the message.
+
+    A straddle uses one strike for both legs; a strangle uses two (by
+    convention the lower strike is the put, the higher the call). Both legs
+    share the same open/close direction -- a long straddle/strangle is
+    bought calls AND bought puts together, a short one is sold calls AND
+    sold puts together -- derived from the message's action word the same
+    way as the other compact shorthands here, defaulting to BUY_TO_OPEN.
+    """
+    sold = bool(re.search(r"\bSOLD\b|\bSELL(?:ING)?\b|\bSTO\b", text, re.IGNORECASE))
+    bought = bool(re.search(r"\bBOUGHT\b|\bBUY(?:ING)?\b|\bBTO\b|\bADD(?:ING|ED)?\b", text, re.IGNORECASE))
+    action = "SELL_TO_OPEN" if (sold and not bought) else "BUY_TO_OPEN"
+    expiry = default_expiry_date("0dte").strftime("%m/%d/%Y")
+    root_upper = (root or "").upper()
+
+    strangle_match = _STRANGLE_TWO_STRIKE_RE.search(text)
+    if strangle_match:
+        try:
+            strike_a, strike_b = sorted(float(value) for value in strangle_match.groups())
+        except ValueError:
+            return []
+        if strike_a == strike_b:
+            return []
+        return [
+            {"action": action, "option_type": "PUT", "strike": _number(str(strike_a)), "expiration": expiry, "ratio": 1, "_root": root_upper},
+            {"action": action, "option_type": "CALL", "strike": _number(str(strike_b)), "expiration": expiry, "ratio": 1, "_root": root_upper},
+        ]
+
+    straddle_match = _STRADDLE_SINGLE_STRIKE_RE.search(text)
+    if straddle_match:
+        try:
+            strike = float(straddle_match.group(1))
+        except ValueError:
+            return []
+        return [
+            {"action": action, "option_type": "CALL", "strike": _number(str(strike)), "expiration": expiry, "ratio": 1, "_root": root_upper},
+            {"action": action, "option_type": "PUT", "strike": _number(str(strike)), "expiration": expiry, "ratio": 1, "_root": root_upper},
+        ]
+
+    return []
 
 
 def _price_fields(text: str) -> dict[str, Any]:
@@ -462,6 +583,10 @@ def build_multi_leg_contract(text: str, option: object = None) -> dict[str, Any]
     legs = _regular_legs(raw, root)
     if len(legs) < 2 and not stock_leg:
         legs = _compact_fly_legs(raw, root) or legs
+    if len(legs) < 2 and not stock_leg:
+        legs = _compact_vertical_spread_legs(raw, root) or legs
+    if len(legs) < 2 and not stock_leg:
+        legs = _compact_straddle_strangle_legs(raw, root) or legs
     if len(legs) < 2 and not stock_leg:
         return {}
     if not root or any(not leg.get("_root") for leg in legs):

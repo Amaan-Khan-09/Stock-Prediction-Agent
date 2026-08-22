@@ -113,6 +113,65 @@ def test_bare_butterfly_keyword_and_compact_strikes_with_trailing_side_word() ->
     )
 
 
+def test_compact_two_strike_vertical_spread_expands_to_both_legs() -> None:
+    print("\nTest: compact 2-strike vertical spread shorthand ('220/210 put spread') expands to both legs")
+    # Regression: only the strike adjacent to the side word ("210 put")
+    # matched the per-leg regex, so the whole strategy silently collapsed
+    # into a single-leg close/open on that one strike, dropping the other
+    # leg entirely -- turning a defined-risk 2-leg spread into a fabricated
+    # naked single-leg trade.
+    cases = [
+        ("Selling AAPL 220/210 put spread for 3.20 credit", "AAPL", "PUT", "bull_put_spread", 220.0, "open_short", 210.0, "open_long"),
+        ("Bought SPY 450/460 call spread for 2.50 debit", "SPY", "CALL", "bull_call_spread", 450.0, "open_long", 460.0, "open_short"),
+        ("STO TSLA 250/240 put spread @1.80", "TSLA", "PUT", "bull_put_spread", 250.0, "open_short", 240.0, "open_long"),
+    ]
+    for text, root, side, structure, strike1, action1, strike2, action2 in cases:
+        parsed = classify_and_parse(text)
+        opt = parsed.option
+        _assert(opt is not None and opt.valid, f"{text!r} parses as valid", getattr(opt, "reason", None))
+        if opt is None or not opt.valid:
+            continue
+        _assert(len(opt.legs) == 2, f"{text!r}: expands to 2 legs", str(len(opt.legs)))
+        _assert(opt.structure == structure, f"{text!r}: structure == {structure}", str(opt.structure))
+        _assert(all(leg.root == root and leg.side == side for leg in opt.legs), f"{text!r}: both legs are {root} {side}")
+        legs_by_strike = {leg.strike: leg.order_action for leg in opt.legs}
+        _assert(legs_by_strike.get(strike1) == action1, f"{text!r}: {strike1} leg is {action1}", str(legs_by_strike))
+        _assert(legs_by_strike.get(strike2) == action2, f"{text!r}: {strike2} leg is {action2}", str(legs_by_strike))
+    # Prior FLY/butterfly/iron-condor compact shorthand must be unaffected.
+    fly = classify_and_parse("SPX : Bought SPX 7725/20/15P FLY at .80").option
+    _assert(fly is not None and fly.valid and len(fly.legs) == 3, "FLY compact shorthand still works unchanged")
+    condor = classify_and_parse("SELL SPX 5800/5850/5900/5950 IC").option
+    _assert(condor is not None and condor.valid and len(condor.legs) == 4, "iron condor compact shorthand still works unchanged")
+
+
+def test_straddle_and_strangle_have_no_side_letter_by_definition() -> None:
+    print("\nTest: straddle/strangle alerts (inherently no CALL/PUT side word) still parse as valid 2-leg trades")
+    # Regression: a straddle/strangle is one call leg + one put leg by
+    # definition, so it never has a per-leg (or even message-level) side
+    # word at all -- the generic "no strike or delta with CALL/PUT side was
+    # found" guard rejected every one of these outright, even though the
+    # structure keyword itself was already being recognized correctly.
+    text = "STO TSLA 250 straddle at 18.50"
+    opt = classify_and_parse(text).option
+    _assert(opt is not None and opt.valid, f"{text!r} parses as valid", getattr(opt, "reason", None))
+    _assert(opt.structure == "short_straddle", f"{text!r}: structure == short_straddle", str(opt.structure))
+    _assert(len(opt.legs) == 2, f"{text!r}: expands to 2 legs", str(len(opt.legs)))
+    _assert(
+        {leg.side for leg in opt.legs} == {"CALL", "PUT"} and all(leg.strike == 250.0 for leg in opt.legs),
+        f"{text!r}: one CALL and one PUT leg, both at strike 250",
+    )
+    _assert(all(leg.order_action == "open_short" for leg in opt.legs), f"{text!r}: both legs sold to open (short straddle)")
+
+    text = "Bought QQQ 400/410 strangle for 6.20"
+    opt = classify_and_parse(text).option
+    _assert(opt is not None and opt.valid, f"{text!r} parses as valid", getattr(opt, "reason", None))
+    _assert(opt.structure == "long_strangle", f"{text!r}: structure == long_strangle", str(opt.structure))
+    _assert(len(opt.legs) == 2, f"{text!r}: expands to 2 legs", str(len(opt.legs)))
+    legs_by_side = {leg.side: leg.strike for leg in opt.legs}
+    _assert(legs_by_side.get("PUT") == 400.0 and legs_by_side.get("CALL") == 410.0, f"{text!r}: put at the lower strike, call at the higher", str(legs_by_side))
+    _assert(all(leg.order_action == "open_long" for leg in opt.legs), f"{text!r}: both legs bought to open (long strangle)")
+
+
 def run_all() -> None:
     print("=" * 60)
     print("DIVERSE REAL-WORLD SIGNAL STRESS-TEST REGRESSIONS")
@@ -122,6 +181,8 @@ def run_all() -> None:
     test_word_fraction_partial_closes_set_close_percent()
     test_shared_root_propagates_to_legs_that_dont_repeat_the_ticker()
     test_bare_butterfly_keyword_and_compact_strikes_with_trailing_side_word()
+    test_compact_two_strike_vertical_spread_expands_to_both_legs()
+    test_straddle_and_strangle_have_no_side_letter_by_definition()
 
     print("\n" + "=" * 60)
     print(f"Results: {PASS} passed, {FAIL} failed")
