@@ -5209,6 +5209,31 @@ async def _process_pending_multi_leg_order(pending: dict, pending_key: str) -> N
         await asyncio.to_thread(remove_pending_option_order, pending_key)
         return
 
+    # Same bounded-retry safety net as the single-leg option queue: every
+    # failure branch below is a bare `return` (retry next cycle) with no
+    # attempt tracking, so a leg that never gets its required position (or a
+    # contract that never gets listed) would otherwise retry forever. A
+    # price-conditional entry is exempt -- it is meant to wait indefinitely
+    # for its own trigger, checked further down.
+    is_price_conditional = bool(
+        str(pending.get("underlying_trigger_direction") or "") and _as_float(pending.get("underlying_trigger_price")) > 0
+    )
+    if not is_price_conditional:
+        expired, expiry_detail = _pending_order_expired(pending.get("attempts"), pending.get("created_at"))
+        if expired:
+            reason = str(pending.get("reason") or "queued_multi_leg")
+            await asyncio.to_thread(remove_pending_option_order, pending_key)
+            await asyncio.to_thread(
+                record_safety_block,
+                {"symbol": root, "category": f"queued_mleg_{reason}_expired", "reason": ""},
+            )
+            await _send_channel(
+                config.discord_paper_log_channel_id or config.discord_review_channel_id,
+                f"{root}: queued multi-leg {reason} expired after {expiry_detail}. "
+                "Removed -- please check manually.",
+            )
+            return
+
     if pending.get("contract_pending") or not all(item.get("symbol") for item in leg_specs):
         contract_check = await asyncio.to_thread(
             _multi_leg_contract_lookup,

@@ -336,6 +336,29 @@ async def _run_tests() -> None:
                     "price-conditional option entry survives the age cutoff",
                 )
                 state_store.remove_pending_option_order("option:waiting-spx")
+
+                # The same safety net applies to the multi-leg queue -- e.g. a
+                # protective stop-loss/take-profit exit whose required legs
+                # never match a held position again.
+                state_store.add_pending_option_order(
+                    {
+                        "pending_key": "mleg-exit:stale",
+                        "order_class": "mleg",
+                        "root": "AAPL",
+                        "qty": 1,
+                        "reason": "multi_leg_stop_loss",
+                        "legs": [
+                            {"symbol": "AAPL261016P00130000", "requires_position": True, "ratio_qty": 1},
+                            {"symbol": "AAPL261016P00140000", "requires_position": True, "ratio_qty": 1},
+                        ],
+                    }
+                )
+                await discord_agent._process_pending_option_orders()
+                _check(
+                    not any(item["pending_key"] == "mleg-exit:stale" for item in state_store.list_pending_option_orders()),
+                    "queued multi-leg order expired on age alone",
+                )
+                _check(any("multi-leg" in item and "expired after" in item for item in messages), "multi-leg expiry announced")
             finally:
                 object.__setattr__(config, "pending_order_max_age_hours", original_max_age)
         finally:
