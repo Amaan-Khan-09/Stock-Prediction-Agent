@@ -118,6 +118,7 @@ def plan_automate_trades(
     min_positions: int,
     max_positions: int,
     min_confidence: float = 0.0,
+    max_evictions_per_cycle: int = 1,
 ) -> TradePlan:
     """Decides what to buy and what to evict first, given ranked candidates
     and the currently open automate_agent-tagged positions.
@@ -126,6 +127,14 @@ def plan_automate_trades(
     and never exceeds max_positions total automate_agent-tagged positions.
     Symbols already held (by automate_agent) are skipped -- no point
     "buying" something already open.
+
+    max_evictions_per_cycle additionally caps how much of the existing book
+    can be swapped out in one call. Without this, a single cycle where
+    max_positions-or-more fresh candidates all outrank the current holdings
+    could evict the entire book at once -- a lot of turnover from one
+    scan, and inconsistent with this module's stated "bounded on purpose to
+    limit risk" design. The default of 1 means at most one position rotates
+    per cycle; a full book gradually rotates across multiple cycles instead.
     """
     ranked = rank_boom_candidates(candidates, min_confidence)
     held_symbols = {
@@ -152,7 +161,10 @@ def plan_automate_trades(
             continue
         # At cap -- evict the oldest automate_agent position to make room,
         # but only if we haven't already hit the overall max_positions
-        # ceiling on how many buys this single cycle should attempt.
+        # ceiling on how many buys this single cycle should attempt, or the
+        # per-cycle eviction limit.
+        if len(to_evict) >= max_evictions_per_cycle:
+            break
         evict = oldest_automate_position(remaining_positions)
         if evict is None:
             break

@@ -115,6 +115,17 @@ REPRESENTATIVE_CASES = [
         "SELL ALL MY SHARES OF RIVN",
         {"asset_type": "STOCK", "action": "SELL", "symbol": "RIVN", "order_type": "MARKET", "status": "VALID"},
     ),
+    (
+        # Regression: "TRAILING STOP 5%" was previously misread as a bare
+        # STOP order at a $5 stop price (from "STOP 5"), which would have
+        # submitted a nonsensical stop order instead of a plain market buy.
+        "BUY AAPL 10 SHARES TRAILING STOP 5%",
+        {"asset_type": "STOCK", "action": "BUY", "symbol": "AAPL", "quantity": 10, "order_type": "MARKET", "status": "VALID"},
+    ),
+    (
+        "SELL MSFT QTY 5 TRAIL STOP 3%",
+        {"asset_type": "STOCK", "action": "SELL", "symbol": "MSFT", "quantity": 5, "order_type": "MARKET", "status": "VALID"},
+    ),
 ]
 
 

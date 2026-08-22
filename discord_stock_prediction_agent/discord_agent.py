@@ -3764,6 +3764,8 @@ async def on_ready() -> None:
         stop_loss_monitor.start()
     if config.automate_agent_autoscan_enabled and not automate_agent_autoscan.is_running():
         automate_agent_autoscan.start()
+    if not symbol_cache_refresh_monitor.is_running():
+        symbol_cache_refresh_monitor.start()
     if config.whatsapp_webhook_enabled:
         try:
             start_whatsapp_webhook_server()
@@ -5880,6 +5882,7 @@ async def _build_automate_agent_text() -> str:
             config.automate_agent_min_positions,
             config.automate_agent_max_positions,
             config.automate_agent_min_confidence,
+            config.automate_agent_max_evictions_per_cycle,
         )
 
         if not plan.to_buy:
@@ -5903,8 +5906,18 @@ async def _build_automate_agent_text() -> str:
                 )
                 if order:
                     await asyncio.to_thread(_record_order, symbol, "sell", held_qty, "submitted", str(order.get("id") or ""), "equity", "automate_agent_evict")
-                    await asyncio.to_thread(remove_position, symbol)
-                    lines.append(f"- Evicted {symbol} ({held_qty:g} sh) to free a slot at the {config.automate_agent_max_positions}-position cap.")
+                    # Do NOT remove_position here -- that would delete local
+                    # protection tracking (and skip recording a trade_outcomes
+                    # P&L entry, which today_realized_pnl needs for the daily-
+                    # loss circuit breaker) before Alpaca confirms the sell
+                    # actually filled. Every other exit path in this file
+                    # tracks-then-reconciles for exactly this reason; a
+                    # rejected/partial eviction sell must leave the position
+                    # tracked and protected, not silently orphaned.
+                    await _track_submitted_exit(
+                        order, symbol, held_qty, "equity", "automate_agent_evict"
+                    )
+                    lines.append(f"- Evicted {symbol} ({held_qty:g} sh) to free a slot at the {config.automate_agent_max_positions}-position cap; awaiting Alpaca fill confirmation.")
                 else:
                     lines.append(f"- Tried to evict {symbol} but the sell was not placed: {_public_error(err)}")
             except Exception as exc:  # noqa: BLE001 -- one symbol's failure must not abort the cycle
@@ -5935,6 +5948,18 @@ async def _build_automate_agent_text() -> str:
                     if equity > 0
                     else config.automate_agent_notional_per_trade
                 )
+                if price > risk_budget:
+                    # Whole shares only below -- max(1, ...) would otherwise
+                    # force a 1-share buy that blows straight past the
+                    # intended risk-based budget for any stock pricier than
+                    # the budget itself, silently defeating fixed-fractional
+                    # sizing for that symbol instead of just sizing down.
+                    lines.append(
+                        f"- Skipped {symbol}: share price ${price:.2f} exceeds the "
+                        f"${risk_budget:.2f} risk budget for this trade; buying even 1 "
+                        "share would oversize the position."
+                    )
+                    continue
                 qty = max(1, int(risk_budget // price))
                 order, err = await asyncio.to_thread(
                     alpaca.submit_market_order,
@@ -6023,6 +6048,38 @@ async def automate_agent_autoscan_error(error: BaseException) -> None:
     )
     await asyncio.sleep(5)
     automate_agent_autoscan.restart()
+
+
+@tasks.loop(seconds=max(300, config.symbol_cache_refresh_interval_seconds))
+async def symbol_cache_refresh_monitor() -> None:
+    """Periodically re-checks the Alpaca tradable-symbol cache.
+
+    refresh_symbol_cache_from_alpaca only actually re-fetches once the cache
+    is 24h+ stale -- on_ready already checks it once at startup, but that
+    left a long-lived process (the recommended deployment pattern) drifting
+    stale for days between restarts, since nothing ever checked again.
+    """
+    status = await asyncio.to_thread(refresh_symbol_cache_from_alpaca)
+    if status.get("status") == "refreshed":
+        logging.getLogger("discord_stock_prediction_agent").info(
+            "Symbol cache refreshed: %s",
+            {k: v for k, v in status.items() if k not in {"error", "message"}},
+        )
+
+
+@symbol_cache_refresh_monitor.before_loop
+async def before_symbol_cache_refresh_monitor() -> None:
+    await bot.wait_until_ready()
+
+
+@symbol_cache_refresh_monitor.error
+async def symbol_cache_refresh_monitor_error(error: BaseException) -> None:
+    logging.getLogger("discord_stock_prediction_agent").error(
+        "Symbol cache refresh task failed and will be restarted.",
+        exc_info=(type(error), error, error.__traceback__),
+    )
+    await asyncio.sleep(5)
+    symbol_cache_refresh_monitor.restart()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

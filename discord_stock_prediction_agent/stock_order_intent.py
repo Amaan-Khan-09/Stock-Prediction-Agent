@@ -438,7 +438,16 @@ def _parse_generic(text: str) -> Optional[dict[str, Any]]:
         result["order_type"] = "STOP_LIMIT"
         result["stop_price"] = _number(stop_limit.group(1))
         result["limit_price"] = _number(stop_limit.group(2))
-    elif _search(r"\bSTOP\b", upper) and stop_only and not _search(r"\bSTOP LOSS\b", upper):
+    elif (
+        _search(r"\bSTOP\b", upper)
+        and stop_only
+        and not _search(r"\bSTOP LOSS\b", upper)
+        # "trailing stop 5%" is a trailing-percentage protection instruction,
+        # not an absolute stop price -- without this exclusion it reads as
+        # "STOP 5" and would submit a stop order at $5 instead of the
+        # intended market/limit entry.
+        and not _search(r"\bTRAIL(?:ING)?\s+STOP\b", upper)
+    ):
         result["order_type"] = "STOP"
         result["stop_price"] = _number(stop_only.group(1))
     elif _search(r"\bLIMIT\b", upper) or price_or_better:

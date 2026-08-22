@@ -446,12 +446,25 @@ def _extract_price_condition(text: str, action: str) -> tuple[str, Optional[floa
     return "", None
 
 
+_TRAILING_STOP_PHRASE_RE = re.compile(
+    r"\bTRAIL(?:ING)?\s+STOP\s*\d+(?:\.\d+)?\s*%?", re.IGNORECASE
+)
+
+
 def _extract_order_details(text: str) -> tuple[str, Optional[float], Optional[float], str]:
     raw = text or ""
     upper = _normalized_text(raw)
     tif_match = re.search(r"\b(GTC|DAY|IOC|FOK)\b", upper)
     tif = tif_match.group(1) if tif_match else "DAY"
-    stop_match = re.search(r"\bSTOP\s*[:@]?\s*\$?\s*(\d+(?:\.\d+)?)\b", raw, re.IGNORECASE)
+    # "trailing stop 5%" / "trail stop 3%" must not be misread as an
+    # absolute stop order at $5 -- it's a trailing-percentage instruction,
+    # not a stop price, and the two look deceptively similar to this regex
+    # once a bare number follows "stop".
+    stop_match = re.search(
+        r"\bSTOP\s*[:@]?\s*\$?\s*(\d+(?:\.\d+)?)\b",
+        _TRAILING_STOP_PHRASE_RE.sub(" ", raw),
+        re.IGNORECASE,
+    )
     limit_match = re.search(r"\bLIMIT\s*[:@]?\s*\$?\s*(\d+(?:\.\d+)?)\b", raw, re.IGNORECASE)
     stop_price = float(stop_match.group(1)) if stop_match else None
     limit_price = float(limit_match.group(1)) if limit_match else None

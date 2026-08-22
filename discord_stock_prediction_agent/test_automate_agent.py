@@ -192,6 +192,38 @@ def test_plan_evicts_oldest_when_at_cap() -> None:
     _assert(plan.to_buy == ["NEW1"], "buys the new candidate", str(plan.to_buy))
 
 
+def test_plan_caps_evictions_per_cycle_even_with_many_fresh_candidates() -> None:
+    print("\nTest: at the cap, plan evicts at most max_evictions_per_cycle positions in one call")
+    existing = [
+        _position("OLD1", updated_at="2026-01-01T00:00:00Z"),
+        _position("OLD2", updated_at="2026-01-02T00:00:00Z"),
+        _position("OLD3", updated_at="2026-01-03T00:00:00Z"),
+        _position("OLD4", updated_at="2026-01-04T00:00:00Z"),
+        _position("OLD5", updated_at="2026-01-05T00:00:00Z"),
+    ]
+    # 5 fresh, higher-ranked BUY candidates -- enough to justify swapping the
+    # entire book if nothing capped it.
+    candidates = [BoomCandidate(f"NEW{i}", "BUY", confidence=90) for i in range(1, 6)]
+    plan = plan_automate_trades(candidates, existing, min_positions=1, max_positions=5)
+    _assert(
+        len(plan.to_evict) == 1,
+        "only 1 eviction per cycle by default, not the entire 5-position book",
+        str(plan.to_evict),
+    )
+    _assert(plan.to_evict == ["OLD1"], "still evicts the oldest first", str(plan.to_evict))
+    _assert(len(plan.to_buy) == 1, "only buys as many as slots freed up", str(plan.to_buy))
+
+    # An explicit higher cap allows more turnover in one cycle if configured.
+    plan_uncapped = plan_automate_trades(
+        candidates, existing, min_positions=1, max_positions=5, max_evictions_per_cycle=5
+    )
+    _assert(
+        len(plan_uncapped.to_evict) == 5,
+        "a raised max_evictions_per_cycle allows more evictions in one call",
+        str(plan_uncapped.to_evict),
+    )
+
+
 def test_plan_never_evicts_a_real_user_position_even_at_cap() -> None:
     print("\nTest: at the cap, plan never evicts a real user's position to make room")
     existing = [
@@ -244,6 +276,7 @@ def run_all() -> None:
     test_plan_buys_up_to_available_slots_no_eviction_needed()
     test_plan_never_exceeds_max_positions()
     test_plan_evicts_oldest_when_at_cap()
+    test_plan_caps_evictions_per_cycle_even_with_many_fresh_candidates()
     test_plan_never_evicts_a_real_user_position_even_at_cap()
     test_plan_skips_symbol_already_held()
     test_plan_buys_nothing_when_no_buy_candidates()

@@ -85,6 +85,14 @@ class AgentConfig:
     option_take_profit_pct: float = _float_env("OPTION_TAKE_PROFIT_PCT", 10.0)
     stop_loss_pct: float = equity_stop_loss_pct  # compatibility alias
     stop_monitor_seconds: int = _int_env("PROTECTION_MONITOR_SECONDS", 15)
+    # refresh_symbol_cache_from_alpaca only actually re-fetches once the
+    # cache turns 24h stale (its own internal gate) -- this just controls how
+    # often we check that gate. Previously the only check was at process
+    # startup, so a long-lived run (the recommended deployment pattern) would
+    # drift stale for days between restarts.
+    symbol_cache_refresh_interval_seconds: int = _int_env(
+        "SYMBOL_CACHE_REFRESH_INTERVAL_SECONDS", 3600
+    )
     max_equity_qty: float = _float_env("MAX_EQUITY_QTY", 1_000_000.0)
     max_option_qty: float = _float_env("MAX_OPTION_QTY", 1_000.0)
     # 0 (the default) means unlimited -- paper trading has no real capital at
@@ -110,6 +118,13 @@ class AgentConfig:
     # separate knob, since both default to the same 1%/10% already.
     automate_agent_min_positions: int = _int_env("AUTOMATE_AGENT_MIN_POSITIONS", 1)
     automate_agent_max_positions: int = _int_env("AUTOMATE_AGENT_MAX_POSITIONS", 5)
+    # Caps how many existing positions can be swapped out in a single scan
+    # cycle, even if enough higher-ranked fresh candidates exist to justify
+    # more -- keeps portfolio churn gradual instead of flipping the whole
+    # book at once.
+    automate_agent_max_evictions_per_cycle: int = _int_env(
+        "AUTOMATE_AGENT_MAX_EVICTIONS_PER_CYCLE", 1
+    )
     automate_agent_exit_minutes_before_close: int = _int_env(
         "AUTOMATE_AGENT_EXIT_MINUTES_BEFORE_CLOSE", 15
     )

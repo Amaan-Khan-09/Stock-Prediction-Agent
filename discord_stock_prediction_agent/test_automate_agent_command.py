@@ -21,6 +21,7 @@ class FakeAutomateAlpaca:
         self.prices: dict[str, float] = {}
         self.quantities: dict[str, float] = {}
         self.submissions: list[dict] = []
+        self.orders: dict[str, dict] = {}
         self.equity = 50_000.0
 
     def ready(self):
@@ -43,9 +44,28 @@ class FakeAutomateAlpaca:
         return (price, "") if price else (None, "no quote")
 
     def submit_market_order(self, symbol: str, side: str, qty: float, client_order_id: str = ""):
-        order = {"id": f"auto-{len(self.submissions) + 1}", "symbol": symbol, "side": side, "qty": str(qty)}
+        # status starts "accepted", not "filled" -- reconciliation tests
+        # simulate the broker confirming the fill in a later call to
+        # get_order, matching how a real market order isn't instantaneous.
+        order = {
+            "id": f"auto-{len(self.submissions) + 1}", "symbol": symbol, "side": side, "qty": str(qty),
+            "status": "accepted", "filled_qty": "0", "filled_avg_price": "0",
+        }
         self.submissions.append(order)
+        self.orders[order["id"]] = order
         return dict(order), ""
+
+    def get_order(self, order_id: str):
+        order = self.orders.get(order_id)
+        return (dict(order), "") if order else (None, "not found")
+
+    def mark_order_filled(self, order_id: str, fill_price: float | None = None) -> None:
+        """Test helper: simulate the broker confirming a fill."""
+        order = self.orders.get(order_id)
+        if not order:
+            return
+        price = fill_price if fill_price is not None else self.prices.get(order["symbol"], 0.0)
+        order.update(status="filled", filled_qty=order["qty"], filled_avg_price=str(price))
 
 
 async def _with_runtime(test_body, predictions: dict[str, object]) -> None:
@@ -316,14 +336,95 @@ def test_at_cap_evicts_oldest_automate_position_before_buying() -> None:
 
         symbols_after = {p["symbol"] for p in state_store.list_positions()}
         assert new_symbol in symbols_after, "the new BUY candidate was bought"
-        assert watchlist[0] not in symbols_after, "the oldest automate position was evicted"
-        assert len(symbols_after) == max_positions, "still at, not above, the cap"
+        # Regression: the eviction sell is only *submitted* here -- the
+        # position must stay tracked (and protected by stop_loss_monitor)
+        # until Alpaca actually confirms the fill, matching every other exit
+        # path in this codebase. Deleting it immediately on mere order
+        # acceptance would silently drop protection if the sell never fills.
+        assert watchlist[0] in symbols_after, (
+            "the evicted position must remain tracked until the exit fill is reconciled"
+        )
+        evict_order_id = next(
+            o["id"] for o in fake.submissions if o["symbol"] == watchlist[0] and o["side"] == "sell"
+        )
+        fake.mark_order_filled(evict_order_id)
+        await discord_agent._reconcile_pending_exit_orders()
+
+        symbols_after_reconcile = {p["symbol"] for p in state_store.list_positions()}
+        assert watchlist[0] not in symbols_after_reconcile, (
+            "the oldest automate position was evicted once the sell was confirmed filled"
+        )
+        assert len(symbols_after_reconcile) == max_positions, "still at, not above, the cap"
 
     predictions = {
         discord_agent.config.automate_agent_watchlist[discord_agent.config.automate_agent_max_positions]: {
             "decision": "BUY", "confidence_score": 75,
         },
     }
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_evicted_position_loss_counts_toward_the_daily_loss_circuit_breaker() -> None:
+    """Regression: eviction previously called the bare remove_position,
+    which never records a trade_outcomes entry -- so a real loss realized by
+    evicting a losing position was invisible to
+    today_realized_pnl(AUTOMATE_AGENT_TAG), the exact figure the daily-loss
+    circuit breaker checks. Routing eviction through the same
+    track-then-reconcile path as every other exit fixes this."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        watchlist = discord_agent.config.automate_agent_watchlist
+        max_positions = discord_agent.config.automate_agent_max_positions
+        for i in range(max_positions):
+            sym = watchlist[i]
+            state_store.upsert_position(sym, 1, 100.0, "", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+            fake.quantities[sym] = 1
+            fake.prices[sym] = 100.0
+        new_symbol = watchlist[max_positions]
+        # The oldest position (watchlist[0]) will be evicted at a loss.
+        fake.prices[watchlist[0]] = 90.0
+        fake.prices[new_symbol] = 75.0
+
+        await discord_agent._build_automate_agent_text()
+        assert state_store.today_realized_pnl(AUTOMATE_AGENT_TAG) == 0.0, (
+            "must not count the loss before the eviction sell is confirmed filled"
+        )
+
+        evict_order_id = next(
+            o["id"] for o in fake.submissions if o["symbol"] == watchlist[0] and o["side"] == "sell"
+        )
+        fake.mark_order_filled(evict_order_id, fill_price=90.0)
+        await discord_agent._reconcile_pending_exit_orders()
+
+        assert state_store.today_realized_pnl(AUTOMATE_AGENT_TAG) == -10.0, (
+            "the -$10 eviction loss (1 sh, $100 -> $90) must now count toward "
+            "automate_agent's own daily-loss circuit breaker"
+        )
+
+    predictions = {
+        discord_agent.config.automate_agent_watchlist[discord_agent.config.automate_agent_max_positions]: {
+            "decision": "BUY", "confidence_score": 75,
+        },
+    }
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_buy_skipped_when_a_single_share_would_exceed_the_risk_budget() -> None:
+    """Regression: max(1, int(risk_budget // price)) used to force a 1-share
+    buy even when that single share cost far more than the risk-based
+    budget -- silently defeating fixed-fractional sizing for any stock
+    pricier than the budget. It must skip instead of oversizing."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.equity = 1_000.0  # 2% risk_pct * confidence-neutral 1.0x = $20 budget
+        fake.prices[symbol] = 50.0  # a single share already costs 2.5x the budget
+
+        text = await discord_agent._build_automate_agent_text()
+
+        assert not fake.submissions, "must not buy a share that costs more than the entire risk budget"
+        assert not state_store.list_positions()
+        assert "exceeds the" in text and "risk budget" in text
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
