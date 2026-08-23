@@ -728,6 +728,16 @@ def test_autoscan_task_runs_the_cycle_when_enabled() -> None:
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
+def test_default_asset_mode_is_equity_only() -> None:
+    # Pins the current product decision: automate_agent places equity
+    # trades only unless explicitly opted into "options"/"both" -- options
+    # and multi-leg support already exist (tested below) but must stay
+    # dormant by default until that's revisited. If this ever flips
+    # silently, automate_agent would start autonomously trading options on
+    # every deployment that never asked for it.
+    assert discord_agent.config.automate_agent_asset_mode == "equity"
+
+
 def _with_asset_mode(mode: str, test_fn) -> None:
     original = discord_agent.config.automate_agent_asset_mode
     object.__setattr__(discord_agent.config, "automate_agent_asset_mode", mode)
