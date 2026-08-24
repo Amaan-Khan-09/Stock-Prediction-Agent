@@ -183,8 +183,8 @@ def set_agent_mode(mode: str, updated_by: str = "") -> Dict[str, Any]:
 def get_automate_agent_mode() -> str:
     """automate_agent's own independent on/off switch -- separate from the
     general agent_control mode (which gates manual/Discord-typed signal
-    processing). Defaults to ON so the feature runs out of the box; still
-    also gated by the general agent mode for safety (both must be ON).
+    processing) and not gated by it at all. Defaults to ON so the feature
+    runs out of the box.
     """
     control = load_state().get("automate_agent_control") or {}
     mode = str(control.get("mode") or "ON").upper()
@@ -846,6 +846,38 @@ def today_realized_pnl(opened_by: str = "") -> float:
             continue
         total += float(outcome.get("pnl_value") or 0)
     return round(total, 6)
+
+
+def list_trade_outcomes(opened_by: str = "", today_only: bool = False) -> List[Dict[str, Any]]:
+    """Returns closed-trade outcome records, optionally scoped to one
+    opened_by tag and/or today (UTC). Backs the automate_agent daily
+    report -- every field a report row needs (symbol, qty, entry/exit
+    price, pnl) is already recorded by close_position_with_outcome.
+    """
+    today = _today_prefix()
+    results = []
+    for outcome in load_state().get("trade_outcomes", []):
+        if opened_by and str(outcome.get("opened_by") or "") != opened_by:
+            continue
+        if today_only and not str(outcome.get("closed_at") or "").startswith(today):
+            continue
+        results.append(outcome)
+    return results
+
+
+def get_automate_agent_report_date() -> str:
+    """The ET calendar date (YYYY-MM-DD) automate_agent's daily report was
+    last posted for -- prevents posting the same day's report twice
+    (including across a bot restart, since this is persisted).
+    """
+    return str(load_state().get("automate_agent_report_date") or "")
+
+
+@_state_mutation
+def set_automate_agent_report_date(date_label: str) -> None:
+    state = load_state()
+    state["automate_agent_report_date"] = str(date_label or "")
+    save_state(state)
 
 
 @_state_mutation

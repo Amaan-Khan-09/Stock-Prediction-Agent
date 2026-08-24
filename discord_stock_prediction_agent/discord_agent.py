@@ -109,6 +109,9 @@ from .state_store import (
     get_agent_mode,
     get_automate_agent_mode,
     set_automate_agent_mode,
+    get_automate_agent_report_date,
+    set_automate_agent_report_date,
+    list_trade_outcomes,
     get_daily_summary,
     get_learning_profile,
     get_option_validation_summary,
@@ -2643,6 +2646,28 @@ def _contract_chunks(option: ParsedOptionSignal, max_chars: int = 950) -> list[s
     return chunks
 
 
+def _now_et() -> datetime:
+    """Single indirection point for "current time in US market time" --
+    lets tests simulate a specific wall-clock moment (e.g. "12:30 has just
+    passed") by monkeypatching this one function instead of the whole
+    datetime module.
+    """
+    return datetime.now(ZoneInfo("America/New_York"))
+
+
+def _automate_agent_eod_cutoff_reached(now_et: datetime, cutoff: str) -> bool:
+    """True once now_et's wall-clock time has reached the configured
+    HH:MM ET cutoff (automate_agent_exit_time_et). A malformed/empty
+    cutoff never forces an exit, matching the "no config, no forced
+    behavior" pattern used elsewhere in this file.
+    """
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(cutoff or "").strip())
+    if not match:
+        return False
+    hour, minute = (int(value) for value in match.groups())
+    return (now_et.hour, now_et.minute) >= (hour, minute)
+
+
 def _option_cancel_deadline_passed(contract: object, created_at: object = None) -> bool:
     if not isinstance(contract, dict):
         return False
@@ -2652,7 +2677,7 @@ def _option_cancel_deadline_passed(contract: object, created_at: object = None) 
     match = re.fullmatch(r"(\d{2}):(\d{2})", str(deadline.get("time") or ""))
     if not match:
         return False
-    now_et = datetime.now(ZoneInfo("America/New_York"))
+    now_et = _now_et()
     created_text = str(created_at or "")
     if created_text:
         try:
@@ -4014,16 +4039,25 @@ async def stop_loss_monitor() -> None:
         eod_forced = False
         if not trigger.triggered:
             if bool(position.get("exit_before_market_close")) and market_open:
-                if equity_clock is None:
-                    equity_clock, _ = await asyncio.to_thread(alpaca.get_clock)
-                try:
-                    next_close = datetime.fromisoformat(
-                        str((equity_clock or {}).get("next_close") or "").replace("Z", "+00:00")
+                if str(position.get("opened_by") or "").lower() == AUTOMATE_AGENT_TAG:
+                    # automate_agent trades a fixed, shorter window (e.g.
+                    # activated ~9:30 ET, force-closed 12:30 ET) rather than
+                    # "close near end of day" -- a predictable daily cutoff
+                    # instead of one relative to market close.
+                    eod_forced = _automate_agent_eod_cutoff_reached(
+                        _now_et(), config.automate_agent_exit_time_et
                     )
-                    seconds_to_close = (next_close - datetime.now(next_close.tzinfo)).total_seconds()
-                    eod_forced = 0 <= seconds_to_close <= config.automate_agent_exit_minutes_before_close * 60
-                except (TypeError, ValueError):
-                    eod_forced = False
+                else:
+                    if equity_clock is None:
+                        equity_clock, _ = await asyncio.to_thread(alpaca.get_clock)
+                    try:
+                        next_close = datetime.fromisoformat(
+                            str((equity_clock or {}).get("next_close") or "").replace("Z", "+00:00")
+                        )
+                        seconds_to_close = (next_close - datetime.now(next_close.tzinfo)).total_seconds()
+                        eod_forced = 0 <= seconds_to_close <= config.automate_agent_exit_minutes_before_close * 60
+                    except (TypeError, ValueError):
+                        eod_forced = False
             if not eod_forced:
                 continue
 
@@ -4097,6 +4131,8 @@ async def stop_loss_monitor() -> None:
 
     await _process_option_exit_monitor(market_open)
     await _process_multi_leg_exit_monitor(market_open)
+    if market_open:
+        await _maybe_post_automate_agent_daily_report()
 
 
 @stop_loss_monitor.before_loop
@@ -5826,6 +5862,16 @@ async def automate_agent_mode(ctx: commands.Context) -> None:
     await _send_context_output(ctx, await _build_automate_agent_mode_text())
 
 
+@bot.command(name="automate_agent_report")
+async def automate_agent_report(ctx: commands.Context) -> None:
+    """On-demand version of the automatic post-cutoff report -- shows
+    today's automate_agent trades and P&L so far, usable any time (not
+    only after the exit-time cutoff, and it doesn't affect whether the
+    automatic once-per-day report still fires later)."""
+    today_label = _now_et().date().isoformat()
+    await _send_context_output(ctx, _build_automate_agent_daily_report_text(today_label))
+
+
 @bot.command(name="agent_mode")
 async def agent_mode(ctx: commands.Context) -> None:
     await _send_context_output(ctx, await _build_agent_mode_text())
@@ -6210,6 +6256,66 @@ _automate_agent_lock = asyncio.Lock()
 _automate_agent_last_run: float = 0.0
 
 
+def _build_automate_agent_daily_report_text(date_label: str = "") -> str:
+    """Every field this needs (symbol, qty, entry/exit price, pnl) is
+    already recorded by close_position_with_outcome at the moment a
+    position actually closes -- this just formats today's automate_agent-
+    tagged records into a report, it doesn't compute anything new.
+    """
+    outcomes = list_trade_outcomes(opened_by=AUTOMATE_AGENT_TAG, today_only=True)
+    header = f"automate_agent daily report ({date_label})" if date_label else "automate_agent daily report"
+    if not outcomes:
+        return f"{header}: no trades were closed today."
+    lines = [header]
+    total_pnl = 0.0
+    wins = 0
+    for outcome in outcomes:
+        symbol = str(outcome.get("symbol") or "")
+        qty = _as_float(outcome.get("qty"))
+        entry_price = _as_float(outcome.get("entry_price"))
+        exit_price = _as_float(outcome.get("exit_price"))
+        pnl_value = _as_float(outcome.get("pnl_value"))
+        pnl_pct = _as_float(outcome.get("pnl_pct"))
+        total_pnl += pnl_value
+        if pnl_value > 0:
+            wins += 1
+        lines.append(
+            f"- {symbol}: {qty:g} sh, entered ${entry_price:.2f} -> exited ${exit_price:.2f} "
+            f"({pnl_value:+.2f} USD, {pnl_pct:+.2f}%)"
+        )
+    lines.append(
+        f"Total trades: {len(outcomes)} ({wins} win / {len(outcomes) - wins} loss) | "
+        f"Total P&L for the day: {total_pnl:+.2f} USD"
+    )
+    return "\n".join(lines)
+
+
+async def _maybe_post_automate_agent_daily_report() -> None:
+    """Fires once per ET calendar day, only after the last automate_agent
+    equity position from today has actually settled (confirmed exit fill,
+    not just "the cutoff time passed") -- posting before that would report
+    an incomplete/still-changing total. If a position is somehow still open
+    past the cutoff, this just keeps checking next cycle instead of posting
+    a premature or duplicate report.
+    """
+    now_et = _now_et()
+    if not _automate_agent_eod_cutoff_reached(now_et, config.automate_agent_exit_time_et):
+        return
+    today_label = now_et.date().isoformat()
+    already_reported = await asyncio.to_thread(get_automate_agent_report_date)
+    if already_reported == today_label:
+        return
+    still_open = any(
+        str(p.get("opened_by") or "").lower() == AUTOMATE_AGENT_TAG
+        for p in await asyncio.to_thread(list_positions)
+    )
+    if still_open:
+        return
+    report = _build_automate_agent_daily_report_text(today_label)
+    await _send_channel(config.discord_review_channel_id, report)
+    await asyncio.to_thread(set_automate_agent_report_date, today_label)
+
+
 async def _build_automate_agent_text() -> str:
     if not alpaca.ready():
         return "automate_agent: Alpaca paper trading is not configured."
@@ -6427,7 +6533,7 @@ async def _build_automate_agent_text() -> str:
                     lines.append(
                         f"- Bought {symbol}: {qty:g} sh @ ~${price:.2f} "
                         f"(stop {config.equity_stop_loss_pct:g}%, target {config.equity_take_profit_pct:g}%, "
-                        f"auto-closes within {config.automate_agent_exit_minutes_before_close} min of market close)."
+                        f"auto-closes by {config.automate_agent_exit_time_et} ET if neither is hit first)."
                         f"{conviction}"
                     )
                 else:
@@ -6566,7 +6672,7 @@ _WHATSAPP_NOT_AUTHORIZED_TEXT = (
 
 async def _dispatch_whatsapp_command_text(name: str, args: list[str], sender_id: str) -> Optional[str]:
     """Return the response text for a recognized command name, or None if
-    `name` isn't one of the 15 known commands (caller should then treat the
+    `name` isn't one of the 16 known commands (caller should then treat the
     message as a normal signal instead).
     """
     if name in _WHATSAPP_ADMIN_COMMANDS and not _is_whatsapp_admin(sender_id):
@@ -6603,11 +6709,13 @@ async def _dispatch_whatsapp_command_text(name: str, args: list[str], sender_id:
         return await _build_automate_agent_mode_change_text("OFF", sender_id)
     if name == "automate_agent_mode":
         return await _build_automate_agent_mode_text()
+    if name == "automate_agent_report":
+        return _build_automate_agent_daily_report_text(_now_et().date().isoformat())
     return None
 
 
 async def _try_dispatch_whatsapp_command(message) -> bool:
-    """If this WhatsApp message is one of the 15 !agent_*/!automate_agent_*
+    """If this WhatsApp message is one of the 16 !agent_*/!automate_agent_*
     commands, handle it and reply; return True so the caller skips normal
     signal processing.
     Returns False for anything else (including unrecognized !words), leaving

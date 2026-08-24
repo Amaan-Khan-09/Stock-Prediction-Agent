@@ -134,6 +134,14 @@ class AgentConfig:
     automate_agent_exit_minutes_before_close: int = _int_env(
         "AUTOMATE_AGENT_EXIT_MINUTES_BEFORE_CLOSE", 15
     )
+    # automate_agent's own trading window is intentionally shorter than the
+    # full session: positions are force-closed at this fixed US Eastern
+    # wall-clock time (HH:MM, 24h) rather than relative to market close, so
+    # a manual "activate around the open" workflow has a predictable, fixed
+    # cutoff every day regardless of early-close days. Equity positions not
+    # opened by automate_agent are unaffected -- they still use the
+    # relative automate_agent_exit_minutes_before_close fallback above.
+    automate_agent_exit_time_et: str = os.getenv("AUTOMATE_AGENT_EXIT_TIME_ET", "12:30").strip()
     # Fixed-fractional position sizing: risk a small, constant % of current
     # account equity per trade rather than a fixed dollar amount, so sizing
     # naturally scales with account growth and shrinks during drawdowns.

@@ -8,9 +8,10 @@ touches a real network, Gemini, or broker call.
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from zoneinfo import ZoneInfo
 
 from . import discord_agent, state_store
 from .automate_agent import AUTOMATE_AGENT_TAG
@@ -974,6 +975,81 @@ def test_pending_option_entries_count_toward_the_shared_cap() -> None:
         asyncio.run(_with_runtime(scenario, predictions=predictions))
 
     _with_asset_mode("options", run)
+
+
+def test_daily_report_lists_trades_with_entry_exit_and_total_pnl() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        state_store.upsert_position("AAPL", 5, 200.0, "buy-1", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+        state_store.close_position_with_outcome("AAPL", 5, 220.0, "protection_take_profit")
+        state_store.upsert_position("MSFT", 3, 400.0, "buy-2", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+        state_store.close_position_with_outcome("MSFT", 3, 396.0, "protection_stop_loss")
+        # A trade not opened by automate_agent must not appear in its report.
+        state_store.upsert_position("TSLA", 1, 100.0, "buy-3", 1.0, 10.0)
+        state_store.close_position_with_outcome("TSLA", 1, 105.0, "manual_sell")
+
+        text = discord_agent._build_automate_agent_daily_report_text("2026-08-24")
+        assert "- AAPL: 5 sh, entered $200.00 -> exited $220.00 (+100.00 USD, +10.00%)" in text
+        assert "- MSFT: 3 sh, entered $400.00 -> exited $396.00 (-12.00 USD, -1.00%)" in text
+        assert "TSLA" not in text
+        assert "Total trades: 2 (1 win / 1 loss)" in text
+        assert "Total P&L for the day: +88.00 USD" in text
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_daily_report_says_no_trades_when_empty() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        text = discord_agent._build_automate_agent_daily_report_text("2026-08-24")
+        assert text == "automate_agent daily report (2026-08-24): no trades were closed today."
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_auto_report_waits_for_open_positions_then_posts_exactly_once() -> None:
+    """Regression-shaped test for a real correctness requirement: the
+    automatic report must not fire while an automate_agent position from
+    today is still open (its P&L isn't final yet), must fire once all of
+    today's positions have actually settled, and must never post twice for
+    the same ET calendar day."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        state_store.upsert_position("AAPL", 5, 200.0, "buy-1", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+        original_now_et = discord_agent._now_et
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 30, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            await discord_agent._maybe_post_automate_agent_daily_report()
+            assert not any("automate_agent daily report" in content for _, content in sent), (
+                "must not report while a position from today is still open"
+            )
+            assert state_store.get_automate_agent_report_date() == ""
+
+            state_store.close_position_with_outcome("AAPL", 5, 220.0, "protection_take_profit")
+            await discord_agent._maybe_post_automate_agent_daily_report()
+            assert any("automate_agent daily report" in content for _, content in sent)
+            assert state_store.get_automate_agent_report_date() == "2026-08-24"
+
+            sent.clear()
+            await discord_agent._maybe_post_automate_agent_daily_report()
+            assert not sent, "must not post a second report for the same day"
+        finally:
+            discord_agent._now_et = original_now_et
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_auto_report_does_not_fire_before_the_cutoff() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        state_store.upsert_position("AAPL", 5, 200.0, "buy-1", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+        state_store.close_position_with_outcome("AAPL", 5, 220.0, "protection_take_profit")
+        original_now_et = discord_agent._now_et
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 11, 0, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            await discord_agent._maybe_post_automate_agent_daily_report()
+            assert not sent
+            assert state_store.get_automate_agent_report_date() == ""
+        finally:
+            discord_agent._now_et = original_now_et
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
 
 
 if __name__ == "__main__":
