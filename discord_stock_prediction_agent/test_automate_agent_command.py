@@ -502,6 +502,27 @@ def _with_extra_watchlist_symbol(test_fn) -> None:
         object.__setattr__(discord_agent.config, "automate_agent_watchlist", original_watchlist)
 
 
+def _stagger_updated_at(symbols: list[str]) -> None:
+    """Force strictly increasing updated_at timestamps, oldest first, for
+    the given symbols' tracked positions.
+
+    upsert_position's timestamp only has second resolution, so several
+    positions opened in a tight test loop can tie -- and state is persisted
+    as JSON with sort_keys=True, so list_positions() comes back in
+    alphabetical order after any save/reload, not insertion order. Without
+    this, "the oldest position" degrades into "whichever symbol sorts
+    first alphabetically among the tied ones" -- a coincidence, not a real
+    FIFO -- which is exactly the ambiguity a real oldest-position lookup
+    must not have.
+    """
+    state = state_store.load_state()
+    positions = state.get("agent_positions", {})
+    for index, symbol in enumerate(symbols):
+        if symbol in positions:
+            positions[symbol]["updated_at"] = f"2020-01-01T00:00:{index:02d}Z"
+    state_store.save_state(state)
+
+
 def test_at_cap_evicts_oldest_automate_position_before_buying() -> None:
     def run(extra_symbol: str) -> None:
         async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
@@ -513,6 +534,7 @@ def test_at_cap_evicts_oldest_automate_position_before_buying() -> None:
                 state_store.upsert_position(sym, 1, 50.0, "", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
                 fake.quantities[sym] = 1
                 fake.prices[sym] = 50.0
+            _stagger_updated_at(list(watchlist[:max_positions]))
             fake.prices[extra_symbol] = 75.0  # not yet held
 
             text = await discord_agent._build_automate_agent_text()
@@ -561,6 +583,7 @@ def test_evicted_position_loss_counts_toward_the_daily_loss_circuit_breaker() ->
                 state_store.upsert_position(sym, 1, 100.0, "", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
                 fake.quantities[sym] = 1
                 fake.prices[sym] = 100.0
+            _stagger_updated_at(list(watchlist[:max_positions]))
             # The oldest position (watchlist[0]) will be evicted at a loss.
             fake.prices[watchlist[0]] = 90.0
             fake.prices[extra_symbol] = 75.0
