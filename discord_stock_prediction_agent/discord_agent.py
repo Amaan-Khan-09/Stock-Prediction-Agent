@@ -129,6 +129,7 @@ from .state_store import (
     update_pending_buy_protected_qty,
     upsert_position,
     upsert_multi_leg_position,
+    count_today_automate_agent_buys,
 )
 
 
@@ -2666,6 +2667,24 @@ def _automate_agent_eod_cutoff_reached(now_et: datetime, cutoff: str) -> bool:
         return False
     hour, minute = (int(value) for value in match.groups())
     return (now_et.hour, now_et.minute) >= (hour, minute)
+
+
+def _automate_agent_in_min_trades_relax_window(now_et: datetime, cutoff: str, relax_minutes: int) -> bool:
+    """True once now_et is within relax_minutes of the fixed daily cutoff
+    but hasn't reached it yet -- the window where a still-unmet compulsory
+    minimum-trades-per-window requirement should relax the confidence bar
+    (see automate_agent_min_trades_per_window) rather than risk missing
+    the quota entirely by waiting for a higher-conviction pick that may
+    never come. A malformed/empty cutoff never relaxes anything, matching
+    the "no config, no forced behavior" pattern used elsewhere here.
+    """
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(cutoff or "").strip())
+    if not match:
+        return False
+    hour, minute = (int(value) for value in match.groups())
+    cutoff_minutes = hour * 60 + minute
+    now_minutes = now_et.hour * 60 + now_et.minute
+    return cutoff_minutes - max(0, int(relax_minutes)) <= now_minutes < cutoff_minutes
 
 
 def _option_cancel_deadline_passed(contract: object, created_at: object = None) -> bool:
@@ -6420,22 +6439,54 @@ async def _build_automate_agent_text() -> str:
             for p in await asyncio.to_thread(list_pending_option_entry_orders)
             if str(p.get("opened_by") or "") == AUTOMATE_AGENT_TAG
         ]
+        # Compulsory minimum: if too few real trades have been placed today
+        # and only a short window remains before the daily exit cutoff,
+        # drop the confidence floor for this cycle's ranking so the quota
+        # can still be met -- BUY/SELL/HOLD and needs_human_review are
+        # still the model's own call either way; only how confident it
+        # needed to be is relaxed. Never applies past the cutoff itself
+        # (nothing new should be bought once positions are being flattened)
+        # and never bypasses the daily-loss circuit breaker above.
+        trades_today = await asyncio.to_thread(count_today_automate_agent_buys)
+        now_et = _now_et()
+        min_trades_unmet = trades_today < config.automate_agent_min_trades_per_window
+        relaxing = (
+            min_trades_unmet
+            and not _automate_agent_eod_cutoff_reached(now_et, config.automate_agent_exit_time_et)
+            and _automate_agent_in_min_trades_relax_window(
+                now_et, config.automate_agent_exit_time_et, config.automate_agent_min_trades_relax_minutes
+            )
+        )
+        effective_min_confidence = 0.0 if relaxing else config.automate_agent_min_confidence
+
         plan = plan_automate_trades(
             candidates,
             open_positions + automate_option_positions,
             config.automate_agent_min_positions,
             config.automate_agent_max_positions,
-            config.automate_agent_min_confidence,
+            effective_min_confidence,
             config.automate_agent_max_evictions_per_cycle,
         )
 
         if not plan.to_buy:
+            unmet_note = (
+                f" {trades_today}/{config.automate_agent_min_trades_per_window} of today's compulsory "
+                "minimum trades placed so far; no candidate cleared even the relaxed bar this cycle."
+                if relaxing else ""
+            )
             return (
                 f"automate_agent: scanned {len(config.automate_agent_watchlist)} watchlist symbol(s), "
-                "no BUY-decision candidates found this cycle. No trades placed."
+                f"no BUY-decision candidates found this cycle. No trades placed.{unmet_note}"
             )
 
         lines = ["automate_agent cycle summary"]
+        if relaxing:
+            lines.append(
+                f"- Compulsory minimum trades not yet met ({trades_today}/"
+                f"{config.automate_agent_min_trades_per_window}) with "
+                f"{config.automate_agent_min_trades_relax_minutes} min left before the "
+                f"{config.automate_agent_exit_time_et} ET cutoff -- confidence bar relaxed to 0 for this cycle."
+            )
 
         # "options"-only mode skips equity entirely -- eviction's whole
         # purpose is freeing a slot for a *new equity* pick, so it's gated
@@ -6516,7 +6567,8 @@ async def _build_automate_agent_text() -> str:
                     _client_order_id("automate_buy", f"{symbol}:{qty}:{price}"),
                 )
                 if order:
-                    await asyncio.to_thread(_record_order, symbol, "buy", qty, "submitted", str(order.get("id") or ""), "equity", "automate_agent_buy")
+                    order_detail = "automate_agent_buy_relaxed" if relaxing else "automate_agent_buy"
+                    await asyncio.to_thread(_record_order, symbol, "buy", qty, "submitted", str(order.get("id") or ""), "equity", order_detail)
                     await asyncio.to_thread(
                         upsert_position,
                         symbol, qty, price, str(order.get("id") or ""),
@@ -6535,6 +6587,7 @@ async def _build_automate_agent_text() -> str:
                         f"(stop {config.equity_stop_loss_pct:g}%, target {config.equity_take_profit_pct:g}%, "
                         f"auto-closes by {config.automate_agent_exit_time_et} ET if neither is hit first)."
                         f"{conviction}"
+                        f"{' [compulsory minimum-trades fill]' if relaxing else ''}"
                     )
                 else:
                     lines.append(f"- Tried to buy {symbol} but the order was not placed: {_public_error(err)}")

@@ -123,7 +123,23 @@ class AgentConfig:
     # existing equity stop-loss/take-profit config above rather than a
     # separate knob, since both default to the same 1%/10% already.
     automate_agent_min_positions: int = _int_env("AUTOMATE_AGENT_MIN_POSITIONS", 1)
-    automate_agent_max_positions: int = _int_env("AUTOMATE_AGENT_MAX_POSITIONS", 10)
+    automate_agent_max_positions: int = _int_env("AUTOMATE_AGENT_MAX_POSITIONS", 20)
+    # Compulsory floor on trades actually placed during the trading window
+    # (not just "ambition" like automate_agent_min_positions above): if
+    # fewer than this many real BUY trades have been placed by the time
+    # only automate_agent_min_trades_relax_minutes remain before the daily
+    # exit cutoff, the confidence bar is dropped to 0 for that cycle's
+    # candidate ranking so the quota can still be met -- the model's own
+    # BUY/SELL/HOLD call and needs_human_review flag are still respected
+    # even then; only how *confident* it needed to be is relaxed. The
+    # daily-loss circuit breaker is never overridden by this -- capital
+    # protection always wins over a trade-count quota.
+    automate_agent_min_trades_per_window: int = _int_env(
+        "AUTOMATE_AGENT_MIN_TRADES_PER_WINDOW", 5
+    )
+    automate_agent_min_trades_relax_minutes: int = _int_env(
+        "AUTOMATE_AGENT_MIN_TRADES_RELAX_MINUTES", 60
+    )
     # Caps how many existing positions can be swapped out in a single scan
     # cycle, even if enough higher-ranked fresh candidates exist to justify
     # more -- keeps portfolio churn gradual instead of flipping the whole

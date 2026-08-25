@@ -1075,6 +1075,110 @@ def test_auto_report_does_not_fire_before_the_cutoff() -> None:
     asyncio.run(_with_runtime(scenario, predictions={}))
 
 
+def _record_fake_automate_buys(count: int) -> None:
+    for i in range(count):
+        state_store.record_order_event(
+            {"symbol": f"FAKE{i}", "side": "buy", "status": "submitted", "detail": "automate_agent_buy"}
+        )
+
+
+def test_compulsory_minimum_relaxes_confidence_bar_within_relax_window() -> None:
+    """A BUY candidate below the normal 60-confidence bar is skipped
+    outside the relax window (unchanged, high-quality-only behavior), but
+    gets bought once few enough trades have been placed today and the
+    relax window (last N minutes before the daily cutoff) has started --
+    the compulsory minimum-trades-per-window requirement."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+        original_now_et = discord_agent._now_et
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            text = await discord_agent._build_automate_agent_text()
+        finally:
+            discord_agent._now_et = original_now_et
+
+        assert len(fake.submissions) == 1, "the low-confidence candidate was bought once relaxed"
+        assert "compulsory minimum-trades fill" in text
+        positions = state_store.list_positions()
+        assert positions[0]["symbol"] == symbol
+        assert positions[0]["stop_loss_pct"] == discord_agent.config.equity_stop_loss_pct
+        assert positions[0]["take_profit_pct"] == discord_agent.config.equity_take_profit_pct
+        assert positions[0]["exit_before_market_close"] is True, "protection still applies to a forced fill"
+
+    # Confidence 30 is well below automate_agent_min_confidence (60).
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 30}}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_compulsory_minimum_does_not_relax_outside_the_relax_window() -> None:
+    """The same low-confidence candidate is left alone when the relax
+    window hasn't started yet -- the normal quality bar still governs most
+    of the trading window."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+        original_now_et = discord_agent._now_et
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            text = await discord_agent._build_automate_agent_text()
+        finally:
+            discord_agent._now_et = original_now_et
+
+        assert not fake.submissions
+        assert "no buy-decision candidates found" in text.lower()
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 30}}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_compulsory_minimum_does_not_relax_once_quota_already_met() -> None:
+    """Once automate_agent_min_trades_per_window real trades have already
+    been placed today, the confidence bar stays at its normal level even
+    inside the relax window -- the quota is a floor, not a standing
+    invitation to keep lowering the bar for the rest of the day."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        _record_fake_automate_buys(discord_agent.config.automate_agent_min_trades_per_window)
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+        original_now_et = discord_agent._now_et
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            text = await discord_agent._build_automate_agent_text()
+        finally:
+            discord_agent._now_et = original_now_et
+
+        assert not fake.submissions, "quota already met -- must not relax further"
+        assert "no buy-decision candidates found" in text.lower()
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 30}}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_compulsory_minimum_never_overrides_the_daily_loss_circuit_breaker() -> None:
+    """A tripped daily-loss circuit breaker still blocks all new entries,
+    even inside the relax window with the quota unmet -- capital
+    protection always wins over a trade-count quota."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        # A big enough automate_agent loss today to trip the breaker.
+        state_store.upsert_position("ZZZLOSS", 100, 100.0, "", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+        state_store.close_position_with_outcome("ZZZLOSS", 100, 50.0, "protection_stop_loss")
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+        original_now_et = discord_agent._now_et
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            text = await discord_agent._build_automate_agent_text()
+        finally:
+            discord_agent._now_et = original_now_et
+
+        assert not fake.submissions
+        assert "circuit breaker" in text.lower()
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 30}}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
 if __name__ == "__main__":
     test_daily_loss_circuit_breaker_blocks_new_positions()
     test_daily_loss_circuit_breaker_ignores_a_real_users_losses()

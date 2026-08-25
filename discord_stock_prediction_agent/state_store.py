@@ -982,6 +982,22 @@ def count_today_order_events() -> int:
     )
 
 
+def count_today_automate_agent_buys() -> int:
+    """Counts equity BUY orders automate_agent has submitted today (UTC day
+    -- the whole 9:30-12:30 ET trading window falls inside one UTC day),
+    regardless of whether each has closed yet. Backs the compulsory
+    minimum-trades-per-window requirement -- "placed" means submitted, not
+    "closed at a profit."
+    """
+    today = _today_prefix()
+    return sum(
+        1 for event in (load_state().get("order_events") or [])
+        if str(event.get("created_at") or "").startswith(today)
+        and str(event.get("side") or "").lower() == "buy"
+        and str(event.get("detail") or "").startswith("automate_agent_buy")
+    )
+
+
 def last_order_for_symbol(symbol: str, side: str = "") -> Dict[str, Any]:
     sym = str(symbol or "").upper()
     side_norm = str(side or "").lower()
