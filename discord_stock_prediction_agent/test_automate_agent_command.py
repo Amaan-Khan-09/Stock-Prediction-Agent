@@ -567,6 +567,62 @@ def test_at_cap_evicts_oldest_automate_position_before_buying() -> None:
     _with_extra_watchlist_symbol(run)
 
 
+def test_pending_eviction_does_not_count_toward_the_cap_on_the_next_cycle() -> None:
+    """Regression: a position mid-eviction (sell submitted, not yet
+    reconciled) is still physically present in list_positions() -- the
+    replacement buy for its slot lands immediately via upsert_position, but
+    remove_position for the evicted symbol only happens once
+    _reconcile_pending_exit_orders later confirms the fill. Left
+    unaccounted for, a second cycle running before that reconciliation would
+    see the stale evicted position as still occupying a slot, forcing yet
+    another eviction it doesn't actually need -- transiently exceeding
+    automate_agent_max_positions by one per pending eviction (observed live:
+    21 open against a cap of 20). automate_agent must instead recognize an
+    in-flight eviction as an already-freed slot and buy straight into it
+    without evicting again."""
+    def run(extra_symbol: str) -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            watchlist = discord_agent.config.automate_agent_watchlist
+            max_positions = discord_agent.config.automate_agent_max_positions
+            for i in range(max_positions):
+                sym = watchlist[i]
+                state_store.upsert_position(sym, 1, 50.0, "", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+                fake.quantities[sym] = 1
+                fake.prices[sym] = 50.0
+            _stagger_updated_at(list(watchlist[:max_positions]))
+            # Simulate a prior cycle's eviction sell that was submitted but
+            # hasn't reconciled yet -- exactly like the AVY case found live.
+            evicted_symbol = watchlist[0]
+            state_store.add_pending_exit_order({
+                "order_id": "stale-eviction-1",
+                "symbol": evicted_symbol,
+                "asset_type": "equity",
+                "reason": "automate_agent_evict",
+                "requested_qty": 1,
+            })
+            fake.prices[extra_symbol] = 75.0  # the one fresh BUY candidate
+
+            await discord_agent._build_automate_agent_text()
+
+            buy_submissions = [o for o in fake.submissions if o["side"] == "buy"]
+            sell_submissions = [o for o in fake.submissions if o["side"] == "sell"]
+            assert len(buy_submissions) == 1 and buy_submissions[0]["symbol"] == extra_symbol, (
+                "the free slot from the pending eviction was used directly"
+            )
+            assert not sell_submissions, (
+                "must not evict a second position -- one slot was already freed"
+            )
+            symbols_after = {p["symbol"] for p in state_store.list_positions()}
+            assert len(symbols_after) == max_positions + 1, (
+                "still exactly one over cap (the still-unreconciled eviction), not two"
+            )
+
+        predictions = {extra_symbol: {"decision": "BUY", "confidence_score": 75}}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_extra_watchlist_symbol(run)
+
+
 def test_evicted_position_loss_counts_toward_the_daily_loss_circuit_breaker() -> None:
     """Regression: eviction previously called the bare remove_position,
     which never records a trade_outcomes entry -- so a real loss realized by

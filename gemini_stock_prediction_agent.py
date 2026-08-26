@@ -37,6 +37,16 @@ AI_PROVIDER             = os.getenv("AI_PROVIDER", "gemini").lower()
 ALLOW_BASELINE_FALLBACK = os.getenv("ALLOW_BASELINE_FALLBACK", "false").lower() == "true"
 GEMINI_MODEL            = os.getenv("GEMINI_MODEL", os.getenv("AGENT_MODEL", "gemini-2.5-flash"))
 _GEMINI_KEY             = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+# Every other network call in this project (Alpaca, historical price fetch) has an
+# explicit timeout; this one didn't. A hung connection under real-world network
+# flakiness (observed directly: DNS reconnect blips, failed sends) would then block
+# its asyncio.to_thread worker forever -- the caller's own outer scan timeout only
+# stops *waiting* on stragglers, it doesn't cancel them, so stuck Gemini calls could
+# accumulate across cycles and eventually starve the whole thread pool that every
+# other network call (including unrelated Alpaca calls) also depends on. 60s is
+# generous enough for a real deep-thinking response, bounded enough to guarantee the
+# call eventually fails cleanly instead of hanging indefinitely.
+GEMINI_REQUEST_TIMEOUT_MS = int(os.getenv("GEMINI_REQUEST_TIMEOUT_MS", "60000"))
 
 STOCK_EVAL_FILE = ROOT / "stock_prediction_evaluation_runs.jsonl"
 
@@ -2213,7 +2223,10 @@ def _call_gemini(
         from google import genai
         from google.genai import types as genai_types
 
-        client = genai.Client(api_key=_GEMINI_KEY)
+        client = genai.Client(
+            api_key=_GEMINI_KEY,
+            http_options=genai_types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_MS),
+        )
 
         # Phase 7 — Deep thinking enabled (budget=8000 lets Gemini reason internally
         # before answering, dramatically improving prediction quality)

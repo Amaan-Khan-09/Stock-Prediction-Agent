@@ -6402,6 +6402,26 @@ async def _build_automate_agent_text() -> str:
 
         candidates = await _scan_automate_agent_watchlist()
         open_positions = await asyncio.to_thread(list_positions)
+        # A position mid-eviction (sell submitted, not yet reconciled) is
+        # still physically tracked in list_positions() -- upsert_position for
+        # its replacement buy happens immediately, but remove_position for the
+        # evicted symbol only happens once _reconcile_pending_exit_orders
+        # later confirms the fill. Left as-is, that gap let the cap-planning
+        # math see both the outgoing and incoming position at once and
+        # transiently exceed automate_agent_max_positions by one per pending
+        # eviction (observed live: 21 open against a cap of 20). The eviction
+        # sell is economically as good as done the moment it's submitted, so
+        # exclude those symbols here rather than waiting for reconciliation.
+        evicting_symbols = {
+            str(order.get("symbol") or "").upper()
+            for order in await asyncio.to_thread(list_pending_exit_orders)
+            if str(order.get("reason") or "") == "automate_agent_evict"
+        }
+        if evicting_symbols:
+            open_positions = [
+                p for p in open_positions
+                if str(p.get("symbol") or "").upper() not in evicting_symbols
+            ]
         # automate_agent option positions share the same 1-10 slot cap as its
         # equity positions (both asset classes compete for the same
         # AUTOMATE_AGENT_MAX_POSITIONS ceiling) -- normalize them to the same
