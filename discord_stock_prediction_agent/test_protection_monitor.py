@@ -208,6 +208,43 @@ def test_equity_stop_falls_back_to_latest_price_when_position_price_is_stale() -
     asyncio.run(_with_runtime(scenario))
 
 
+def test_one_positions_error_does_not_block_the_rest_from_being_checked() -> None:
+    """Regression: the equity protection loop had no per-position error
+    isolation, unlike every other per-symbol loop in this file -- an
+    exception on a single position (a malformed record, an unexpected API
+    response) would abort the whole for-loop, skipping every position after
+    it that cycle. If the same condition recurred every cycle, that one
+    position could permanently block all the others from ever being
+    force-closed. A stuck/erroring symbol must never be able to prevent
+    the rest of the book from being protected or force-closed."""
+    async def scenario(fake: ProtectionAlpaca) -> None:
+        state_store.upsert_position("AAPL", 2, 100.0, "buy", 1.0, 10.0)
+        state_store.upsert_position("MSFT", 3, 100.0, "buy", 1.0, 10.0)
+        fake.quantities["AAPL"] = 2
+        fake.quantities["MSFT"] = 3
+        fake.prices["AAPL"] = 95.0  # past the 1% stop
+        fake.prices["MSFT"] = 95.0  # past the 1% stop
+
+        real_get_position = fake.get_position
+
+        def raise_for_aapl(symbol: str):
+            if symbol == "AAPL":
+                raise RuntimeError("simulated malformed Alpaca response")
+            return real_get_position(symbol)
+
+        fake.get_position = raise_for_aapl
+        await discord_agent.stop_loss_monitor.coro()
+
+        assert len(fake.submissions) == 1, "AAPL's failure must not suppress MSFT's own check"
+        assert fake.submissions[0]["symbol"] == "MSFT"
+        assert state_store.list_pending_exit_orders()[0]["reason"] == "protection_stop_loss"
+        # AAPL must still be tracked (not silently dropped) so it gets a
+        # real chance again on the next cycle instead of vanishing.
+        assert any(p["symbol"] == "AAPL" for p in state_store.list_positions())
+
+    asyncio.run(_with_runtime(scenario))
+
+
 def test_equity_closed_market_stop_is_durable_and_not_duplicated() -> None:
     async def scenario(fake: ProtectionAlpaca) -> None:
         state_store.upsert_position("MSFT", 3, 100.0, "buy", 1.0, 10.0)
@@ -425,6 +462,53 @@ def test_automate_agent_option_close_records_outcome_for_circuit_breaker() -> No
         assert not state_store.list_option_positions()
         assert state_store.today_realized_pnl(AUTOMATE_AGENT_TAG) < 0, (
             "the option loss must count toward automate_agent's own daily-loss circuit breaker"
+        )
+
+    asyncio.run(_with_runtime(scenario))
+
+
+def test_one_pending_exits_error_does_not_block_reconciling_the_rest() -> None:
+    """Regression: _reconcile_pending_exit_orders had no per-order error
+    isolation -- an exception reconciling a single pending exit (a
+    malformed broker response, an unexpected field) would abort the whole
+    loop, leaving every other pending exit in that batch un-reconciled that
+    cycle. This is the function that actually finalizes a submitted sell
+    into a closed position, so one bad order must never be able to prevent
+    the rest of a force-close (e.g. the 12:30 cutoff) from actually
+    completing."""
+    async def scenario(fake: ProtectionAlpaca) -> None:
+        state_store.upsert_position("AAPL", 2, 100.0, "buy", 1.0, 10.0)
+        state_store.upsert_position("MSFT", 3, 100.0, "buy", 1.0, 10.0)
+        fake.quantities["AAPL"] = 2
+        fake.quantities["MSFT"] = 3
+        fake.prices["AAPL"] = 95.0  # past the 1% stop
+        fake.prices["MSFT"] = 95.0  # past the 1% stop
+        await discord_agent.stop_loss_monitor.coro()
+        pending = state_store.list_pending_exit_orders()
+        assert len(pending) == 2
+
+        for item in pending:
+            order_id = item["order_id"]
+            fake.orders[order_id].update(status="filled", filled_qty=item["requested_qty"], filled_avg_price="95.0")
+        fake.quantities["AAPL"] = 0
+        fake.quantities["MSFT"] = 0
+
+        aapl_order_id = next(p["order_id"] for p in pending if p["symbol"] == "AAPL")
+        real_get_order = fake.get_order
+
+        def raise_for_aapl_order(order_id: str):
+            if order_id == aapl_order_id:
+                raise RuntimeError("simulated malformed Alpaca response")
+            return real_get_order(order_id)
+
+        fake.get_order = raise_for_aapl_order
+        await discord_agent._reconcile_pending_exit_orders()
+
+        assert "MSFT" not in {p["symbol"] for p in state_store.list_positions()}, (
+            "AAPL's reconciliation failure must not block MSFT's from completing"
+        )
+        assert "AAPL" in {p["symbol"] for p in state_store.list_positions()}, (
+            "AAPL must still be tracked (not silently dropped) so it can be retried"
         )
 
     asyncio.run(_with_runtime(scenario))
