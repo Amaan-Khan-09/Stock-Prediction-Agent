@@ -829,3 +829,53 @@ def test_multi_leg_stalled_leg_quote_skips_silently_but_logs_a_warning(caplog) -
         )
 
     asyncio.run(_with_runtime(scenario))
+
+
+def test_agent_health_reports_a_recent_monitor_tick() -> None:
+    async def scenario(fake: ProtectionAlpaca) -> None:
+        original = discord_agent._stop_loss_monitor_last_tick
+        try:
+            await discord_agent.stop_loss_monitor.coro()
+            text = await discord_agent._build_agent_health_text()
+            assert "Position monitor: last ran" in text
+            assert "STALLED" not in text
+            assert "Agent Health: READY" in text
+        finally:
+            discord_agent._stop_loss_monitor_last_tick = original
+
+    asyncio.run(_with_runtime(scenario))
+
+
+def test_agent_health_flags_a_stalled_monitor() -> None:
+    """Regression: the position monitor stalling with no exception, no
+    restart, and no log activity at all is a real incident this is meant to
+    catch -- the only way anyone noticed live was manually checking
+    positions well after the 12:30 force-close should have already
+    happened. !agent_health must surface this proactively."""
+    async def scenario(fake: ProtectionAlpaca) -> None:
+        original = discord_agent._stop_loss_monitor_last_tick
+        try:
+            discord_agent._stop_loss_monitor_last_tick = (
+                asyncio.get_event_loop().time() - 10_000
+            )
+            text = await discord_agent._build_agent_health_text()
+            assert "Position monitor: last ran" in text
+            assert "STALLED" in text
+            assert "Agent Health: DEGRADED" in text
+        finally:
+            discord_agent._stop_loss_monitor_last_tick = original
+
+    asyncio.run(_with_runtime(scenario))
+
+
+def test_agent_health_before_any_tick_this_process() -> None:
+    async def scenario(fake: ProtectionAlpaca) -> None:
+        original = discord_agent._stop_loss_monitor_last_tick
+        try:
+            discord_agent._stop_loss_monitor_last_tick = 0.0
+            text = await discord_agent._build_agent_health_text()
+            assert "has not run yet this process" in text
+        finally:
+            discord_agent._stop_loss_monitor_last_tick = original
+
+    asyncio.run(_with_runtime(scenario))

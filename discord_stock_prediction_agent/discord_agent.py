@@ -4004,8 +4004,18 @@ async def on_message(message: discord.Message) -> None:
         return
     if queued.get("duplicate_delivery"):
         return
+_stop_loss_monitor_last_tick: float = 0.0
+
+
 @tasks.loop(seconds=max(15, config.stop_monitor_seconds))
 async def stop_loss_monitor() -> None:
+    # Recorded before anything else runs, specifically so !agent_health can
+    # surface a stalled monitor loop (this incident happened live: the loop
+    # stopped ticking with no exception, no restart, and no log activity at
+    # all -- the only way anyone noticed was manually checking positions
+    # well after the 12:30 force-close should have already happened).
+    global _stop_loss_monitor_last_tick
+    _stop_loss_monitor_last_tick = asyncio.get_event_loop().time()
     if not alpaca.ready():
         return
     await _activate_filled_pending_buys()
@@ -6039,12 +6049,30 @@ async def _build_agent_health_text() -> str:
     queue = await asyncio.to_thread(queue_stats)
     market_queue = await asyncio.to_thread(market_order_queue_summary)
     market_open, market_error = await asyncio.to_thread(alpaca.is_market_open)
-    status = "READY" if not production_config_errors() else "DEGRADED"
+    # The position-protection monitor stalling with no exception, no restart,
+    # and no log activity at all is a real incident this caught live -- the
+    # only way anyone noticed was manually checking positions well after the
+    # 12:30 force-close should have already happened. 5x its own interval
+    # (floor 120s) is generous enough that one slow cycle never false-alarms.
+    monitor_stale_after = max(120, config.stop_monitor_seconds * 5)
+    monitor_seconds_ago = (
+        asyncio.get_event_loop().time() - _stop_loss_monitor_last_tick
+        if _stop_loss_monitor_last_tick > 0 else None
+    )
+    monitor_stalled = monitor_seconds_ago is not None and monitor_seconds_ago > monitor_stale_after
+    status = "READY" if not production_config_errors() and not monitor_stalled else "DEGRADED"
+    if monitor_seconds_ago is None:
+        monitor_line = "Position monitor: has not run yet this process"
+    else:
+        monitor_line = f"Position monitor: last ran {monitor_seconds_ago:.0f}s ago"
+        if monitor_stalled:
+            monitor_line += " -- STALLED, positions may be unprotected; restart the process"
     lines = [
         f"Agent Health: {status}",
         f"Agent mode: {get_agent_mode()}",
         f"Alpaca paper configured: {config.has_alpaca and config.uses_paper_alpaca_endpoint}",
         f"Alpaca market open: {market_open}",
+        monitor_line,
         f"Signal workers: {max(1, min(16, config.signal_worker_concurrency))}",
         f"Signal queue: {queue['queued']} queued / {queue['processing']} processing / {queue['dead']} dead",
         f"Market-order queue: {market_queue['queued']} queued / {market_queue['failed']} failed",
