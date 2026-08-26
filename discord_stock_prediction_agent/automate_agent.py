@@ -11,9 +11,13 @@ Unlike every other trade path in this agent, `!automate_agent` is a
 deliberate, explicitly-requested exception to "a human originates every
 signal": the human trigger is the command itself, not a specific ticker.
 The scope is bounded on purpose to limit that risk: a fixed watchlist
-(config.automate_agent_watchlist), a hard 1-5 position cap, fixed 1%/10%
-stop-loss/take-profit, and every position it opens is tagged so it can
-never be confused with (or evict) a position a real user asked for.
+(config.automate_agent_watchlist), a hard position cap
+(config.automate_agent_max_positions), fixed stop-loss/take-profit (equity:
+config.equity_stop_loss_pct/take_profit_pct; automate_agent's own options:
+config.automate_agent_option_stop_loss_pct/take_profit_pct, a wider
+premium-based band since premium swings far more than the underlying), and
+every position it opens is tagged so it can never be confused with (or
+evict) a position a real user asked for.
 """
 from __future__ import annotations
 
@@ -33,10 +37,16 @@ class BoomCandidate:
 
 
 def rank_boom_candidates(
-    candidates: list[BoomCandidate], min_confidence: float = 0.0
+    candidates: list[BoomCandidate], min_confidence: float = 0.0, include_sell: bool = False
 ) -> list[BoomCandidate]:
-    """Keeps only BUY-decision candidates that the prediction engine itself
-    didn't flag as needing human review, strongest conviction first.
+    """Keeps only BUY-decision candidates (and, if include_sell, SELL-decision
+    ones too) that the prediction engine itself didn't flag as needing human
+    review, strongest conviction first.
+
+    include_sell exists for the options path: a SELL call is just as
+    actionable as a BUY one when the position itself is a put (profiting
+    from an expected decline) rather than a long share position -- equity
+    callers leave this False since automate_agent never shorts stock.
 
     needs_human_review is the model's own signal that its call here is
     uncertain enough to want a second opinion. automate_agent is the one
@@ -46,19 +56,26 @@ def rank_boom_candidates(
     the rest of the system's "when the model says it's unsure, a human (or
     here, extra caution) is required" design.
 
-    min_confidence additionally drops BUY calls the model itself didn't flag
-    as uncertain, but that still cleared the BUY bar by a thin margin --
-    without this, a 51-confidence BUY and a 95-confidence BUY were treated
+    min_confidence additionally drops calls the model itself didn't flag
+    as uncertain, but that still cleared the bar by a thin margin --
+    without this, a 51-confidence call and a 95-confidence call were treated
     identically (aside from sizing/ranking order), which is a lower quality
     bar than the rest of this function's "extra caution" intent implies.
     """
-    buys = [
+    decisions = {"BUY", "SELL"} if include_sell else {"BUY"}
+    matches = [
         c for c in candidates
-        if c.decision.upper() == "BUY"
+        if c.decision.upper() in decisions
         and not c.needs_human_review
         and c.confidence >= min_confidence
     ]
-    return sorted(buys, key=lambda c: (c.confidence, c.predicted_return_pct), reverse=True)
+    # abs() on the tiebreaker: a BUY's predicted_return_pct is positive and a
+    # SELL's is negative, so ranking by the raw signed value would silently
+    # bias every confidence-tie toward BUY candidates regardless of which
+    # direction's move is actually predicted to be larger. When include_sell
+    # is False (the equity path, unchanged), every value here is already
+    # positive, so abs() is a no-op and behavior is identical to before.
+    return sorted(matches, key=lambda c: (c.confidence, abs(c.predicted_return_pct)), reverse=True)
 
 
 def confidence_scaled_risk_multiplier(confidence: float, floor: float = 0.75, cap: float = 1.25) -> float:
@@ -129,6 +146,7 @@ def plan_automate_trades(
     max_positions: int,
     min_confidence: float = 0.0,
     max_evictions_per_cycle: int = 1,
+    include_sell: bool = False,
 ) -> TradePlan:
     """Decides what to buy and what to evict first, given ranked candidates
     and the currently open automate_agent-tagged positions.
@@ -146,7 +164,7 @@ def plan_automate_trades(
     limit risk" design. The default of 1 means at most one position rotates
     per cycle; a full book gradually rotates across multiple cycles instead.
     """
-    ranked = rank_boom_candidates(candidates, min_confidence)
+    ranked = rank_boom_candidates(candidates, min_confidence, include_sell)
     held_symbols = {
         str(p.get("symbol") or "").upper()
         for p in open_positions

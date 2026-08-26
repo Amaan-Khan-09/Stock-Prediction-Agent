@@ -16,6 +16,40 @@ from zoneinfo import ZoneInfo
 from . import discord_agent, state_store
 from .automate_agent import AUTOMATE_AGENT_TAG
 
+# This whole file is about the equity buy/evict/cap mechanism (options-mode
+# tests opt back in explicitly via _with_asset_mode). Production's actual
+# default asset_mode/watchlist changed to "options"/TSLA-only for the live
+# TSLA-options pivot, so pin an explicit, stable test configuration here
+# instead -- decoupling this file's assumptions from whatever production
+# happens to default to today. This must happen at *module* setup, not
+# inside _with_runtime's per-test async setup: several tests compute their
+# `predictions` dict from discord_agent.config.automate_agent_watchlist[0]
+# in the test function's own top-level code, before ever calling
+# _with_runtime, so the pin has to already be in place by then.
+#
+# Needs at least automate_agent_max_positions (20) symbols: several
+# cap/eviction tests fill every slot by indexing watchlist[0:max_positions],
+# plus one more for _with_extra_watchlist_symbol's fresh-candidate symbol.
+_TEST_WATCHLIST = (
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "AVGO", "NFLX",
+    "CRM", "ORCL", "ADBE", "INTC", "QCOM", "TXN", "IBM", "CSCO", "UBER", "PYPL",
+)
+_original_asset_mode: str | None = None
+_original_watchlist: tuple[str, ...] | None = None
+
+
+def setup_module(module) -> None:
+    global _original_asset_mode, _original_watchlist
+    _original_asset_mode = discord_agent.config.automate_agent_asset_mode
+    _original_watchlist = discord_agent.config.automate_agent_watchlist
+    object.__setattr__(discord_agent.config, "automate_agent_asset_mode", "equity")
+    object.__setattr__(discord_agent.config, "automate_agent_watchlist", _TEST_WATCHLIST)
+
+
+def teardown_module(module) -> None:
+    object.__setattr__(discord_agent.config, "automate_agent_asset_mode", _original_asset_mode)
+    object.__setattr__(discord_agent.config, "automate_agent_watchlist", _original_watchlist)
+
 
 class FakeAutomateAlpaca:
     def __init__(self) -> None:
@@ -808,14 +842,25 @@ def test_autoscan_task_runs_the_cycle_when_enabled() -> None:
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
-def test_default_asset_mode_is_equity_only() -> None:
-    # Pins the current product decision: automate_agent places equity
-    # trades only unless explicitly opted into "options"/"both" -- options
-    # and multi-leg support already exist (tested below) but must stay
-    # dormant by default until that's revisited. If this ever flips
-    # silently, automate_agent would start autonomously trading options on
-    # every deployment that never asked for it.
-    assert discord_agent.config.automate_agent_asset_mode == "equity"
+def test_default_asset_mode_is_options_on_tsla() -> None:
+    # Pins the current product decision, per direction from the user's
+    # senior: automate_agent trades options (calls on BUY, puts on SELL)
+    # on a narrow TSLA-only watchlist by default now -- equity scanning
+    # across a broad watchlist is paused (not removed) and can be switched
+    # back on via AUTOMATE_AGENT_ASSET_MODE/AUTOMATE_AGENT_WATCHLIST. If
+    # this ever flips silently, automate_agent's live behavior would
+    # diverge from what was actually decided without anyone noticing.
+    #
+    # Asserts against a *fresh* AgentConfig(), not discord_agent.config --
+    # this module's own setup_module pins the live config to "equity" plus
+    # a wide watchlist for the rest of this file's equity-focused tests,
+    # so reading the live singleton here would just be asserting our own
+    # test pin back at ourselves.
+    from .config import AgentConfig
+
+    fresh = AgentConfig()
+    assert fresh.automate_agent_asset_mode == "options"
+    assert fresh.automate_agent_watchlist == ("TSLA",)
 
 
 def _with_asset_mode(mode: str, test_fn) -> None:
@@ -869,12 +914,58 @@ def test_options_mode_buys_an_atm_call_when_backtest_confirms_buy() -> None:
             assert position["occ_symbol"] == occ_symbol
             assert position["strike"] == 100.0, "must pick the ATM strike, not the nearby OTM ones"
             assert position["opened_by"] == AUTOMATE_AGENT_TAG
-            # Explicit user choice: automate_agent's options use the same
-            # 1%/10% as its equity positions, not the OPTION_STOP_LOSS_PCT
-            # default every other option position uses.
-            assert abs(position["stop_loss"] - 2.0 * (1 - discord_agent.config.equity_stop_loss_pct / 100)) < 1e-6
+            # Per direction from the user's senior: automate_agent's own
+            # option positions use a premium-based 20%/25% stop-loss/take-
+            # profit (option premium moves far more than the underlying),
+            # not the equity_stop_loss_pct automate_agent's equity positions
+            # use, and not the default OPTION_STOP_LOSS_PCT every other
+            # (human-originated) option position uses.
+            assert abs(
+                position["stop_loss"] - 2.0 * (1 - discord_agent.config.automate_agent_option_stop_loss_pct / 100)
+            ) < 1e-6
 
         predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("options", run)
+
+
+def test_options_mode_buys_an_atm_put_on_a_sell_signal() -> None:
+    """New behavior for the TSLA-options pivot: a SELL-decision candidate is
+    actionable in options mode too -- automate_agent buys a PUT (profiting
+    from an expected decline) rather than shorting stock, which it has no
+    path to do at all."""
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            fake.prices[symbol] = 100.0
+            today = date.today().isoformat()
+            occ_symbol = f"{symbol}260101P00100000"
+            fake.option_contracts_by_expiry[today] = [{"symbol": occ_symbol, "strike_price": "100"}]
+            fake.option_premiums[occ_symbol] = 2.0
+
+            original_validate = discord_agent.run_options_strategy_validation
+            discord_agent.run_options_strategy_validation = lambda option: {
+                "status": "SUCCESS", "decision": "BUY",
+            }
+            try:
+                text = await discord_agent._build_automate_agent_text()
+
+                entry_order_id = next(
+                    o["id"] for o in fake.submissions if o["symbol"] == occ_symbol and o["side"] == "buy"
+                )
+                fake.mark_order_filled(entry_order_id, fill_price=2.0)
+                await discord_agent._reconcile_pending_option_entry_orders()
+            finally:
+                discord_agent.run_options_strategy_validation = original_validate
+
+            assert "put contract" in text.lower(), text
+            option_positions = state_store.list_option_positions()
+            assert len(option_positions) == 1, option_positions
+            assert option_positions[0]["side"] == "PUT"
+            assert option_positions[0]["occ_symbol"] == occ_symbol
+
+        predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "SELL", "confidence_score": 75}}
         asyncio.run(_with_runtime(scenario, predictions=predictions))
 
     _with_asset_mode("options", run)
@@ -998,7 +1089,7 @@ def test_options_mode_skips_duplicate_buy_while_entry_is_still_pending() -> None
                 assert len(fake.submissions) == 1, (
                     "must not submit a second buy for the same root while its first entry is still pending"
                 )
-                assert "no buy-decision candidates" in text.lower()
+                assert "no buy/sell-decision candidates" in text.lower()
             finally:
                 discord_agent.run_options_strategy_validation = original_validate
 
@@ -1236,6 +1327,7 @@ def test_compulsory_minimum_never_overrides_the_daily_loss_circuit_breaker() -> 
 
 
 if __name__ == "__main__":
+    setup_module(None)
     test_daily_loss_circuit_breaker_blocks_new_positions()
     test_daily_loss_circuit_breaker_ignores_a_real_users_losses()
     test_position_sizing_scales_with_account_equity()
@@ -1251,4 +1343,5 @@ if __name__ == "__main__":
     test_needs_human_review_candidate_is_not_bought()
     test_buy_summary_shows_confidence_and_predicted_return()
     test_a_failed_symbol_lookup_does_not_abort_the_whole_scan()
+    teardown_module(None)
     print("ALL AUTOMATE_AGENT COMMAND INTEGRATION TESTS PASSED")

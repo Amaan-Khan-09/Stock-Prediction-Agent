@@ -105,6 +105,55 @@ def test_rank_excludes_below_min_confidence() -> None:
     )
 
 
+def test_rank_include_sell_false_still_excludes_sell() -> None:
+    print("\nTest: include_sell defaults False -- equity path behavior is unchanged")
+    candidates = [BoomCandidate("AAPL", "BUY"), BoomCandidate("NVDA", "SELL")]
+    ranked = rank_boom_candidates(candidates)
+    _assert([c.symbol for c in ranked] == ["AAPL"], "SELL still excluded when include_sell isn't passed", str(ranked))
+
+
+def test_rank_include_sell_true_keeps_sell_decisions_too() -> None:
+    print("\nTest: include_sell=True keeps SELL-decision candidates alongside BUY ones")
+    candidates = [
+        BoomCandidate("AAPL", "BUY", confidence=80),
+        BoomCandidate("NVDA", "SELL", confidence=90),
+        BoomCandidate("MSFT", "HOLD", confidence=99),
+        BoomCandidate("TSLA", "REVIEW", confidence=99),
+    ]
+    ranked = rank_boom_candidates(candidates, include_sell=True)
+    _assert(
+        [c.symbol for c in ranked] == ["NVDA", "AAPL"],
+        "both BUY and SELL kept (strongest confidence first), HOLD/REVIEW still excluded",
+        str(ranked),
+    )
+
+
+def test_rank_include_sell_tiebreak_uses_abs_predicted_return() -> None:
+    print("\nTest: include_sell tiebreak compares |predicted_return_pct|, not the signed value")
+    candidates = [
+        # A SELL's predicted_return_pct is naturally negative (predicting a
+        # decline) -- without abs(), this would always lose the tiebreak to
+        # any BUY at the same confidence regardless of move size.
+        BoomCandidate("NVDA", "SELL", confidence=70, predicted_return_pct=-5.0),
+        BoomCandidate("AAPL", "BUY", confidence=70, predicted_return_pct=2.0),
+    ]
+    ranked = rank_boom_candidates(candidates, include_sell=True)
+    _assert(
+        [c.symbol for c in ranked] == ["NVDA", "AAPL"],
+        "NVDA's larger-magnitude -5% move outranks AAPL's smaller +2% move at equal confidence",
+        str(ranked),
+    )
+
+
+def test_plan_include_sell_plans_a_sell_candidate_as_a_buy() -> None:
+    print("\nTest: plan_automate_trades' include_sell surfaces a SELL candidate as something to buy (a put)")
+    candidates = [BoomCandidate("TSLA", "SELL", confidence=80)]
+    plan = plan_automate_trades(
+        candidates, open_positions=[], min_positions=1, max_positions=5, include_sell=True
+    )
+    _assert(plan.to_buy == ["TSLA"], "the SELL-decision symbol is queued to buy (as a put)", str(plan.to_buy))
+
+
 def test_plan_respects_min_confidence() -> None:
     print("\nTest: plan_automate_trades threads min_confidence through to ranking")
     candidates = [BoomCandidate("AAPL", "BUY", confidence=90), BoomCandidate("MSFT", "BUY", confidence=10)]
@@ -296,6 +345,10 @@ def run_all() -> None:
     test_rank_tiebreaks_by_predicted_return_pct()
     test_rank_excludes_needs_human_review()
     test_rank_excludes_below_min_confidence()
+    test_rank_include_sell_false_still_excludes_sell()
+    test_rank_include_sell_true_keeps_sell_decisions_too()
+    test_rank_include_sell_tiebreak_uses_abs_predicted_return()
+    test_plan_include_sell_plans_a_sell_candidate_as_a_buy()
     test_plan_respects_min_confidence()
     test_confidence_scaled_risk_multiplier_floor_at_low_confidence()
     test_confidence_scaled_risk_multiplier_caps_at_high_confidence()

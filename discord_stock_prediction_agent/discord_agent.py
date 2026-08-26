@@ -4888,11 +4888,13 @@ async def _reconcile_pending_option_entry_orders() -> None:
                 pending.get("exit_underlying_price"),
                 pending.get("time_in_force"),
                 pending.get("stop_scope"),
-                # automate_agent's own option positions use the same 1%/10%
-                # as its equity positions (explicit user choice); every other
-                # option position keeps the normal option defaults.
-                config.equity_stop_loss_pct if is_automate_agent else config.option_stop_loss_pct,
-                config.equity_take_profit_pct if is_automate_agent else config.option_take_profit_pct,
+                # automate_agent's own option positions use their own
+                # premium-based percentages (20%/25% by default -- premium
+                # swings far more than the underlying, so these are wider
+                # than automate_agent's equity SL/TP on purpose); every
+                # other option position keeps the normal option defaults.
+                config.automate_agent_option_stop_loss_pct if is_automate_agent else config.option_stop_loss_pct,
+                config.automate_agent_option_take_profit_pct if is_automate_agent else config.option_take_profit_pct,
                 opened_by,
             )
             await asyncio.to_thread(
@@ -6172,9 +6174,9 @@ async def agent_option_validation(ctx: commands.Context) -> None:
     await _send_context_output(ctx, await _build_agent_option_validation_text())
 
 
-async def _automate_agent_pick_option_contract(root: str) -> Optional[dict]:
-    """Pick a same-day (0DTE) at-the-money CALL for `root`, falling back to
-    the nearest later listed expiry within
+async def _automate_agent_pick_option_contract(root: str, side: str = "call") -> Optional[dict]:
+    """Pick a same-day (0DTE) at-the-money CALL or PUT for `root`, falling
+    back to the nearest later listed expiry within
     config.automate_agent_option_expiry_fallback_days if nothing is listed
     today.
 
@@ -6189,10 +6191,11 @@ async def _automate_agent_pick_option_contract(root: str) -> Optional[dict]:
     if not price or price <= 0:
         return None
 
+    normalized_side = "put" if str(side or "").lower().startswith("p") else "call"
     for offset in range(0, max(0, config.automate_agent_option_expiry_fallback_days) + 1):
         expiry = (date.today() + timedelta(days=offset)).isoformat()
         contracts, _ = await asyncio.to_thread(
-            alpaca.get_option_contracts, root, expiry, None, "call"
+            alpaca.get_option_contracts, root, expiry, None, normalized_side
         )
         if contracts:
             nearest = min(
@@ -6212,13 +6215,17 @@ async def _automate_agent_pick_option_contract(root: str) -> Optional[dict]:
 
 
 async def _automate_agent_buy_option(
-    root: str, picked: Optional[BoomCandidate], equity: float
+    root: str, picked: Optional[BoomCandidate], equity: float, relaxing: bool = False
 ) -> str:
-    """Autonomously validate and place a single-leg CALL for `root`, reusing
-    the same tastytrade backtest gate (run_options_strategy_validation) every
-    manually-typed option signal already goes through -- never placed
-    without that same validation passing.
+    """Autonomously validate and place a single-leg CALL (on a BUY signal)
+    or PUT (on a SELL signal) for `root`, reusing the same tastytrade
+    backtest gate (run_options_strategy_validation) every manually-typed
+    option signal already goes through -- never placed without that same
+    validation passing. Defaults to CALL if there's no candidate signal to
+    read a direction from (matches the previous CALL-only behavior).
     """
+    side = "PUT" if picked is not None and picked.decision.upper() == "SELL" else "CALL"
+    side_letter = "P" if side == "PUT" else "C"
     already_held = any(
         str(p.get("root") or "").upper() == root
         and str(p.get("opened_by") or "") == AUTOMATE_AGENT_TAG
@@ -6241,10 +6248,10 @@ async def _automate_agent_buy_option(
     if already_pending:
         return f"- {root} (option): an automate_agent option entry is still pending confirmation, skipped."
 
-    contract = await _automate_agent_pick_option_contract(root)
+    contract = await _automate_agent_pick_option_contract(root, side)
     if not contract:
         return (
-            f"- {root} (option): no listed CALL contract found within "
+            f"- {root} (option): no listed {side} contract found within "
             f"{config.automate_agent_option_expiry_fallback_days} day(s), skipped."
         )
     occ_symbol = contract["occ_symbol"]
@@ -6256,14 +6263,14 @@ async def _automate_agent_buy_option(
         valid=True,
         root=root,
         strike=contract["strike"],
-        side="CALL",
+        side=side,
         expiry_date=contract["expiry_date"],
         expiry_mode="explicit",
         fill_price=premium if premium > 0 else None,
         quantity=1.0,
         order_action="open_long",
         tense="new_order",
-        raw_text=f"automate_agent synthetic BUY {root} {contract['strike']}C {contract['expiry_date']}",
+        raw_text=f"automate_agent synthetic BUY {root} {contract['strike']}{side_letter} {contract['expiry_date']}",
     )
     strategy_validation = await asyncio.to_thread(run_options_strategy_validation, synthetic)
     if str(strategy_validation.get("decision") or "").upper() != "BUY":
@@ -6297,12 +6304,13 @@ async def _automate_agent_buy_option(
     if not order:
         return f"- {occ_symbol}: option order was not placed: {_public_error(err)}"
 
-    await asyncio.to_thread(_record_order, occ_symbol, "buy", contracts, "submitted", str(order.get("id") or ""), "option", "automate_agent_buy")
+    order_detail = "automate_agent_buy_relaxed" if relaxing else "automate_agent_buy"
+    await asyncio.to_thread(_record_order, occ_symbol, "buy", contracts, "submitted", str(order.get("id") or ""), "option", order_detail)
     await _track_submitted_option_entry(
         order, occ_symbol, contracts,
         {
             "root": root,
-            "side": "CALL",
+            "side": side,
             "strike": contract["strike"],
             "expiry_date": contract["expiry_date"],
             "position_intent": "buy_to_open",
@@ -6313,8 +6321,12 @@ async def _automate_agent_buy_option(
     )
     conviction = f" [confidence {picked.confidence:.0f}]" if picked is not None else ""
     return (
-        f"- Bought {occ_symbol}: {contracts:g} contract(s) @ ~${premium:.2f} "
-        f"(stop {config.equity_stop_loss_pct:g}%, target {config.equity_take_profit_pct:g}%).{conviction}"
+        f"- Bought {occ_symbol}: {contracts:g} {side.lower()} contract(s) @ ~${premium:.2f} "
+        f"(stop {config.automate_agent_option_stop_loss_pct:g}% of premium, "
+        f"target {config.automate_agent_option_take_profit_pct:g}% of premium, "
+        f"auto-closes by {config.automate_agent_exit_time_et} ET if neither is hit first)."
+        f"{conviction}"
+        f"{' [compulsory minimum-trades fill]' if relaxing else ''}"
     )
 
 
@@ -6585,6 +6597,10 @@ async def _build_automate_agent_text() -> str:
             )
         )
         effective_min_confidence = 0.0 if relaxing else config.automate_agent_min_confidence
+        # A SELL signal is only actionable when automate_agent can actually
+        # act on it -- buying a put. Equity has no short-selling path, so
+        # this stays False (unchanged) whenever options aren't in play.
+        include_sell = config.automate_agent_asset_mode in {"options", "both"}
 
         plan = plan_automate_trades(
             candidates,
@@ -6593,6 +6609,7 @@ async def _build_automate_agent_text() -> str:
             config.automate_agent_max_positions,
             effective_min_confidence,
             config.automate_agent_max_evictions_per_cycle,
+            include_sell,
         )
 
         if not plan.to_buy:
@@ -6601,9 +6618,10 @@ async def _build_automate_agent_text() -> str:
                 "minimum trades placed so far; no candidate cleared even the relaxed bar this cycle."
                 if relaxing else ""
             )
+            decision_word = "BUY/SELL-decision" if include_sell else "BUY-decision"
             return (
                 f"automate_agent: scanned {len(config.automate_agent_watchlist)} watchlist symbol(s), "
-                f"no BUY-decision candidates found this cycle. No trades placed.{unmet_note}"
+                f"no {decision_word} candidates found this cycle. No trades placed.{unmet_note}"
             )
 
         lines = ["automate_agent cycle summary"]
@@ -6739,7 +6757,7 @@ async def _build_automate_agent_text() -> str:
             remaining_slots = max(0, config.automate_agent_max_positions - projected_combined_count)
             for symbol in plan.to_buy[:remaining_slots]:
                 try:
-                    lines.append(await _automate_agent_buy_option(symbol, candidates_by_symbol.get(symbol.upper()), equity))
+                    lines.append(await _automate_agent_buy_option(symbol, candidates_by_symbol.get(symbol.upper()), equity, relaxing))
                 except Exception as exc:  # noqa: BLE001 -- one symbol's failure must not abort the cycle
                     logging.getLogger("discord_stock_prediction_agent").error(
                         "automate_agent: option buy failed for %s: %s", symbol, exc
