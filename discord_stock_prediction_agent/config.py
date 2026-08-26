@@ -210,6 +210,13 @@ class AgentConfig:
     # itself (e.g. bought at $2.00: stop at $1.60, target at $2.50).
     automate_agent_option_stop_loss_pct: float = _float_env("AUTOMATE_AGENT_OPTION_STOP_LOSS_PCT", 20.0)
     automate_agent_option_take_profit_pct: float = _float_env("AUTOMATE_AGENT_OPTION_TAKE_PROFIT_PCT", 25.0)
+    # How many listed strikes nearest the current price to fetch premiums
+    # for and score (automate_agent.select_best_strike) when choosing which
+    # strike to buy, instead of only ever taking the nearest-the-money one.
+    # Deliberately small: each candidate costs one extra live-quote call,
+    # which is fine for a narrow, single-symbol watchlist but would not
+    # have been for the prior full S&P 500 watchlist.
+    automate_agent_strike_candidates: int = _int_env("AUTOMATE_AGENT_STRIKE_CANDIDATES", 5)
     # A BUY the model itself didn't flag as needing review can still be a
     # thin, barely-cleared-the-bar call. This drops anything below the
     # threshold from consideration entirely, on top of the existing

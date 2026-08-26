@@ -50,9 +50,11 @@ from .pending_market_orders import (
 from .automate_agent import (
     AUTOMATE_AGENT_TAG,
     BoomCandidate,
+    StrikeQuote,
     confidence_scaled_risk_multiplier,
     count_automate_positions,
     plan_automate_trades,
+    select_best_strike,
 )
 from .prediction_bridge import run_project_prediction
 from .protection_policy import build_protection_levels, evaluate_protection
@@ -6174,18 +6176,27 @@ async def agent_option_validation(ctx: commands.Context) -> None:
     await _send_context_output(ctx, await _build_agent_option_validation_text())
 
 
-async def _automate_agent_pick_option_contract(root: str, side: str = "call") -> Optional[dict]:
-    """Pick a same-day (0DTE) at-the-money CALL or PUT for `root`, falling
-    back to the nearest later listed expiry within
+async def _automate_agent_pick_option_contract(
+    root: str, side: str, predicted_target_price: Optional[float], risk_budget: float
+) -> Optional[dict]:
+    """Pick a same-day (0DTE) CALL or PUT for `root`, falling back to the
+    nearest later listed expiry within
     config.automate_agent_option_expiry_fallback_days if nothing is listed
     today.
 
-    There is no options-greeks/delta data source anywhere in this codebase
-    (Alpaca's contract-listing endpoint returns no greeks, and nothing wraps
-    a snapshot-based delta estimate) -- ATM (nearest listed strike to the
-    live underlying price) is used as the closest buildable proxy for a
-    balanced, non-extreme delta, rather than inventing an unvalidated
-    greeks estimator for a no-human-review path.
+    Scores the config.automate_agent_strike_candidates listed strikes
+    nearest the current price by their expected payoff at
+    predicted_target_price (automate_agent.select_best_strike), rather than
+    blindly taking the nearest-the-money strike regardless of what the
+    model itself expects. There is still no options-greeks/delta data
+    source anywhere in this codebase (Alpaca's contract-listing endpoint
+    returns no greeks, and nothing wraps a snapshot-based delta estimate)
+    -- reusing the same predicted_target_price that already produced this
+    symbol's BUY/SELL decision is the closest buildable substitute for
+    "which strike is actually the best trade," rather than inventing an
+    unvalidated greeks estimator for a no-human-review path. Falls back to
+    nearest-the-money when there's no predicted target to score against
+    (see select_best_strike), matching the previous behavior.
     """
     price, price_err = await asyncio.to_thread(alpaca.get_latest_price, root)
     if not price or price <= 0:
@@ -6197,20 +6208,33 @@ async def _automate_agent_pick_option_contract(root: str, side: str = "call") ->
         contracts, _ = await asyncio.to_thread(
             alpaca.get_option_contracts, root, expiry, None, normalized_side
         )
-        if contracts:
-            nearest = min(
-                contracts,
-                key=lambda c: abs(_as_float(c.get("strike_price")) - price),
-            )
-            strike = _as_float(nearest.get("strike_price"))
-            if strike <= 0:
+        if not contracts:
+            continue
+        nearest_first = sorted(
+            contracts, key=lambda c: abs(_as_float(c.get("strike_price")) - price)
+        )[: max(1, config.automate_agent_strike_candidates)]
+        quotes: list[StrikeQuote] = []
+        for candidate in nearest_first:
+            strike = _as_float(candidate.get("strike_price"))
+            occ_symbol = str(candidate.get("symbol") or "")
+            if strike <= 0 or not occ_symbol:
                 continue
-            return {
-                "occ_symbol": str(nearest.get("symbol") or ""),
-                "strike": strike,
-                "expiry_date": expiry,
-                "root": root,
-            }
+            premium, _ = await asyncio.to_thread(alpaca.get_latest_option_price, occ_symbol)
+            premium = _as_float(premium)
+            if premium > 0:
+                quotes.append(StrikeQuote(occ_symbol=occ_symbol, strike=strike, premium=premium))
+        if not quotes:
+            continue
+        chosen = select_best_strike(quotes, normalized_side, predicted_target_price, price, risk_budget)
+        if chosen is None:
+            continue
+        return {
+            "occ_symbol": chosen.occ_symbol,
+            "strike": chosen.strike,
+            "expiry_date": expiry,
+            "root": root,
+            "premium": chosen.premium,
+        }
     return None
 
 
@@ -6248,16 +6272,18 @@ async def _automate_agent_buy_option(
     if already_pending:
         return f"- {root} (option): an automate_agent option entry is still pending confirmation, skipped."
 
-    contract = await _automate_agent_pick_option_contract(root, side)
+    size_multiplier = confidence_scaled_risk_multiplier(picked.confidence) if picked is not None else 1.0
+    risk_budget = equity * config.automate_agent_risk_pct_per_trade / 100.0 * size_multiplier
+    predicted_target_price = picked.predicted_target_price if picked is not None else None
+    contract = await _automate_agent_pick_option_contract(root, side, predicted_target_price, risk_budget)
     if not contract:
         return (
             f"- {root} (option): no listed {side} contract found within "
-            f"{config.automate_agent_option_expiry_fallback_days} day(s), skipped."
+            f"{config.automate_agent_option_expiry_fallback_days} day(s) affordable within the "
+            f"${risk_budget:.2f} risk budget, skipped."
         )
     occ_symbol = contract["occ_symbol"]
-
-    premium, _ = await asyncio.to_thread(alpaca.get_latest_option_price, occ_symbol)
-    premium = _as_float(premium)
+    premium = _as_float(contract["premium"])
 
     synthetic = ParsedOptionSignal(
         valid=True,
@@ -6283,17 +6309,11 @@ async def _automate_agent_buy_option(
     if not enabled:
         return f"- {occ_symbol}: {_public_error(options_err)}"
 
-    if premium <= 0:
-        return f"- {occ_symbol}: could not get a live option premium, skipped."
-
-    size_multiplier = confidence_scaled_risk_multiplier(picked.confidence) if picked is not None else 1.0
-    risk_budget = equity * config.automate_agent_risk_pct_per_trade / 100.0 * size_multiplier
+    # premium/affordability were already checked by select_best_strike inside
+    # _automate_agent_pick_option_contract (it never returns a strike whose
+    # premium is <= 0 or exceeds risk_budget) -- contract["premium"] is
+    # guaranteed sane here.
     per_contract_cost = premium * 100.0
-    if per_contract_cost > risk_budget:
-        return (
-            f"- {occ_symbol}: premium ${premium:.2f} (${per_contract_cost:.2f}/contract) exceeds "
-            f"the ${risk_budget:.2f} risk budget; even 1 contract would oversize the position, skipped."
-        )
     contracts = max(1, int(risk_budget // per_contract_cost))
 
     order, err = await asyncio.to_thread(
@@ -6371,6 +6391,7 @@ async def _scan_automate_agent_watchlist() -> list[BoomCandidate]:
             confidence=_as_float(ai_prediction.get("confidence_score")),
             predicted_return_pct=_as_float(ai_prediction.get("predicted_return_pct")),
             needs_human_review=bool(ai_prediction.get("needs_human_review")),
+            predicted_target_price=_as_float(ai_prediction.get("predicted_target_price")) or None,
         )
 
     tasks = [

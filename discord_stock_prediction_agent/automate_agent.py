@@ -34,6 +34,11 @@ class BoomCandidate:
     confidence: float = 0.0  # 0-100 confidence_score from the prediction engine
     predicted_return_pct: float = 0.0  # used as a tiebreaker when confidence ties
     needs_human_review: bool = False  # the model's OWN flag that this call is uncertain
+    # The same absolute price target that produced predicted_return_pct (and
+    # therefore this BUY/SELL decision in the first place). None if the
+    # prediction result didn't carry one -- callers must degrade gracefully,
+    # not assume it's always present.
+    predicted_target_price: Optional[float] = None
 
 
 def rank_boom_candidates(
@@ -98,6 +103,65 @@ def confidence_scaled_risk_multiplier(confidence: float, floor: float = 0.75, ca
         return cap
     frac = (confidence - 50) / 50.0
     return floor + frac * (cap - floor)
+
+
+@dataclass(frozen=True)
+class StrikeQuote:
+    occ_symbol: str
+    strike: float
+    premium: float  # per-share option premium; one contract costs premium * 100
+
+
+def select_best_strike(
+    quotes: list[StrikeQuote],
+    side: str,
+    predicted_target_price: Optional[float],
+    current_price: float,
+    risk_budget: float,
+) -> Optional[StrikeQuote]:
+    """Picks which listed strike (from a handful of quoted candidates near
+    the money) is actually the best trade, instead of always taking the
+    nearest-the-money strike regardless of what the model itself expects.
+
+    There is still no options-greeks/delta data source anywhere in this
+    codebase, so this can't rank by real delta/theta. What IS already
+    available is predicted_target_price -- the same absolute price target
+    that produced the BUY/SELL decision for this symbol in the first
+    place. Scoring each candidate strike by its expected payoff if that
+    target is reached (intrinsic value at the target, minus the premium
+    paid, as a fraction of that premium) reuses a signal this codebase
+    already computed and validated the decision on, rather than inventing
+    a fresh, unvalidated one.
+
+    Strikes whose premium doesn't fit risk_budget are dropped before
+    scoring -- a strike this trade literally can't afford isn't "the best
+    trade," it isn't a trade at all. Returns None if nothing quoted fits.
+
+    Falls back to nearest-the-money among what's affordable when
+    predicted_target_price isn't available (matches the prior, simpler
+    behavior); ties in expected payoff also break toward nearest-the-money,
+    so this converges to the old ATM-only behavior as the model's own
+    predicted move shrinks toward zero.
+    """
+    affordable = [q for q in quotes if q.premium > 0 and q.premium * 100.0 <= risk_budget]
+    if not affordable:
+        return None
+    if predicted_target_price is None or predicted_target_price <= 0:
+        return min(affordable, key=lambda q: abs(q.strike - current_price))
+
+    is_call = side.upper() == "CALL"
+
+    def expected_profit_ratio(q: StrikeQuote) -> float:
+        intrinsic_at_target = (
+            max(0.0, predicted_target_price - q.strike) if is_call
+            else max(0.0, q.strike - predicted_target_price)
+        )
+        return (intrinsic_at_target - q.premium) / q.premium
+
+    return max(
+        affordable,
+        key=lambda q: (expected_profit_ratio(q), -abs(q.strike - current_price)),
+    )
 
 
 def oldest_automate_position(open_positions: list[dict]) -> Optional[str]:

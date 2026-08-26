@@ -13,11 +13,13 @@ from __future__ import annotations
 from .automate_agent import (
     AUTOMATE_AGENT_TAG,
     BoomCandidate,
+    StrikeQuote,
     confidence_scaled_risk_multiplier,
     count_automate_positions,
     oldest_automate_position,
     plan_automate_trades,
     rank_boom_candidates,
+    select_best_strike,
 )
 
 PASS = 0
@@ -182,6 +184,75 @@ def test_confidence_scaled_risk_multiplier_interpolates_linearly() -> None:
     _assert(abs(mid - 1.0) < 1e-9, "confidence 75 (midpoint) is exactly the neutral 1.0x", str(mid))
     high = confidence_scaled_risk_multiplier(90)
     _assert(0.75 < mid < high < 1.25, "monotonically increasing between floor and cap", f"mid={mid} high={high}")
+
+
+def test_select_best_strike_falls_back_to_nearest_the_money_without_a_target() -> None:
+    print("\nTest: select_best_strike falls back to nearest-the-money when there's no predicted target")
+    quotes = [
+        StrikeQuote("A95", 95.0, premium=3.0),
+        StrikeQuote("A100", 100.0, premium=2.0),
+        StrikeQuote("A105", 105.0, premium=1.0),
+    ]
+    chosen = select_best_strike(quotes, "CALL", None, current_price=101.0, risk_budget=1000.0)
+    _assert(chosen is not None and chosen.strike == 100.0, "picks the strike nearest the $101 spot", chosen)
+
+
+def test_select_best_strike_picks_highest_expected_payoff_for_a_call() -> None:
+    print("\nTest: select_best_strike picks the CALL strike with the best expected payoff at the predicted target")
+    quotes = [
+        StrikeQuote("A95", 95.0, premium=7.0),   # intrinsic@110=15, ratio=1.14
+        StrikeQuote("A100", 100.0, premium=4.0),  # intrinsic@110=10, ratio=1.5
+        StrikeQuote("A105", 105.0, premium=1.0),  # intrinsic@110=5,  ratio=4.0 <- best
+    ]
+    chosen = select_best_strike(quotes, "CALL", 110.0, current_price=100.0, risk_budget=1000.0)
+    _assert(
+        chosen is not None and chosen.strike == 105.0,
+        "the cheap OTM call has the best expected payoff, not the ATM one",
+        chosen,
+    )
+
+
+def test_select_best_strike_picks_highest_expected_payoff_for_a_put() -> None:
+    print("\nTest: select_best_strike mirrors the same logic for PUTs")
+    quotes = [
+        StrikeQuote("A105", 105.0, premium=7.0),  # intrinsic@90=15, ratio=1.14
+        StrikeQuote("A100", 100.0, premium=4.0),  # intrinsic@90=10, ratio=1.5
+        StrikeQuote("A95", 95.0, premium=1.0),    # intrinsic@90=5,  ratio=4.0 <- best
+    ]
+    chosen = select_best_strike(quotes, "PUT", 90.0, current_price=100.0, risk_budget=1000.0)
+    _assert(
+        chosen is not None and chosen.strike == 95.0,
+        "the cheap OTM put has the best expected payoff, not the ATM one",
+        chosen,
+    )
+
+
+def test_select_best_strike_drops_strikes_the_risk_budget_cannot_afford() -> None:
+    print("\nTest: select_best_strike never returns a strike whose premium exceeds risk_budget")
+    quotes = [
+        StrikeQuote("DeepITM", 90.0, premium=12.0),  # intrinsic@101=11, ratio=-0.083 (best if affordable)
+        StrikeQuote("ATM", 100.0, premium=3.0),       # intrinsic@101=1,  ratio=-0.667
+        StrikeQuote("OTM", 110.0, premium=0.5),       # intrinsic@101=0,  ratio=-1.0
+    ]
+    tight = select_best_strike(quotes, "CALL", 101.0, current_price=100.0, risk_budget=500.0)
+    _assert(
+        tight is not None and tight.strike == 100.0,
+        "DeepITM (cost $1200) doesn't fit a $500 budget, so the next-best affordable strike wins",
+        tight,
+    )
+    loose = select_best_strike(quotes, "CALL", 101.0, current_price=100.0, risk_budget=2000.0)
+    _assert(
+        loose is not None and loose.strike == 90.0,
+        "with enough budget to afford it, DeepITM's better expected payoff wins",
+        loose,
+    )
+
+
+def test_select_best_strike_returns_none_when_nothing_affordable() -> None:
+    print("\nTest: select_best_strike returns None rather than a trade the risk budget can't support")
+    quotes = [StrikeQuote("A100", 100.0, premium=10.0)]
+    chosen = select_best_strike(quotes, "CALL", 110.0, current_price=100.0, risk_budget=500.0)
+    _assert(chosen is None, "no strike fits a $500 budget when the cheapest costs $1000/contract", chosen)
 
 
 def test_oldest_automate_position_ignores_user_trades() -> None:
@@ -353,6 +424,11 @@ def run_all() -> None:
     test_confidence_scaled_risk_multiplier_floor_at_low_confidence()
     test_confidence_scaled_risk_multiplier_caps_at_high_confidence()
     test_confidence_scaled_risk_multiplier_interpolates_linearly()
+    test_select_best_strike_falls_back_to_nearest_the_money_without_a_target()
+    test_select_best_strike_picks_highest_expected_payoff_for_a_call()
+    test_select_best_strike_picks_highest_expected_payoff_for_a_put()
+    test_select_best_strike_drops_strikes_the_risk_budget_cannot_afford()
+    test_select_best_strike_returns_none_when_nothing_affordable()
     test_oldest_automate_position_ignores_user_trades()
     test_oldest_automate_position_none_when_all_user_owned()
     test_count_automate_positions()

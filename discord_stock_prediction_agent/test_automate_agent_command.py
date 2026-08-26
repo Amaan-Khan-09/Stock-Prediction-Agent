@@ -930,6 +930,59 @@ def test_options_mode_buys_an_atm_call_when_backtest_confirms_buy() -> None:
     _with_asset_mode("options", run)
 
 
+def test_options_mode_picks_the_best_expected_payoff_strike_not_just_atm() -> None:
+    """New behavior for the TSLA-options pivot: when more than one nearby
+    strike is actually quoted, automate_agent buys whichever has the best
+    expected payoff at the model's own predicted_target_price
+    (automate_agent.select_best_strike), not simply whichever is closest
+    to the current price."""
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            fake.prices[symbol] = 100.0
+            today = date.today().isoformat()
+            occ_95 = f"{symbol}260101C00095000"
+            occ_100 = f"{symbol}260101C00100000"  # nearest-the-money
+            occ_105 = f"{symbol}260101C00105000"  # best expected payoff at a $110 target
+            fake.option_contracts_by_expiry[today] = [
+                {"symbol": occ_95, "strike_price": "95"},
+                {"symbol": occ_100, "strike_price": "100"},
+                {"symbol": occ_105, "strike_price": "105"},
+            ]
+            fake.option_premiums[occ_95] = 7.0
+            fake.option_premiums[occ_100] = 4.0
+            fake.option_premiums[occ_105] = 1.0
+
+            original_validate = discord_agent.run_options_strategy_validation
+            discord_agent.run_options_strategy_validation = lambda option: {
+                "status": "SUCCESS", "decision": "BUY",
+            }
+            try:
+                await discord_agent._build_automate_agent_text()
+                entry_order_id = next(
+                    o["id"] for o in fake.submissions if o["symbol"] == occ_105 and o["side"] == "buy"
+                )
+                fake.mark_order_filled(entry_order_id, fill_price=1.0)
+                await discord_agent._reconcile_pending_option_entry_orders()
+            finally:
+                discord_agent.run_options_strategy_validation = original_validate
+
+            option_positions = state_store.list_option_positions()
+            assert len(option_positions) == 1, option_positions
+            assert option_positions[0]["occ_symbol"] == occ_105, (
+                "the $105 strike (best expected payoff at the $110 target) must win over the $100 ATM strike"
+            )
+
+        predictions = {
+            discord_agent.config.automate_agent_watchlist[0]: {
+                "decision": "BUY", "confidence_score": 75, "predicted_target_price": 110.0,
+            }
+        }
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("options", run)
+
+
 def test_options_mode_buys_an_atm_put_on_a_sell_signal() -> None:
     """New behavior for the TSLA-options pivot: a SELL-decision candidate is
     actionable in options mode too -- automate_agent buys a PUT (profiting
