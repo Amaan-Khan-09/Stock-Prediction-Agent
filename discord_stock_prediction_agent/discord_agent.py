@@ -6438,8 +6438,14 @@ def _build_automate_agent_daily_report_text(date_label: str = "") -> str:
         total_pnl += pnl_value
         if pnl_value > 0:
             wins += 1
+        # asset_type distinguishes a plain TSLA share trade (entry/exit are
+        # a share price) from a single-leg option trade (entry/exit are the
+        # contract's premium, and symbol is the full OCC contract -- already
+        # self-describing, e.g. TSLA260101C00350000) -- both asset classes
+        # can close on the same day now that automate_agent trades both.
+        unit = "contract(s)" if str(outcome.get("asset_type") or "") == "option" else "share(s)"
         lines.append(
-            f"- {symbol}: {qty:g} sh, entered ${entry_price:.2f} -> exited ${exit_price:.2f} "
+            f"- {symbol}: {qty:g} {unit}, entered ${entry_price:.2f} -> exited ${exit_price:.2f} "
             f"({pnl_value:+.2f} USD, {pnl_pct:+.2f}%)"
         )
     lines.append(
@@ -6450,10 +6456,11 @@ def _build_automate_agent_daily_report_text(date_label: str = "") -> str:
 
 
 async def _maybe_post_automate_agent_daily_report() -> None:
-    """Fires once per ET calendar day, only after the last automate_agent
-    equity position from today has actually settled (confirmed exit fill,
-    not just "the cutoff time passed") -- posting before that would report
-    an incomplete/still-changing total. If a position is somehow still open
+    """Fires once per ET calendar day, only after every automate_agent
+    position from today -- equity AND option, now that automate_agent
+    trades both -- has actually settled (confirmed exit fill, not just
+    "the cutoff time passed") -- posting before that would report an
+    incomplete/still-changing total. If a position is somehow still open
     past the cutoff, this just keeps checking next cycle instead of posting
     a premature or duplicate report.
     """
@@ -6467,6 +6474,9 @@ async def _maybe_post_automate_agent_daily_report() -> None:
     still_open = any(
         str(p.get("opened_by") or "").lower() == AUTOMATE_AGENT_TAG
         for p in await asyncio.to_thread(list_positions)
+    ) or any(
+        str(p.get("opened_by") or "").lower() == AUTOMATE_AGENT_TAG
+        for p in await asyncio.to_thread(list_option_positions)
     )
     if still_open:
         return
@@ -6540,6 +6550,22 @@ async def _build_automate_agent_text() -> str:
                 "are still protected by the normal stop-loss/take-profit monitor."
             )
 
+        # Hard ceiling on total orders placed today (equity + option buys
+        # combined, same counter the compulsory-minimum check below uses) --
+        # distinct from automate_agent_max_positions, which only bounds how
+        # many are held *at once*. Without this, a busy day of eviction
+        # churn could place far more than automate_agent_max_trades_per_window
+        # orders even though the concurrent-position cap was never exceeded.
+        trades_today = await asyncio.to_thread(count_today_automate_agent_buys)
+        if trades_today >= config.automate_agent_max_trades_per_window:
+            return (
+                f"automate_agent: today's order quota "
+                f"({config.automate_agent_max_trades_per_window}) already reached "
+                f"({trades_today} placed); no new positions will be opened for the rest of the "
+                "window. Existing positions are still protected and will still be closed by "
+                "the exit cutoff."
+            )
+
         candidates = await _scan_automate_agent_watchlist()
         open_positions = await asyncio.to_thread(list_positions)
         # A position mid-eviction (sell submitted, not yet reconciled) is
@@ -6607,7 +6633,8 @@ async def _build_automate_agent_text() -> str:
         # needed to be is relaxed. Never applies past the cutoff itself
         # (nothing new should be bought once positions are being flattened)
         # and never bypasses the daily-loss circuit breaker above.
-        trades_today = await asyncio.to_thread(count_today_automate_agent_buys)
+        # trades_today was already fetched above for the max-trades-per-
+        # window gate -- same counter, reused here rather than re-queried.
         now_et = _now_et()
         min_trades_unmet = trades_today < config.automate_agent_min_trades_per_window
         relaxing = (

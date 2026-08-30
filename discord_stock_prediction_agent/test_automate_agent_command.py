@@ -842,14 +842,15 @@ def test_autoscan_task_runs_the_cycle_when_enabled() -> None:
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
-def test_default_asset_mode_is_options_on_tsla() -> None:
+def test_default_asset_mode_is_both_on_tsla() -> None:
     # Pins the current product decision, per direction from the user's
-    # senior: automate_agent trades options (calls on BUY, puts on SELL)
-    # on a narrow TSLA-only watchlist by default now -- equity scanning
-    # across a broad watchlist is paused (not removed) and can be switched
-    # back on via AUTOMATE_AGENT_ASSET_MODE/AUTOMATE_AGENT_WATCHLIST. If
-    # this ever flips silently, automate_agent's live behavior would
-    # diverge from what was actually decided without anyone noticing.
+    # senior: automate_agent trades normal TSLA shares AND single-leg
+    # options (calls on BUY, puts on SELL) side by side by default, on a
+    # narrow TSLA-only watchlist -- scanning the whole S&P 500 is paused
+    # (not removed) and can be switched back on via
+    # AUTOMATE_AGENT_ASSET_MODE/AUTOMATE_AGENT_WATCHLIST. If this ever
+    # flips silently, automate_agent's live behavior would diverge from
+    # what was actually decided without anyone noticing.
     #
     # Asserts against a *fresh* AgentConfig(), not discord_agent.config --
     # this module's own setup_module pins the live config to "equity" plus
@@ -859,8 +860,10 @@ def test_default_asset_mode_is_options_on_tsla() -> None:
     from .config import AgentConfig
 
     fresh = AgentConfig()
-    assert fresh.automate_agent_asset_mode == "options"
+    assert fresh.automate_agent_asset_mode == "both"
     assert fresh.automate_agent_watchlist == ("TSLA",)
+    assert fresh.automate_agent_min_trades_per_window == 5
+    assert fresh.automate_agent_max_trades_per_window == 25
 
 
 def _with_asset_mode(mode: str, test_fn) -> None:
@@ -1211,11 +1214,56 @@ def test_daily_report_lists_trades_with_entry_exit_and_total_pnl() -> None:
         state_store.close_position_with_outcome("TSLA", 1, 105.0, "manual_sell")
 
         text = discord_agent._build_automate_agent_daily_report_text("2026-08-24")
-        assert "- AAPL: 5 sh, entered $200.00 -> exited $220.00 (+100.00 USD, +10.00%)" in text
-        assert "- MSFT: 3 sh, entered $400.00 -> exited $396.00 (-12.00 USD, -1.00%)" in text
+        assert "- AAPL: 5 share(s), entered $200.00 -> exited $220.00 (+100.00 USD, +10.00%)" in text
+        assert "- MSFT: 3 share(s), entered $400.00 -> exited $396.00 (-12.00 USD, -1.00%)" in text
         assert "TSLA" not in text
         assert "Total trades: 2 (1 win / 1 loss)" in text
         assert "Total P&L for the day: +88.00 USD" in text
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_daily_report_covers_both_equity_and_option_trades_together() -> None:
+    """New requirement for the "both" pivot: automate_agent trades normal
+    TSLA shares and single-leg options side by side, so one day's report
+    must list both kinds of closed trades -- not just equity."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        state_store.upsert_position("TSLA", 10, 300.0, "buy-1", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+        state_store.close_position_with_outcome("TSLA", 10, 315.0, "protection_take_profit")
+        state_store.upsert_option_position(
+            "TSLA260101C00350000", "TSLA", "CALL", 350.0, "2026-01-01",
+            2, 2.0, "opt-buy-1", opened_by=AUTOMATE_AGENT_TAG,
+        )
+        state_store.close_option_position_with_outcome("TSLA260101C00350000", 2, 2.5, "protection_take_profit")
+
+        text = discord_agent._build_automate_agent_daily_report_text("2026-08-31")
+        assert "- TSLA: 10 share(s), entered $300.00 -> exited $315.00 (+150.00 USD, +5.00%)" in text
+        assert "- TSLA260101C00350000: 2 contract(s), entered $2.00 -> exited $2.50" in text
+        assert "Total trades: 2 (2 win / 0 loss)" in text
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_daily_report_waits_for_a_still_open_option_position_too() -> None:
+    """Regression: _maybe_post_automate_agent_daily_report's still_open
+    check only ever looked at list_positions() (equity) -- an automate_agent
+    option position still open past the cutoff would be silently ignored,
+    letting an incomplete report post (and then never post again, since
+    the report date gets marked as already-reported for the day)."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        state_store.upsert_option_position(
+            "TSLA260101C00350000", "TSLA", "CALL", 350.0, "2026-01-01",
+            1, 2.0, "opt-buy-1", opened_by=AUTOMATE_AGENT_TAG,
+        )
+        original_now_et = discord_agent._now_et
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 13, 0, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            await discord_agent._maybe_post_automate_agent_daily_report()
+        finally:
+            discord_agent._now_et = original_now_et
+
+        assert not sent, "must not post the daily report while an automate_agent option position is still open"
+        assert not state_store.get_automate_agent_report_date(), "must not mark today as reported either"
 
     asyncio.run(_with_runtime(scenario, predictions={}))
 
@@ -1352,6 +1400,43 @@ def test_compulsory_minimum_does_not_relax_once_quota_already_met() -> None:
         assert "no buy-decision candidates found" in text.lower()
 
     predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 30}}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_max_trades_per_window_blocks_new_buys_once_reached() -> None:
+    """Per the user's senior: at most automate_agent_max_trades_per_window
+    (25) orders in the whole trading window, regardless of how much
+    position-cap headroom eviction churn might otherwise free up. This is
+    a hard ceiling on total orders placed, distinct from
+    automate_agent_max_positions (which only bounds concurrent holdings)."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        _record_fake_automate_buys(discord_agent.config.automate_agent_max_trades_per_window)
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+
+        text = await discord_agent._build_automate_agent_text()
+
+        assert not fake.submissions, "quota already reached -- must not place another order"
+        assert "order quota" in text.lower()
+        assert str(discord_agent.config.automate_agent_max_trades_per_window) in text
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 95}}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_max_trades_per_window_still_allows_buys_below_the_cap() -> None:
+    """One order short of the cap must still go through normally -- the
+    quota only blocks *once* the ceiling is actually reached."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        _record_fake_automate_buys(discord_agent.config.automate_agent_max_trades_per_window - 1)
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+
+        await discord_agent._build_automate_agent_text()
+
+        assert len(fake.submissions) == 1, "one slot remained under the cap"
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 95}}
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 

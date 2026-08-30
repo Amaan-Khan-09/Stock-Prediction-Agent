@@ -788,6 +788,7 @@ def close_position_with_outcome(
     ) * close_qty
     outcome = {
         "symbol": sym,
+        "asset_type": "equity",
         "side": "buy_to_close_short" if short_position else "sell_to_close_long",
         "qty": round(close_qty, 6),
         "entry_price": round(entry_price, 6),
@@ -1233,6 +1234,7 @@ def close_option_position_with_outcome(
     ) * close_qty * 100.0
     outcome = {
         "symbol": occ_symbol,
+        "asset_type": "option",
         "side": "buy_to_close_short" if short_position else "sell_to_close_long",
         "qty": round(close_qty, 6),
         "entry_price": round(entry_price, 6),

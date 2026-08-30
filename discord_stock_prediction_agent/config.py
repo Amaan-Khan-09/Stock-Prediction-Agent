@@ -137,6 +137,15 @@ class AgentConfig:
     automate_agent_min_trades_per_window: int = _int_env(
         "AUTOMATE_AGENT_MIN_TRADES_PER_WINDOW", 5
     )
+    # Hard ceiling on the flip side -- total orders (equity + option buys
+    # combined, counted the same way as the minimum above) placed during
+    # the whole trading window, regardless of how much position-cap
+    # headroom eviction churn might otherwise free up. Per direction from
+    # the user's senior: 5 minimum, 25 maximum over the ~9:30-12:30 ET
+    # window.
+    automate_agent_max_trades_per_window: int = _int_env(
+        "AUTOMATE_AGENT_MAX_TRADES_PER_WINDOW", 25
+    )
     automate_agent_min_trades_relax_minutes: int = _int_env(
         "AUTOMATE_AGENT_MIN_TRADES_RELAX_MINUTES", 60
     )
@@ -191,14 +200,15 @@ class AgentConfig:
     automate_agent_scan_timeout_seconds: int = _int_env(
         "AUTOMATE_AGENT_SCAN_TIMEOUT_SECONDS", 600
     )
-    # "equity" | "options" (default) | "both". Controls whether automate_agent's
+    # "equity" | "options" | "both" (default). Controls whether automate_agent's
     # autonomous buys are shares, single-leg options, or both asset classes
     # competing for the same position cap. Per direction from the user's
-    # senior: pivoted to options-first (calls on a BUY signal, puts on a
-    # SELL signal) on a narrow, deliberately-chosen symbol list rather than
-    # scanning the whole S&P 500 for equity -- equity scanning is paused,
-    # not removed, and can be switched back on via this same setting.
-    automate_agent_asset_mode: str = os.getenv("AUTOMATE_AGENT_ASSET_MODE", "options").strip().lower()
+    # senior: normal TSLA share trades AND single-leg options (calls on a
+    # BUY signal, puts on a SELL signal) side by side, on a narrow,
+    # deliberately-chosen symbol list rather than scanning the whole S&P
+    # 500 -- equity-only/options-only remain available via this same
+    # setting for anyone who wants a narrower mode.
+    automate_agent_asset_mode: str = os.getenv("AUTOMATE_AGENT_ASSET_MODE", "both").strip().lower()
     # How many calendar days forward to search for a listed option expiry
     # when a watchlist symbol has no same-day (0DTE) contracts listed.
     automate_agent_option_expiry_fallback_days: int = _int_env(
