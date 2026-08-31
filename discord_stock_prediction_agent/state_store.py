@@ -1012,13 +1012,18 @@ def count_today_order_events(exclude_automate_agent: bool = False) -> int:
     )
 
 
-def count_today_automate_agent_buys() -> int:
-    """Counts BUY orders (equity shares AND single-leg options alike)
-    automate_agent has submitted today (UTC day -- the whole 9:30-12:30 ET
-    trading window falls inside one UTC day), regardless of whether each
-    has closed yet. Backs both the compulsory minimum-trades-per-window
-    floor and the max-trades-per-window ceiling -- "placed" means
-    submitted, not "closed at a profit."
+def count_today_automate_agent_buys(asset_type: str = "") -> int:
+    """Counts BUY orders automate_agent has submitted today (UTC day --
+    the whole 9:30-12:30 ET trading window falls inside one UTC day),
+    regardless of whether each has closed yet. "placed" means submitted,
+    not "closed at a profit."
+
+    asset_type="option" scopes this to single-leg options buys only --
+    backs the compulsory minimum-options-trades-per-window floor,
+    deliberately not counting equity buys toward that quota. Left blank
+    (the default), every asset type is counted together -- backs the
+    overall max-trades-per-window ceiling, which is meant to bound total
+    order volume regardless of asset class.
     """
     today = _today_prefix()
     return sum(
@@ -1026,6 +1031,7 @@ def count_today_automate_agent_buys() -> int:
         if str(event.get("created_at") or "").startswith(today)
         and str(event.get("side") or "").lower() == "buy"
         and _is_automate_agent_order_event(event)
+        and (not asset_type or str(event.get("asset_type") or "").lower() == asset_type.lower())
     )
 
 

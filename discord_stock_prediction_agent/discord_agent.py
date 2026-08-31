@@ -2689,11 +2689,12 @@ def _automate_agent_eod_cutoff_reached(now_et: datetime, cutoff: str) -> bool:
 def _automate_agent_in_min_trades_relax_window(now_et: datetime, cutoff: str, relax_minutes: int) -> bool:
     """True once now_et is within relax_minutes of the fixed daily cutoff
     but hasn't reached it yet -- the window where a still-unmet compulsory
-    minimum-trades-per-window requirement should relax the confidence bar
-    (see automate_agent_min_trades_per_window) rather than risk missing
-    the quota entirely by waiting for a higher-conviction pick that may
-    never come. A malformed/empty cutoff never relaxes anything, matching
-    the "no config, no forced behavior" pattern used elsewhere here.
+    minimum-options-trades-per-window requirement should relax the
+    confidence bar (see automate_agent_min_options_trades_per_window)
+    rather than risk missing the quota entirely by waiting for a higher-
+    conviction pick that may never come. A malformed/empty cutoff never
+    relaxes anything, matching the "no config, no forced behavior"
+    pattern used elsewhere here.
     """
     match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(cutoff or "").strip())
     if not match:
@@ -6598,11 +6599,13 @@ async def _build_automate_agent_text() -> str:
             )
 
         # Hard ceiling on total orders placed today (equity + option buys
-        # combined, same counter the compulsory-minimum check below uses) --
-        # distinct from automate_agent_max_positions, which only bounds how
-        # many are held *at once*. Without this, a busy day of eviction
-        # churn could place far more than automate_agent_max_trades_per_window
-        # orders even though the concurrent-position cap was never exceeded.
+        # combined) -- distinct from automate_agent_max_positions, which
+        # only bounds how many are held *at once*. Without this, a busy
+        # day of eviction churn could place far more than
+        # automate_agent_max_trades_per_window orders even though the
+        # concurrent-position cap was never exceeded. Distinct in scope
+        # from the compulsory-minimum check below, which counts options
+        # buys only -- this one counts every asset type together.
         trades_today = await asyncio.to_thread(count_today_automate_agent_buys)
         if trades_today >= config.automate_agent_max_trades_per_window:
             return (
@@ -6672,18 +6675,19 @@ async def _build_automate_agent_text() -> str:
             for p in await asyncio.to_thread(list_pending_option_entry_orders)
             if str(p.get("opened_by") or "") == AUTOMATE_AGENT_TAG
         ]
-        # Compulsory minimum: if too few real trades have been placed today
-        # and only a short window remains before the daily exit cutoff,
-        # drop the confidence floor for this cycle's ranking so the quota
-        # can still be met -- BUY/SELL/HOLD and needs_human_review are
-        # still the model's own call either way; only how confident it
-        # needed to be is relaxed. Never applies past the cutoff itself
-        # (nothing new should be bought once positions are being flattened)
-        # and never bypasses the daily-loss circuit breaker above.
-        # trades_today was already fetched above for the max-trades-per-
-        # window gate -- same counter, reused here rather than re-queried.
+        # Compulsory minimum: specifically single-leg TSLA options trades
+        # (an equity buy never counts toward this) -- if too few real
+        # options BUY trades have been placed today and only a short
+        # window remains before the daily exit cutoff, drop the
+        # confidence floor for this cycle's ranking so the quota can
+        # still be met -- BUY/SELL/HOLD and needs_human_review are still
+        # the model's own call either way; only how confident it needed
+        # to be is relaxed. Never applies past the cutoff itself (nothing
+        # new should be bought once positions are being flattened) and
+        # never bypasses the daily-loss circuit breaker above.
+        options_trades_today = await asyncio.to_thread(count_today_automate_agent_buys, "option")
         now_et = _now_et()
-        min_trades_unmet = trades_today < config.automate_agent_min_trades_per_window
+        min_trades_unmet = options_trades_today < config.automate_agent_min_options_trades_per_window
         relaxing = (
             min_trades_unmet
             and not _automate_agent_eod_cutoff_reached(now_et, config.automate_agent_exit_time_et)
@@ -6752,8 +6756,9 @@ async def _build_automate_agent_text() -> str:
             # silently dropped by an early return keyed off the other
             # plan alone.
             unmet_note = (
-                f" {trades_today}/{config.automate_agent_min_trades_per_window} of today's compulsory "
-                "minimum trades placed so far; no candidate cleared even the relaxed bar this cycle."
+                f" {options_trades_today}/{config.automate_agent_min_options_trades_per_window} of today's "
+                "compulsory minimum options trades placed so far; no candidate cleared even the relaxed "
+                "bar this cycle."
                 if relaxing else ""
             )
             decision_word = "BUY/SELL-decision" if include_sell else "BUY-decision"
@@ -6765,8 +6770,8 @@ async def _build_automate_agent_text() -> str:
         lines = ["automate_agent cycle summary"]
         if relaxing:
             lines.append(
-                f"- Compulsory minimum trades not yet met ({trades_today}/"
-                f"{config.automate_agent_min_trades_per_window}) with "
+                f"- Compulsory minimum options trades not yet met ({options_trades_today}/"
+                f"{config.automate_agent_min_options_trades_per_window}) with "
                 f"{config.automate_agent_min_trades_relax_minutes} min left before the "
                 f"{config.automate_agent_exit_time_et} ET cutoff -- confidence bar relaxed to 0 for this cycle."
             )

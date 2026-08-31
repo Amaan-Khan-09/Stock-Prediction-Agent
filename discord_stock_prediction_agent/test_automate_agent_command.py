@@ -912,21 +912,22 @@ def test_default_asset_mode_is_both_on_tsla() -> None:
     fresh = AgentConfig()
     assert fresh.automate_agent_asset_mode == "both"
     assert fresh.automate_agent_watchlist == ("TSLA",)
-    assert fresh.automate_agent_min_trades_per_window == 5
-    assert fresh.automate_agent_max_trades_per_window == 25
+    assert fresh.automate_agent_min_options_trades_per_window == 3
+    assert fresh.automate_agent_max_trades_per_window == 15
 
 
 def test_config_rejects_max_trades_per_window_below_the_minimum() -> None:
-    """A misconfigured pair here (max below min) would silently make the
-    compulsory minimum permanently unreachable -- the max-trades gate
-    stops all new orders for the rest of the window before the relaxed-
-    confidence logic ever gets a chance to reach the higher minimum
-    target. Must fail loudly at construction instead."""
+    """A misconfigured pair here (max below the options minimum) would
+    silently make the compulsory minimum permanently unreachable -- the
+    max-trades gate stops all new orders (equity and options alike) for
+    the rest of the window before the relaxed-confidence logic ever gets
+    a chance to reach the higher options-minimum target. Must fail loudly
+    at construction instead."""
     from .config import AgentConfig
 
     try:
-        AgentConfig(automate_agent_min_trades_per_window=10, automate_agent_max_trades_per_window=5)
-        raise AssertionError("must reject max_trades_per_window < min_trades_per_window")
+        AgentConfig(automate_agent_min_options_trades_per_window=10, automate_agent_max_trades_per_window=5)
+        raise AssertionError("must reject max_trades_per_window < min_options_trades_per_window")
     except ValueError as exc:
         assert "AUTOMATE_AGENT_MAX_TRADES_PER_WINDOW" in str(exc)
 
@@ -1468,11 +1469,12 @@ def test_auto_report_does_not_fire_before_the_cutoff() -> None:
     asyncio.run(_with_runtime(scenario, predictions={}))
 
 
-def _record_fake_automate_buys(count: int) -> None:
+def _record_fake_automate_buys(count: int, asset_type: str = "") -> None:
     for i in range(count):
-        state_store.record_order_event(
-            {"symbol": f"FAKE{i}", "side": "buy", "status": "submitted", "detail": "automate_agent_buy"}
-        )
+        event = {"symbol": f"FAKE{i}", "side": "buy", "status": "submitted", "detail": "automate_agent_buy"}
+        if asset_type:
+            event["asset_type"] = asset_type
+        state_store.record_order_event(event)
 
 
 def test_compulsory_minimum_relaxes_confidence_bar_within_relax_window() -> None:
@@ -1526,12 +1528,13 @@ def test_compulsory_minimum_does_not_relax_outside_the_relax_window() -> None:
 
 
 def test_compulsory_minimum_does_not_relax_once_quota_already_met() -> None:
-    """Once automate_agent_min_trades_per_window real trades have already
-    been placed today, the confidence bar stays at its normal level even
-    inside the relax window -- the quota is a floor, not a standing
-    invitation to keep lowering the bar for the rest of the day."""
+    """Once automate_agent_min_options_trades_per_window real options
+    trades have already been placed today, the confidence bar stays at
+    its normal level even inside the relax window -- the quota is a
+    floor, not a standing invitation to keep lowering the bar for the
+    rest of the day."""
     async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
-        _record_fake_automate_buys(discord_agent.config.automate_agent_min_trades_per_window)
+        _record_fake_automate_buys(discord_agent.config.automate_agent_min_options_trades_per_window, "option")
         symbol = discord_agent.config.automate_agent_watchlist[0]
         fake.prices[symbol] = 100.0
         original_now_et = discord_agent._now_et
@@ -1548,9 +1551,34 @@ def test_compulsory_minimum_does_not_relax_once_quota_already_met() -> None:
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
+def test_compulsory_options_minimum_ignores_equity_trades() -> None:
+    """The compulsory minimum is specifically about single-leg TSLA
+    options trades -- plenty of equity buys recorded today must not
+    satisfy it. A day that only ever traded shares should still relax
+    the confidence bar looking for an options trade."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        # Comfortably more equity-tagged buys than the options minimum
+        # requires, and none of them are options trades.
+        _record_fake_automate_buys(discord_agent.config.automate_agent_max_trades_per_window - 1, "equity")
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 100.0
+        original_now_et = discord_agent._now_et
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            text = await discord_agent._build_automate_agent_text()
+        finally:
+            discord_agent._now_et = original_now_et
+
+        assert "compulsory minimum options trades not yet met" in text.lower(), text
+        assert len(fake.submissions) == 1, "the low-confidence candidate was still bought once relaxed"
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 30}}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
 def test_max_trades_per_window_blocks_new_buys_once_reached() -> None:
     """Per the user's senior: at most automate_agent_max_trades_per_window
-    (25) orders in the whole trading window, regardless of how much
+    (15) orders in the whole trading window, regardless of how much
     position-cap headroom eviction churn might otherwise free up. This is
     a hard ceiling on total orders placed, distinct from
     automate_agent_max_positions (which only bounds concurrent holdings)."""

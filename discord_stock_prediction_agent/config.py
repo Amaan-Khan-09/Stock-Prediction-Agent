@@ -124,27 +124,28 @@ class AgentConfig:
     # separate knob, since both default to the same 1%/10% already.
     automate_agent_min_positions: int = _int_env("AUTOMATE_AGENT_MIN_POSITIONS", 1)
     automate_agent_max_positions: int = _int_env("AUTOMATE_AGENT_MAX_POSITIONS", 20)
-    # Compulsory floor on trades actually placed during the trading window
-    # (not just "ambition" like automate_agent_min_positions above): if
-    # fewer than this many real BUY trades have been placed by the time
-    # only automate_agent_min_trades_relax_minutes remain before the daily
-    # exit cutoff, the confidence bar is dropped to 0 for that cycle's
+    # Compulsory floor on single-leg TSLA *options* trades specifically
+    # (not just "ambition" like automate_agent_min_positions above, and
+    # not equity -- an equity buy never counts toward this): if fewer than
+    # this many real options BUY trades have been placed by the time only
+    # automate_agent_min_trades_relax_minutes remain before the daily exit
+    # cutoff, the confidence bar is dropped to 0 for that cycle's
     # candidate ranking so the quota can still be met -- the model's own
     # BUY/SELL/HOLD call and needs_human_review flag are still respected
     # even then; only how *confident* it needed to be is relaxed. The
     # daily-loss circuit breaker is never overridden by this -- capital
     # protection always wins over a trade-count quota.
-    automate_agent_min_trades_per_window: int = _int_env(
-        "AUTOMATE_AGENT_MIN_TRADES_PER_WINDOW", 5
+    automate_agent_min_options_trades_per_window: int = _int_env(
+        "AUTOMATE_AGENT_MIN_OPTIONS_TRADES_PER_WINDOW", 3
     )
     # Hard ceiling on the flip side -- total orders (equity + option buys
-    # combined, counted the same way as the minimum above) placed during
-    # the whole trading window, regardless of how much position-cap
-    # headroom eviction churn might otherwise free up. Per direction from
-    # the user's senior: 5 minimum, 25 maximum over the ~9:30-12:30 ET
-    # window.
+    # combined) placed during the whole trading window, regardless of how
+    # much position-cap headroom eviction churn might otherwise free up.
+    # Per direction from the user's senior: at least 3 single-leg TSLA
+    # options trades, and no more than 15 total orders, over the
+    # ~9:30-12:30 ET window.
     automate_agent_max_trades_per_window: int = _int_env(
-        "AUTOMATE_AGENT_MAX_TRADES_PER_WINDOW", 25
+        "AUTOMATE_AGENT_MAX_TRADES_PER_WINDOW", 15
     )
     automate_agent_min_trades_relax_minutes: int = _int_env(
         "AUTOMATE_AGENT_MIN_TRADES_RELAX_MINUTES", 60
@@ -359,19 +360,21 @@ class AgentConfig:
 
     def __post_init__(self) -> None:
         # A misconfigured pair here (e.g. AUTOMATE_AGENT_MAX_TRADES_PER_
-        # WINDOW set below the min) would make the compulsory-minimum
-        # floor permanently unreachable: the max-trades gate in
-        # discord_agent.py stops all new orders for the rest of the
-        # window as soon as it's hit, before the min-trades relax logic
-        # ever gets a chance to reach its own, higher target. Fail loudly
-        # at startup rather than silently running a window that can never
+        # WINDOW set below the options minimum) would make the compulsory-
+        # minimum floor permanently unreachable: the max-trades gate in
+        # discord_agent.py stops ALL new orders (equity and options alike)
+        # for the rest of the window as soon as it's hit, before the
+        # options-minimum relax logic ever gets a chance to reach its own
+        # target -- options trades are a subset of total trades, so the
+        # ceiling must be at least as high as that floor. Fail loudly at
+        # startup rather than silently running a window that can never
         # place its required minimum.
-        if self.automate_agent_max_trades_per_window < self.automate_agent_min_trades_per_window:
+        if self.automate_agent_max_trades_per_window < self.automate_agent_min_options_trades_per_window:
             raise ValueError(
                 "AUTOMATE_AGENT_MAX_TRADES_PER_WINDOW "
                 f"({self.automate_agent_max_trades_per_window}) must be >= "
-                "AUTOMATE_AGENT_MIN_TRADES_PER_WINDOW "
-                f"({self.automate_agent_min_trades_per_window})."
+                "AUTOMATE_AGENT_MIN_OPTIONS_TRADES_PER_WINDOW "
+                f"({self.automate_agent_min_options_trades_per_window})."
             )
 
 
