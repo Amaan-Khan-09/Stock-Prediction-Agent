@@ -6682,19 +6682,24 @@ async def _build_automate_agent_text() -> str:
             for p in await asyncio.to_thread(list_pending_option_entry_orders)
             if str(p.get("opened_by") or "") == AUTOMATE_AGENT_TAG
         ]
-        # Compulsory minimum: specifically single-leg TSLA options trades
-        # (an equity buy never counts toward this) -- if too few real
-        # options BUY trades have been placed today and only a short
-        # window remains before the daily exit cutoff, drop the
-        # confidence floor for this cycle's ranking so the quota can
-        # still be met -- BUY/SELL/HOLD and needs_human_review are still
-        # the model's own call either way; only how confident it needed
-        # to be is relaxed. Never applies past the cutoff itself (nothing
-        # new should be bought once positions are being flattened) and
-        # never bypasses the daily-loss circuit breaker above.
+        # Compulsory minimums: a total-trades floor (equity + options
+        # combined -- trades_today, already fetched above for the max-
+        # trades gate) and a stricter, options-only floor within it (an
+        # equity buy never counts toward the options one). Either one
+        # still unmet, with only a short window remaining before the
+        # daily exit cutoff, drops the confidence floor for this cycle's
+        # ranking so both quotas still have a chance to be met -- BUY/
+        # SELL/HOLD and needs_human_review are still the model's own call
+        # either way; only how confident it needed to be is relaxed.
+        # Never applies past the cutoff itself (nothing new should be
+        # bought once positions are being flattened) and never bypasses
+        # the daily-loss circuit breaker above.
         options_trades_today = await asyncio.to_thread(count_today_automate_agent_buys, "option")
         now_et = _now_et()
-        min_trades_unmet = options_trades_today < config.automate_agent_min_options_trades_per_window
+        min_trades_unmet = (
+            options_trades_today < config.automate_agent_min_options_trades_per_window
+            or trades_today < config.automate_agent_min_total_trades_per_window
+        )
         relaxing = (
             min_trades_unmet
             and not _automate_agent_eod_cutoff_reached(now_et, config.automate_agent_exit_time_et)
@@ -6763,8 +6768,9 @@ async def _build_automate_agent_text() -> str:
             # silently dropped by an early return keyed off the other
             # plan alone.
             unmet_note = (
-                f" {options_trades_today}/{config.automate_agent_min_options_trades_per_window} of today's "
-                "compulsory minimum options trades placed so far; no candidate cleared even the relaxed "
+                f" {trades_today}/{config.automate_agent_min_total_trades_per_window} total, "
+                f"{options_trades_today}/{config.automate_agent_min_options_trades_per_window} options, "
+                "of today's compulsory minimums placed so far; no candidate cleared even the relaxed "
                 "bar this cycle."
                 if relaxing else ""
             )
@@ -6777,7 +6783,8 @@ async def _build_automate_agent_text() -> str:
         lines = ["automate_agent cycle summary"]
         if relaxing:
             lines.append(
-                f"- Compulsory minimum options trades not yet met ({options_trades_today}/"
+                f"- Compulsory minimums not yet met (total {trades_today}/"
+                f"{config.automate_agent_min_total_trades_per_window}, options {options_trades_today}/"
                 f"{config.automate_agent_min_options_trades_per_window}) with "
                 f"{config.automate_agent_min_trades_relax_minutes} min left before the "
                 f"{config.automate_agent_exit_time_et} ET cutoff -- confidence bar relaxed to 0 for this cycle."
