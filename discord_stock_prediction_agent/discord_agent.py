@@ -728,6 +728,7 @@ def _queue_option_exit(position: dict, qty: float, reason: str, trigger_price: f
             "signal_quality": position.get("signal_quality"),
             "raw_input": f"Protective option exit for {occ_symbol}",
             "reason": reason,
+            "opened_by": str(position.get("opened_by") or ""),
             "order_side": "buy" if short_position else "sell",
             "position_intent": "buy_to_close" if short_position else "sell_to_close",
             "requires_position": True,
@@ -4409,7 +4410,10 @@ async def _process_option_exit_monitor(market_open: bool) -> None:
                     if _has_pending_option_exit(occ_symbol):
                         continue
                     await asyncio.to_thread(_queue_option_exit, position, sell_qty, exit_reason, trigger_price, current_price)
-                    await asyncio.to_thread(_record_order, occ_symbol, "sell", sell_qty, "queued", "", "option", exit_reason)
+                    await asyncio.to_thread(
+                        _record_order, occ_symbol, "sell", sell_qty, "queued", "",
+                        "option", exit_reason, str(position.get("opened_by") or ""),
+                    )
                     await _send_channel(
                         config.discord_paper_log_channel_id or config.discord_review_channel_id,
                         f"{occ_symbol}: option exit condition reached at ${current_price:.2f}; sell-to-close queued for market open.",
@@ -5701,7 +5705,10 @@ async def _process_pending_option_orders() -> None:
             )
             continue
 
-        await asyncio.to_thread(_record_order, occ_symbol, order_side, qty, "submitted", str(order.get("id") or ""), "option", reason)
+        await asyncio.to_thread(
+            _record_order, occ_symbol, order_side, qty, "submitted", str(order.get("id") or ""),
+            "option", reason, str(pending.get("opened_by") or ""),
+        )
         if position_intent in {"sell_to_close", "buy_to_close"}:
             await _track_submitted_exit(
                 order,

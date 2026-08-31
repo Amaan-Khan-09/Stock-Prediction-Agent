@@ -193,14 +193,26 @@ class AgentConfig:
     # not just delay one cycle.
     # Sized for the current narrow, deliberately-chosen watchlist (TSLA
     # only by default) -- each symbol is a real historical-data fetch plus
-    # a real AI prediction call, run concurrently. 120s comfortably covers
-    # a single slow real Gemini call without letting a genuinely hung call
-    # go undetected for anywhere near the full trading window. A wider
-    # watchlist (e.g. the S&P 500, still available via
-    # AUTOMATE_AGENT_WATCHLIST) needs a proportionally larger value here,
-    # since every symbol shares the same bounded thread pool.
+    # a real AI prediction call, run concurrently. A wider watchlist (e.g.
+    # the S&P 500, still available via AUTOMATE_AGENT_WATCHLIST) needs a
+    # proportionally larger value here, since every symbol shares the same
+    # bounded thread pool.
+    #
+    # MUST stay comfortably above 180s: when the running interpreter isn't
+    # this project's own venv python, prediction_bridge.py delegates the
+    # whole prediction (historical fetch + real Gemini call) to a
+    # subprocess with its own internal 180s timeout
+    # (_run_prediction_in_project_venv). A previous attempt to tighten
+    # this to 120s -- reasoning "one symbol should be fast" without
+    # accounting for that subprocess's own ceiling -- meant every single
+    # scan cycle timed out here *before* the subprocess could ever finish
+    # or fail on its own terms, so automate_agent never got a single
+    # completed prediction and placed zero trades for the entire trading
+    # day. Confirmed against discord_agent.log: every cycle from startup
+    # onward logged "scan timed out after 120s ... proceeding with 0
+    # completed result(s)."
     automate_agent_scan_timeout_seconds: int = _int_env(
-        "AUTOMATE_AGENT_SCAN_TIMEOUT_SECONDS", 120
+        "AUTOMATE_AGENT_SCAN_TIMEOUT_SECONDS", 240
     )
     # "equity" | "options" | "both" (default). Controls whether automate_agent's
     # autonomous buys are shares, single-leg options, or both asset classes
