@@ -155,6 +155,23 @@ class AgentConfig:
     automate_agent_min_trades_relax_minutes: int = _int_env(
         "AUTOMATE_AGENT_MIN_TRADES_RELAX_MINUTES", 60
     )
+    # A narrower window inside the relax window above, for the options
+    # path only: once this close to the cutoff and the compulsory minimum
+    # is still unmet, automate_agent buys the best available option
+    # candidate even if the real historical backtest
+    # (run_options_strategy_validation) didn't confirm BUY for it.
+    # Relaxing the confidence bar alone (see above) was found to be
+    # insufficient on 2026-08-31 -- a real candidate cleared the relaxed
+    # bar but the backtest gate still vetoed it, and nothing forced a
+    # trade past that veto, so the window closed at 0 trades despite the
+    # quota. Per explicit direction: the compulsory minimum should win
+    # over the backtest gate once genuinely out of time, at the cost of
+    # sometimes taking a trade the backtest itself disagreed with. Equity
+    # has no equivalent backtest gate in automate_agent, so this only
+    # changes the options path.
+    automate_agent_force_trade_minutes: int = _int_env(
+        "AUTOMATE_AGENT_FORCE_TRADE_MINUTES", 15
+    )
     # Caps how many existing positions can be swapped out in a single scan
     # cycle, even if enough higher-ranked fresh candidates exist to justify
     # more -- keeps portfolio churn gradual instead of flipping the whole
@@ -420,6 +437,17 @@ class AgentConfig:
                 "AUTOMATE_AGENT_MIN_TOTAL_TRADES_PER_WINDOW "
                 f"({self.automate_agent_min_total_trades_per_window}) -- options trades are "
                 "a subset of total trades."
+            )
+        # The force-past-backtest window only makes sense as the tail end
+        # of the confidence-relax window, not wider than it -- forcing a
+        # trade before the confidence bar has even relaxed would be a more
+        # aggressive override than intended.
+        if self.automate_agent_force_trade_minutes > self.automate_agent_min_trades_relax_minutes:
+            raise ValueError(
+                "AUTOMATE_AGENT_FORCE_TRADE_MINUTES "
+                f"({self.automate_agent_force_trade_minutes}) must be <= "
+                "AUTOMATE_AGENT_MIN_TRADES_RELAX_MINUTES "
+                f"({self.automate_agent_min_trades_relax_minutes})."
             )
 
 

@@ -956,6 +956,18 @@ def test_config_rejects_options_minimum_above_the_total_minimum() -> None:
         assert "AUTOMATE_AGENT_MIN_OPTIONS_TRADES_PER_WINDOW" in str(exc)
 
 
+def test_config_rejects_force_trade_minutes_above_the_relax_minutes() -> None:
+    """The force-past-backtest window is meant to be the tail end of the
+    confidence-relax window, not wider than it."""
+    from .config import AgentConfig
+
+    try:
+        AgentConfig(automate_agent_force_trade_minutes=90, automate_agent_min_trades_relax_minutes=60)
+        raise AssertionError("must reject force_trade_minutes > min_trades_relax_minutes")
+    except ValueError as exc:
+        assert "AUTOMATE_AGENT_FORCE_TRADE_MINUTES" in str(exc)
+
+
 def _with_asset_mode(mode: str, test_fn) -> None:
     original = discord_agent.config.automate_agent_asset_mode
     object.__setattr__(discord_agent.config, "automate_agent_asset_mode", mode)
@@ -1118,6 +1130,8 @@ def test_options_mode_buys_an_atm_put_on_a_sell_signal() -> None:
 
 
 def test_options_mode_skips_when_backtest_does_not_confirm_buy() -> None:
+    """Outside the force-trade window (see the two tests below for inside
+    it), a backtest that doesn't confirm BUY is still a hard no."""
     def run() -> None:
         async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
             symbol = discord_agent.config.automate_agent_watchlist[0]
@@ -1130,13 +1144,99 @@ def test_options_mode_skips_when_backtest_does_not_confirm_buy() -> None:
             discord_agent.run_options_strategy_validation = lambda option: {
                 "status": "REVIEW", "decision": "HOLD",
             }
+            # Pinned outside both the relax and force windows of the
+            # default 12:30 cutoff -- without this, running the suite
+            # during the real force window (12:15-12:30 ET) would make
+            # forcing True unexpectedly and this test flaky.
+            original_now_et = discord_agent._now_et
+            discord_agent._now_et = lambda: datetime(2026, 8, 24, 10, 0, tzinfo=ZoneInfo("America/New_York"))
             try:
                 await discord_agent._build_automate_agent_text()
             finally:
                 discord_agent.run_options_strategy_validation = original_validate
+                discord_agent._now_et = original_now_et
 
             assert not state_store.list_option_positions(), "must never place a trade the backtest didn't confirm"
             assert not fake.submissions
+
+        predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("options", run)
+
+
+def test_options_mode_still_skips_backtest_veto_within_relax_window_but_outside_force_window() -> None:
+    """Relaxing the confidence bar (last 60 min) is not the same as
+    forcing past the backtest (last 15 min, a subset of the 60). 30
+    minutes out is inside the relax window but outside the force one --
+    the backtest veto must still hold."""
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            fake.prices[symbol] = 100.0
+            today = date.today().isoformat()
+            fake.option_contracts_by_expiry[today] = [{"symbol": f"{symbol}260101C00100000", "strike_price": "100"}]
+            fake.option_premiums[f"{symbol}260101C00100000"] = 2.0
+
+            original_validate = discord_agent.run_options_strategy_validation
+            discord_agent.run_options_strategy_validation = lambda option: {
+                "status": "REVIEW", "decision": "HOLD",
+            }
+            original_now_et = discord_agent._now_et
+            discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+            try:
+                await discord_agent._build_automate_agent_text()
+            finally:
+                discord_agent.run_options_strategy_validation = original_validate
+                discord_agent._now_et = original_now_et
+
+            assert not state_store.list_option_positions(), "relax window alone must not force past the backtest"
+            assert not fake.submissions
+
+        predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("options", run)
+
+
+def test_options_mode_forces_a_trade_past_backtest_veto_within_force_window() -> None:
+    """Regression for the live 2026-08-31 incident: a candidate cleared
+    the relaxed confidence bar but the real backtest still vetoed it, and
+    nothing forced it through, so the window closed at 0 trades despite
+    the compulsory minimum. Within the force window (last 15 min), the
+    trade must go through anyway, clearly labeled as forced."""
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            fake.prices[symbol] = 100.0
+            today = date.today().isoformat()
+            occ_symbol = f"{symbol}260101C00100000"
+            fake.option_contracts_by_expiry[today] = [{"symbol": occ_symbol, "strike_price": "100"}]
+            fake.option_premiums[occ_symbol] = 2.0
+
+            original_validate = discord_agent.run_options_strategy_validation
+            discord_agent.run_options_strategy_validation = lambda option: {
+                "status": "SUCCESS_POLYGON_STRIKE", "decision": "HOLD",
+            }
+            # 12:20 ET, 10 min before the default 12:30 cutoff -- inside
+            # both the relax window (60 min) and the force window (15 min).
+            original_now_et = discord_agent._now_et
+            discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 20, tzinfo=ZoneInfo("America/New_York"))
+            try:
+                text = await discord_agent._build_automate_agent_text()
+            finally:
+                discord_agent.run_options_strategy_validation = original_validate
+                discord_agent._now_et = original_now_et
+
+            assert "FORCED past backtest veto" in text, text
+            order_ids = [o["id"] for o in fake.submissions if o["symbol"] == occ_symbol and o["side"] == "buy"]
+            assert len(order_ids) == 1, "the trade must still be placed despite the HOLD verdict"
+            fake.mark_order_filled(order_ids[0], fill_price=2.0)
+            await discord_agent._reconcile_pending_option_entry_orders()
+
+            option_positions = state_store.list_option_positions()
+            assert len(option_positions) == 1, option_positions
+            assert option_positions[0]["occ_symbol"] == occ_symbol
 
         predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
         asyncio.run(_with_runtime(scenario, predictions=predictions))

@@ -6284,14 +6284,21 @@ async def _automate_agent_pick_option_contract(
 
 
 async def _automate_agent_buy_option(
-    root: str, picked: Optional[BoomCandidate], equity: float, relaxing: bool = False
+    root: str, picked: Optional[BoomCandidate], equity: float, relaxing: bool = False, forcing: bool = False
 ) -> str:
     """Autonomously validate and place a single-leg CALL (on a BUY signal)
     or PUT (on a SELL signal) for `root`, reusing the same tastytrade
     backtest gate (run_options_strategy_validation) every manually-typed
     option signal already goes through -- never placed without that same
-    validation passing. Defaults to CALL if there's no candidate signal to
-    read a direction from (matches the previous CALL-only behavior).
+    validation passing, UNLESS forcing is True (deep in the compulsory-
+    minimum relax window and still short of quota -- see
+    automate_agent_force_trade_minutes), in which case a real BUY
+    confirmation from the backtest is no longer required. Every other
+    safety check here (already held/pending, no listed contract, options
+    trading enabled, premium/risk-budget affordability) still applies
+    regardless of forcing -- it only ever overrides the backtest's own
+    verdict, nothing else. Defaults to CALL if there's no candidate signal
+    to read a direction from (matches the previous CALL-only behavior).
     """
     side = "PUT" if picked is not None and picked.decision.upper() == "SELL" else "CALL"
     side_letter = "P" if side == "PUT" else "C"
@@ -6344,7 +6351,8 @@ async def _automate_agent_buy_option(
         raw_text=f"automate_agent synthetic BUY {root} {contract['strike']}{side_letter} {contract['expiry_date']}",
     )
     strategy_validation = await asyncio.to_thread(run_options_strategy_validation, synthetic)
-    if str(strategy_validation.get("decision") or "").upper() != "BUY":
+    backtest_confirmed_buy = str(strategy_validation.get("decision") or "").upper() == "BUY"
+    if not backtest_confirmed_buy and not forcing:
         return (
             f"- {occ_symbol}: strategy validation did not confirm BUY "
             f"({strategy_validation.get('status')}), skipped."
@@ -6369,7 +6377,12 @@ async def _automate_agent_buy_option(
     if not order:
         return f"- {occ_symbol}: option order was not placed: {_public_error(err)}"
 
-    order_detail = "automate_agent_buy_relaxed" if relaxing else "automate_agent_buy"
+    forced_past_backtest = forcing and not backtest_confirmed_buy
+    order_detail = (
+        "automate_agent_buy_forced" if forced_past_backtest
+        else "automate_agent_buy_relaxed" if relaxing
+        else "automate_agent_buy"
+    )
     await asyncio.to_thread(
         _record_order, occ_symbol, "buy", contracts, "submitted", str(order.get("id") or ""),
         "option", order_detail, AUTOMATE_AGENT_TAG,
@@ -6388,13 +6401,19 @@ async def _automate_agent_buy_option(
         },
     )
     conviction = f" [confidence {picked.confidence:.0f}]" if picked is not None else ""
+    forced_note = (
+        f" [FORCED past backtest veto ({strategy_validation.get('status')}, "
+        f"decision {strategy_validation.get('decision')}) to meet the compulsory minimum]"
+        if forced_past_backtest else ""
+    )
     return (
         f"- Bought {occ_symbol}: {contracts:g} {side.lower()} contract(s) @ ~${premium:.2f} "
         f"(stop {config.automate_agent_option_stop_loss_pct:g}% of premium, "
         f"target {config.automate_agent_option_take_profit_pct:g}% of premium, "
         f"auto-closes by {config.automate_agent_exit_time_et} ET if neither is hit first)."
         f"{conviction}"
-        f"{' [compulsory minimum-trades fill]' if relaxing else ''}"
+        f"{' [compulsory minimum-trades fill]' if relaxing and not forced_past_backtest else ''}"
+        f"{forced_note}"
     )
 
 
@@ -6707,6 +6726,24 @@ async def _build_automate_agent_text() -> str:
                 now_et, config.automate_agent_exit_time_et, config.automate_agent_min_trades_relax_minutes
             )
         )
+        # Deeper into the same window: relaxing the confidence bar alone
+        # isn't a hard guarantee -- a candidate can still clear it and then
+        # get vetoed by the real historical backtest
+        # (run_options_strategy_validation), which has no "but we're short
+        # on quota" exception. forcing (options path only -- equity has no
+        # equivalent backtest gate) tells _automate_agent_buy_option to
+        # place the trade anyway once genuinely out of time. Confirmed
+        # necessary live on 2026-08-31: a candidate cleared the relaxed
+        # confidence bar but the backtest still said no, and nothing
+        # forced it through, so the window closed at 0 trades despite the
+        # compulsory minimum.
+        forcing = (
+            min_trades_unmet
+            and not _automate_agent_eod_cutoff_reached(now_et, config.automate_agent_exit_time_et)
+            and _automate_agent_in_min_trades_relax_window(
+                now_et, config.automate_agent_exit_time_et, config.automate_agent_force_trade_minutes
+            )
+        )
         effective_min_confidence = 0.0 if relaxing else config.automate_agent_min_confidence
         # A SELL signal is only actionable when automate_agent can actually
         # act on it -- buying a put. Equity has no short-selling path, so
@@ -6788,6 +6825,11 @@ async def _build_automate_agent_text() -> str:
                 f"{config.automate_agent_min_options_trades_per_window}) with "
                 f"{config.automate_agent_min_trades_relax_minutes} min left before the "
                 f"{config.automate_agent_exit_time_et} ET cutoff -- confidence bar relaxed to 0 for this cycle."
+            )
+        if forcing:
+            lines.append(
+                f"- Still short with only {config.automate_agent_force_trade_minutes} min left -- an option "
+                "candidate will be bought even if the backtest doesn't confirm BUY for it this cycle."
             )
 
         for symbol in equity_to_evict:
@@ -6912,7 +6954,7 @@ async def _build_automate_agent_text() -> str:
             remaining_slots = max(0, config.automate_agent_max_positions - projected_combined_count)
             for symbol in plan.to_buy[:remaining_slots]:
                 try:
-                    lines.append(await _automate_agent_buy_option(symbol, candidates_by_symbol.get(symbol.upper()), equity, relaxing))
+                    lines.append(await _automate_agent_buy_option(symbol, candidates_by_symbol.get(symbol.upper()), equity, relaxing, forcing))
                 except Exception as exc:  # noqa: BLE001 -- one symbol's failure must not abort the cycle
                     logging.getLogger("discord_stock_prediction_agent").error(
                         "automate_agent: option buy failed for %s: %s", symbol, exc
