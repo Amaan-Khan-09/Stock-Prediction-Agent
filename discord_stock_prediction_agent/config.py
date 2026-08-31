@@ -203,21 +203,33 @@ class AgentConfig:
     # proportionally larger value here, since every symbol shares the same
     # bounded thread pool.
     #
-    # MUST stay comfortably above 180s: when the running interpreter isn't
-    # this project's own venv python, prediction_bridge.py delegates the
-    # whole prediction (historical fetch + real Gemini call) to a
-    # subprocess with its own internal 180s timeout
-    # (_run_prediction_in_project_venv). A previous attempt to tighten
-    # this to 120s -- reasoning "one symbol should be fast" without
-    # accounting for that subprocess's own ceiling -- meant every single
-    # scan cycle timed out here *before* the subprocess could ever finish
-    # or fail on its own terms, so automate_agent never got a single
-    # completed prediction and placed zero trades for the entire trading
-    # day. Confirmed against discord_agent.log: every cycle from startup
-    # onward logged "scan timed out after 120s ... proceeding with 0
-    # completed result(s)."
+    # The real, measured bottleneck is historical_price_service.py's
+    # fetch_price_history(): it cascades through ~25 sequential RapidAPI
+    # endpoint/exchange/path combinations (10 and 6 second timeouts each)
+    # before falling back to an external provider, and that fallback is
+    # apparently the only one that actually works on the current RapidAPI
+    # subscription ("historical endpoints not available on your current
+    # plan"). Directly timed on 2026-08-31: fetch_price_history('TSLA')
+    # took 263s on its own, before Gemini is even called. Worse, its
+    # 10-minute price cache (_CACHE_TTL) never helps automate_agent
+    # specifically, because the default autoscan interval (15 min) is
+    # longer than that cache TTL -- every single cycle is a guaranteed
+    # cache miss, paying the full ~260s cascade every time. (This wasn't
+    # obvious with the old wide S&P 500 watchlist, where many symbols ran
+    # concurrently and one slow one didn't dominate; a single-symbol
+    # watchlist has nothing to hide behind.)
+    #
+    # A previous attempt to tighten this to 120s (reasoning "one symbol
+    # should be fast", without measuring) meant every cycle timed out here
+    # before the fetch could ever finish, so automate_agent placed zero
+    # trades for an entire trading day. This value must stay comfortably
+    # above the measured ~263s; the real fix (raising the price cache TTL,
+    # or reducing fetch_price_history's fallback cascade) lives in
+    # historical_price_service.py, a shared module used well beyond
+    # automate_agent -- flagged for the user to decide on rather than
+    # changed here.
     automate_agent_scan_timeout_seconds: int = _int_env(
-        "AUTOMATE_AGENT_SCAN_TIMEOUT_SECONDS", 240
+        "AUTOMATE_AGENT_SCAN_TIMEOUT_SECONDS", 400
     )
     # "equity" | "options" | "both" (default). Controls whether automate_agent's
     # autonomous buys are shares, single-leg options, or both asset classes
