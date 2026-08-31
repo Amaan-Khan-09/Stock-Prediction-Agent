@@ -313,6 +313,40 @@ def test_daily_loss_circuit_breaker_ignores_a_real_users_losses() -> None:
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
+def test_manual_daily_paper_trade_limit_ignores_automate_agent_orders() -> None:
+    """Regression: count_today_order_events() used to count every order
+    event regardless of source, so a busy automate_agent day (up to 25
+    orders) could push a configured MAX_DAILY_PAPER_TRADES limit over the
+    top and block a real user's next manually-typed signal -- even though
+    that user hadn't placed a single trade of their own yet. This is the
+    same automate_agent-vs-manual boundary as the daily-loss circuit
+    breaker and the position cap; the manual path's own daily limit must
+    only ever count the manual path's own orders."""
+    with TemporaryDirectory() as tmp:
+        original_state = state_store.STATE_PATH
+        state_store.STATE_PATH = Path(tmp) / "agent_state.json"
+        try:
+            for i in range(10):
+                state_store.record_order_event(
+                    {"symbol": f"FAKE{i}", "side": "buy", "status": "submitted", "detail": "automate_agent_buy"}
+                )
+            assert state_store.count_today_order_events(exclude_automate_agent=True) == 0, (
+                "a busy automate_agent day alone must not count toward the manual daily-trade limit"
+            )
+            assert state_store.count_today_order_events() == 10, (
+                "the unscoped count still reflects everything, for callers that genuinely want the raw total"
+            )
+
+            state_store.record_order_event(
+                {"symbol": "AAPL", "side": "buy", "status": "submitted", "detail": "manual_signal"}
+            )
+            assert state_store.count_today_order_events(exclude_automate_agent=True) == 1, (
+                "a real manual order is still counted normally"
+            )
+        finally:
+            state_store.STATE_PATH = original_state
+
+
 def test_unverifiable_equity_blocks_the_cycle_instead_of_trading_blind() -> None:
     """Regression: when alpaca.get_account() fails, equity resolved to 0 and
     `if equity > 0` silently skipped the daily-loss circuit-breaker check

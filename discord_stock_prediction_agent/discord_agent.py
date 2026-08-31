@@ -386,7 +386,10 @@ async def _trade_guard(
             "quantity_limit",
         )
         return False
-    if config.max_daily_paper_trades > 0 and count_today_order_events() >= config.max_daily_paper_trades:
+    if (
+        config.max_daily_paper_trades > 0
+        and count_today_order_events(exclude_automate_agent=True) >= config.max_daily_paper_trades
+    ):
         await _block_trade(
             message,
             symbol,

@@ -974,12 +974,21 @@ def record_safety_block(record: Dict[str, Any], limit: int = 1000) -> None:
     save_state(state)
 
 
-def count_today_order_events() -> int:
+def count_today_order_events(exclude_automate_agent: bool = False) -> int:
+    """exclude_automate_agent drops automate_agent's own order events (buy,
+    buy_relaxed, evict -- all tagged with an "automate_agent_" detail
+    prefix) from the count. Used by the manual-signal MAX_DAILY_PAPER_TRADES
+    guard so that knob -- like every other automate_agent-vs-manual
+    boundary in this codebase (today_realized_pnl, the position cap,
+    eviction) -- only ever reflects and limits manual trading, never a busy
+    automate_agent day, and vice versa: the two paths run fully separately.
+    """
     today = _today_prefix()
     return sum(
         1 for event in (load_state().get("order_events") or [])
         if str(event.get("created_at") or "").startswith(today)
         and str(event.get("status") or "").lower() in {"submitted", "placed", "accepted", "filled"}
+        and not (exclude_automate_agent and str(event.get("detail") or "").startswith("automate_agent_"))
     )
 
 
