@@ -42,6 +42,22 @@ def setup_module(module) -> None:
     global _original_asset_mode, _original_watchlist
     _original_asset_mode = discord_agent.config.automate_agent_asset_mode
     _original_watchlist = discord_agent.config.automate_agent_watchlist
+    # This is the one place in the whole suite that can still observe the
+    # *live* discord_agent.config singleton before this file's own pin
+    # overwrites it below -- every test in this file runs after that pin,
+    # so a test asserting against a fresh AgentConfig() (see
+    # test_default_asset_mode_is_both_on_tsla) can only ever re-validate
+    # the class-level literal in config.py, never catch the live singleton
+    # actually drifting at runtime (a startup hook, a forgotten teardown
+    # elsewhere). Assert it here instead, once, before the pin.
+    assert _original_asset_mode == "both", (
+        f"automate_agent_asset_mode was {_original_asset_mode!r} before this file's setup_module pinned "
+        "it -- either the production default silently changed, or an earlier test left it mutated "
+        "without restoring it in its own teardown."
+    )
+    assert _original_watchlist == ("TSLA",), (
+        f"automate_agent_watchlist was {_original_watchlist!r} before this file's setup_module pinned it."
+    )
     object.__setattr__(discord_agent.config, "automate_agent_asset_mode", "equity")
     object.__setattr__(discord_agent.config, "automate_agent_watchlist", _TEST_WATCHLIST)
 
@@ -900,6 +916,21 @@ def test_default_asset_mode_is_both_on_tsla() -> None:
     assert fresh.automate_agent_max_trades_per_window == 25
 
 
+def test_config_rejects_max_trades_per_window_below_the_minimum() -> None:
+    """A misconfigured pair here (max below min) would silently make the
+    compulsory minimum permanently unreachable -- the max-trades gate
+    stops all new orders for the rest of the window before the relaxed-
+    confidence logic ever gets a chance to reach the higher minimum
+    target. Must fail loudly at construction instead."""
+    from .config import AgentConfig
+
+    try:
+        AgentConfig(automate_agent_min_trades_per_window=10, automate_agent_max_trades_per_window=5)
+        raise AssertionError("must reject max_trades_per_window < min_trades_per_window")
+    except ValueError as exc:
+        assert "AUTOMATE_AGENT_MAX_TRADES_PER_WINDOW" in str(exc)
+
+
 def _with_asset_mode(mode: str, test_fn) -> None:
     original = discord_agent.config.automate_agent_asset_mode
     object.__setattr__(discord_agent.config, "automate_agent_asset_mode", mode)
@@ -1137,6 +1168,86 @@ def test_both_mode_shares_the_position_cap_between_equity_and_options() -> None:
             )
 
         predictions = {sym: {"decision": "BUY", "confidence_score": 75} for sym in discord_agent.config.automate_agent_watchlist}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("both", run)
+
+
+def test_both_mode_sell_signal_never_buys_equity_shares() -> None:
+    """Regression: "both" mode used to share a single ranked plan between
+    the equity and options loops. Since that plan includes SELL-decision
+    candidates (so options can buy a put), the equity loop -- which has no
+    reference to each candidate's decision at all -- ended up buying long
+    shares on a bearish SELL signal too. Equity's own plan must always be
+    ranked BUY-only regardless of asset mode."""
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            fake.prices[symbol] = 100.0
+            today = date.today().isoformat()
+            occ_symbol = f"{symbol}260101P00100000"
+            fake.option_contracts_by_expiry[today] = [{"symbol": occ_symbol, "strike_price": "100"}]
+            fake.option_premiums[occ_symbol] = 2.0
+
+            original_validate = discord_agent.run_options_strategy_validation
+            discord_agent.run_options_strategy_validation = lambda option: {
+                "status": "SUCCESS", "decision": "BUY",
+            }
+            try:
+                text = await discord_agent._build_automate_agent_text()
+            finally:
+                discord_agent.run_options_strategy_validation = original_validate
+
+            assert not fake.quantities.get(symbol), (
+                f"a SELL signal must never result in long equity shares -- got {fake.quantities.get(symbol)}"
+            )
+            equity_buy_orders = [o for o in fake.submissions if o["symbol"] == symbol and o["side"] == "buy"]
+            assert not equity_buy_orders, "no equity buy order should have been submitted for a SELL signal"
+            put_orders = [o for o in fake.submissions if o["symbol"] == occ_symbol and o["side"] == "buy"]
+            assert len(put_orders) == 1, "the put purchase (the actually-correct action for a SELL) must still happen"
+
+        predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "SELL", "confidence_score": 80}}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("both", run)
+
+
+def test_both_mode_equity_position_does_not_block_the_option_leg() -> None:
+    """Regression: plan_automate_trades' held_symbols check didn't
+    distinguish asset type, so once a symbol was held as equity it looked
+    "already held" for the options plan too (and vice versa) -- silently
+    preventing "both" mode's whole point (holding shares AND an option on
+    the same symbol at once) from ever completing whenever one leg's buy
+    landed before the other's."""
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            # Equity already holds this symbol from an earlier cycle --
+            # the options leg must still be free to buy a call for it.
+            state_store.upsert_position(symbol, 1, 100.0, "", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+            fake.quantities[symbol] = 1
+            fake.prices[symbol] = 100.0
+            today = date.today().isoformat()
+            occ_symbol = f"{symbol}260101C00100000"
+            fake.option_contracts_by_expiry[today] = [{"symbol": occ_symbol, "strike_price": "100"}]
+            fake.option_premiums[occ_symbol] = 2.0
+
+            original_validate = discord_agent.run_options_strategy_validation
+            discord_agent.run_options_strategy_validation = lambda option: {
+                "status": "SUCCESS", "decision": "BUY",
+            }
+            try:
+                await discord_agent._build_automate_agent_text()
+            finally:
+                discord_agent.run_options_strategy_validation = original_validate
+
+            call_orders = [o for o in fake.submissions if o["symbol"] == occ_symbol and o["side"] == "buy"]
+            assert len(call_orders) == 1, (
+                "an existing equity position for this symbol must not block automate_agent from also "
+                "opening an option position for the same symbol"
+            )
+
+        predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
         asyncio.run(_with_runtime(scenario, predictions=predictions))
 
     _with_asset_mode("both", run)

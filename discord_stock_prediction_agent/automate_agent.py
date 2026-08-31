@@ -74,13 +74,24 @@ def rank_boom_candidates(
         and not c.needs_human_review
         and c.confidence >= min_confidence
     ]
-    # abs() on the tiebreaker: a BUY's predicted_return_pct is positive and a
-    # SELL's is negative, so ranking by the raw signed value would silently
-    # bias every confidence-tie toward BUY candidates regardless of which
-    # direction's move is actually predicted to be larger. When include_sell
-    # is False (the equity path, unchanged), every value here is already
-    # positive, so abs() is a no-op and behavior is identical to before.
-    return sorted(matches, key=lambda c: (c.confidence, abs(c.predicted_return_pct)), reverse=True)
+    # Tiebreak by conviction *in the direction of this candidate's own
+    # decision* -- a BUY's predicted_return_pct is normally positive and a
+    # SELL's normally negative, so ranking by the raw signed value would
+    # silently bias every confidence-tie toward BUY candidates regardless
+    # of which direction's move is actually predicted to be larger. This
+    # is deliberately not just abs(): a plain abs() trusts that sign and
+    # decision always agree, which isn't actually guaranteed upstream (a
+    # decision can be adjusted by a downstream override without
+    # necessarily recomputing predicted_return_pct to match) -- flipping
+    # SELL's sign relative to its own decision, rather than discarding
+    # sign entirely, means a decision/return-sign mismatch demotes a
+    # candidate instead of inflating it. When include_sell is False (the
+    # equity path, unchanged), every match is a BUY, so this reduces to
+    # the original signed value -- a no-op relative to prior behavior.
+    def _conviction(c: BoomCandidate) -> float:
+        return c.predicted_return_pct if c.decision.upper() == "BUY" else -c.predicted_return_pct
+
+    return sorted(matches, key=lambda c: (c.confidence, _conviction(c)), reverse=True)
 
 
 def confidence_scaled_risk_multiplier(confidence: float, floor: float = 0.75, cap: float = 1.25) -> float:
@@ -211,14 +222,25 @@ def plan_automate_trades(
     min_confidence: float = 0.0,
     max_evictions_per_cycle: int = 1,
     include_sell: bool = False,
+    asset_type: str = "equity",
 ) -> TradePlan:
     """Decides what to buy and what to evict first, given ranked candidates
     and the currently open automate_agent-tagged positions.
 
     Never evicts more than necessary, never buys more candidates than exist,
     and never exceeds max_positions total automate_agent-tagged positions.
-    Symbols already held (by automate_agent) are skipped -- no point
-    "buying" something already open.
+    Symbols already held (by automate_agent) *in this same asset_type* are
+    skipped -- no point "buying" something already open.
+
+    asset_type scopes that "already held" check to the asset class this
+    plan is being computed for. open_positions is expected to be the full
+    combined equity+option book (asset-tagged via each dict's own
+    "asset_type" key, equity positions defaulting to "equity" when absent)
+    so max_positions still counts both together -- but a symbol held as
+    equity must not by itself block that same symbol from also being
+    bought as an option, and vice versa. "both" mode's whole point is
+    holding both at once for one symbol; without this, whichever leg
+    fills first would silently lock the other out of ever completing.
 
     max_evictions_per_cycle additionally caps how much of the existing book
     can be swapped out in one call. Without this, a single cycle where
@@ -233,6 +255,7 @@ def plan_automate_trades(
         str(p.get("symbol") or "").upper()
         for p in open_positions
         if str(p.get("opened_by") or "").lower() == AUTOMATE_AGENT_TAG
+        and str(p.get("asset_type") or "equity").lower() == asset_type.lower()
     }
     fresh = [c.symbol.upper() for c in ranked if c.symbol.upper() not in held_symbols]
     if not fresh:

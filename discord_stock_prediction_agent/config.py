@@ -190,15 +190,16 @@ class AgentConfig:
     # and since the scan runs inside _automate_agent_lock, that would
     # silently freeze !automate_agent and the autoscan loop permanently,
     # not just delay one cycle.
-    # 90s was sized for the original 10-symbol watchlist. The default
-    # watchlist below is now the full S&P 500 (503 tickers) -- each symbol
-    # is a real historical-data fetch plus a real AI prediction call, run
-    # concurrently but still bounded by Python's default thread-pool size
-    # (a handful of workers, not 503 at once), so a full scan genuinely
-    # takes minutes, not seconds. This is widened accordingly; a smaller
-    # custom watchlist can safely lower it again via the env var.
+    # Sized for the current narrow, deliberately-chosen watchlist (TSLA
+    # only by default) -- each symbol is a real historical-data fetch plus
+    # a real AI prediction call, run concurrently. 120s comfortably covers
+    # a single slow real Gemini call without letting a genuinely hung call
+    # go undetected for anywhere near the full trading window. A wider
+    # watchlist (e.g. the S&P 500, still available via
+    # AUTOMATE_AGENT_WATCHLIST) needs a proportionally larger value here,
+    # since every symbol shares the same bounded thread pool.
     automate_agent_scan_timeout_seconds: int = _int_env(
-        "AUTOMATE_AGENT_SCAN_TIMEOUT_SECONDS", 600
+        "AUTOMATE_AGENT_SCAN_TIMEOUT_SECONDS", 120
     )
     # "equity" | "options" | "both" (default). Controls whether automate_agent's
     # autonomous buys are shares, single-leg options, or both asset classes
@@ -355,6 +356,23 @@ class AgentConfig:
             and self.whatsapp_phone_number_id
             and self.whatsapp_app_secret
         )
+
+    def __post_init__(self) -> None:
+        # A misconfigured pair here (e.g. AUTOMATE_AGENT_MAX_TRADES_PER_
+        # WINDOW set below the min) would make the compulsory-minimum
+        # floor permanently unreachable: the max-trades gate in
+        # discord_agent.py stops all new orders for the rest of the
+        # window as soon as it's hit, before the min-trades relax logic
+        # ever gets a chance to reach its own, higher target. Fail loudly
+        # at startup rather than silently running a window that can never
+        # place its required minimum.
+        if self.automate_agent_max_trades_per_window < self.automate_agent_min_trades_per_window:
+            raise ValueError(
+                "AUTOMATE_AGENT_MAX_TRADES_PER_WINDOW "
+                f"({self.automate_agent_max_trades_per_window}) must be >= "
+                "AUTOMATE_AGENT_MIN_TRADES_PER_WINDOW "
+                f"({self.automate_agent_min_trades_per_window})."
+            )
 
 
 config = AgentConfig()

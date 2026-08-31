@@ -398,6 +398,24 @@ def test_plan_skips_symbol_already_held() -> None:
     _assert(plan.to_buy == ["MSFT"], "only buys MSFT, skips already-held AAPL", str(plan.to_buy))
 
 
+def test_plan_asset_type_scopes_the_already_held_check() -> None:
+    print("\nTest: asset_type scopes 'already held' so an equity position doesn't block the option plan for the same symbol")
+    existing = [_position("AAPL")]  # held as equity -- _position's asset_type defaults to "equity"
+    candidates = [BoomCandidate("AAPL", "BUY")]
+    equity_plan = plan_automate_trades(candidates, existing, min_positions=1, max_positions=5, asset_type="equity")
+    option_plan = plan_automate_trades(candidates, existing, min_positions=1, max_positions=5, asset_type="option")
+    _assert(
+        equity_plan.to_buy == [],
+        "AAPL is already held as equity -- equity's own plan must skip it",
+        str(equity_plan.to_buy),
+    )
+    _assert(
+        option_plan.to_buy == ["AAPL"],
+        "AAPL is NOT held as an option -- the option plan must still buy it, not treat it as already-held",
+        str(option_plan.to_buy),
+    )
+
+
 def test_plan_buys_nothing_when_no_buy_candidates() -> None:
     print("\nTest: plan buys nothing and evicts nothing when there are no BUY candidates")
     candidates = [BoomCandidate("AAPL", "HOLD"), BoomCandidate("MSFT", "SELL")]
@@ -438,6 +456,7 @@ def run_all() -> None:
     test_plan_caps_evictions_per_cycle_even_with_many_fresh_candidates()
     test_plan_never_evicts_a_real_user_position_even_at_cap()
     test_plan_skips_symbol_already_held()
+    test_plan_asset_type_scopes_the_already_held_check()
     test_plan_buys_nothing_when_no_buy_candidates()
 
     print("\n" + "=" * 60)

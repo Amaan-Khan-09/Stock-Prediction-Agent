@@ -410,7 +410,18 @@ async def _trade_guard(
     return True
 
 
-def _record_order(symbol: str, side: str, qty: float, status: str, order_id: str = "", asset_type: str = "equity", detail: str = "") -> None:
+def _record_order(
+    symbol: str, side: str, qty: float, status: str, order_id: str = "",
+    asset_type: str = "equity", detail: str = "", opened_by: str = "",
+) -> None:
+    # opened_by identifies which position this order belongs to (e.g.
+    # AUTOMATE_AGENT_TAG), independent of `detail` -- an exit order (stop-
+    # loss/take-profit/EOD-forced-close) uses the same generic exit_reason
+    # detail string regardless of who opened the position it's closing, so
+    # detail-string sniffing alone can't tell an automate_agent exit apart
+    # from a manual one. Left "" (the default) for every call site that
+    # doesn't originate from a tracked position -- i.e. every manually-
+    # typed signal.
     record_order_event(
         {
             "symbol": symbol.upper(),
@@ -420,6 +431,7 @@ def _record_order(symbol: str, side: str, qty: float, status: str, order_id: str
             "order_id": order_id,
             "asset_type": asset_type,
             "detail": detail,
+            "opened_by": opened_by,
         }
     )
 
@@ -4148,7 +4160,10 @@ async def stop_loss_monitor() -> None:
                 ),
             )
             if order:
-                await asyncio.to_thread(_record_order, symbol, exit_side, exit_qty, "submitted", str(order.get("id") or ""), "equity", exit_reason)
+                await asyncio.to_thread(
+                    _record_order, symbol, exit_side, exit_qty, "submitted", str(order.get("id") or ""),
+                    "equity", exit_reason, str(position.get("opened_by") or ""),
+                )
                 await _track_submitted_exit(
                     order, symbol, exit_qty, "equity", exit_reason
                 )
@@ -4359,7 +4374,10 @@ async def _process_option_exit_monitor(market_open: bool) -> None:
                 if _has_pending_option_exit(occ_symbol):
                     continue
                 await asyncio.to_thread(_queue_option_exit, position, sell_qty, exit_reason, trigger_price, current_price)
-                await asyncio.to_thread(_record_order, occ_symbol, "sell", sell_qty, "queued", "", "option", exit_reason)
+                await asyncio.to_thread(
+                    _record_order, occ_symbol, "sell", sell_qty, "queued", "",
+                    "option", exit_reason, str(position.get("opened_by") or ""),
+                )
                 await _send_channel(
                     config.discord_paper_log_channel_id or config.discord_review_channel_id,
                     f"{occ_symbol}: option exit condition reached at ${current_price:.2f}; sell-to-close queued for market open.",
@@ -4406,7 +4424,10 @@ async def _process_option_exit_monitor(market_open: bool) -> None:
                 )
                 continue
 
-            await asyncio.to_thread(_record_order, occ_symbol, exit_side, sell_qty, "submitted", str(order.get("id") or ""), "option", exit_reason)
+            await asyncio.to_thread(
+                _record_order, occ_symbol, exit_side, sell_qty, "submitted", str(order.get("id") or ""),
+                "option", exit_reason, str(position.get("opened_by") or ""),
+            )
             await _track_submitted_exit(
                 order,
                 occ_symbol,
@@ -6216,16 +6237,29 @@ async def _automate_agent_pick_option_contract(
         nearest_first = sorted(
             contracts, key=lambda c: abs(_as_float(c.get("strike_price")) - price)
         )[: max(1, config.automate_agent_strike_candidates)]
-        quotes: list[StrikeQuote] = []
-        for candidate in nearest_first:
-            strike = _as_float(candidate.get("strike_price"))
-            occ_symbol = str(candidate.get("symbol") or "")
-            if strike <= 0 or not occ_symbol:
-                continue
-            premium, _ = await asyncio.to_thread(alpaca.get_latest_option_price, occ_symbol)
-            premium = _as_float(premium)
-            if premium > 0:
-                quotes.append(StrikeQuote(occ_symbol=occ_symbol, strike=strike, premium=premium))
+        valid_candidates = [
+            (str(c.get("symbol") or ""), _as_float(c.get("strike_price")))
+            for c in nearest_first
+        ]
+        valid_candidates = [(occ, strike) for occ, strike in valid_candidates if strike > 0 and occ]
+        if not valid_candidates:
+            continue
+        # Independent live-quote lookups for different contracts -- fired
+        # concurrently rather than one-by-one, matching how
+        # _scan_automate_agent_watchlist already fetches independent
+        # per-symbol predictions concurrently. This runs inside
+        # _automate_agent_lock, so a serial fetch here would directly
+        # extend how long one cycle (and everything waiting on it) is
+        # blocked, for no benefit -- these strikes don't depend on each
+        # other's quotes.
+        premiums = await asyncio.gather(
+            *(asyncio.to_thread(alpaca.get_latest_option_price, occ) for occ, _ in valid_candidates)
+        )
+        quotes = [
+            StrikeQuote(occ_symbol=occ, strike=strike, premium=_as_float(premium))
+            for (occ, strike), (premium, _err) in zip(valid_candidates, premiums)
+            if _as_float(premium) > 0
+        ]
         if not quotes:
             continue
         chosen = select_best_strike(quotes, normalized_side, predicted_target_price, price, risk_budget)
@@ -6328,7 +6362,10 @@ async def _automate_agent_buy_option(
         return f"- {occ_symbol}: option order was not placed: {_public_error(err)}"
 
     order_detail = "automate_agent_buy_relaxed" if relaxing else "automate_agent_buy"
-    await asyncio.to_thread(_record_order, occ_symbol, "buy", contracts, "submitted", str(order.get("id") or ""), "option", order_detail)
+    await asyncio.to_thread(
+        _record_order, occ_symbol, "buy", contracts, "submitted", str(order.get("id") or ""),
+        "option", order_detail, AUTOMATE_AGENT_TAG,
+    )
     await _track_submitted_option_entry(
         order, occ_symbol, contracts,
         {
@@ -6394,7 +6431,11 @@ async def _scan_automate_agent_watchlist() -> list[BoomCandidate]:
             confidence=_as_float(ai_prediction.get("confidence_score")),
             predicted_return_pct=_as_float(ai_prediction.get("predicted_return_pct")),
             needs_human_review=bool(ai_prediction.get("needs_human_review")),
-            predicted_target_price=_as_float(ai_prediction.get("predicted_target_price")) or None,
+            # A missing/zero/negative value is passed through as-is rather
+            # than coerced to None here -- select_best_strike already
+            # treats None and <= 0 identically as "no usable target,"
+            # so there's no need for a second place to encode that rule.
+            predicted_target_price=_as_float(ai_prediction.get("predicted_target_price")),
         )
 
     tasks = [
@@ -6474,12 +6515,15 @@ async def _maybe_post_automate_agent_daily_report() -> None:
     already_reported = await asyncio.to_thread(get_automate_agent_report_date)
     if already_reported == today_label:
         return
+    equity_positions, option_positions = await asyncio.gather(
+        asyncio.to_thread(list_positions), asyncio.to_thread(list_option_positions)
+    )
     still_open = any(
         str(p.get("opened_by") or "").lower() == AUTOMATE_AGENT_TAG
-        for p in await asyncio.to_thread(list_positions)
+        for p in equity_positions
     ) or any(
         str(p.get("opened_by") or "").lower() == AUTOMATE_AGENT_TAG
-        for p in await asyncio.to_thread(list_option_positions)
+        for p in option_positions
     )
     if still_open:
         return
@@ -6650,9 +6694,33 @@ async def _build_automate_agent_text() -> str:
         effective_min_confidence = 0.0 if relaxing else config.automate_agent_min_confidence
         # A SELL signal is only actionable when automate_agent can actually
         # act on it -- buying a put. Equity has no short-selling path, so
-        # this stays False (unchanged) whenever options aren't in play.
+        # equity's own plan is always ranked BUY-only (include_sell=False)
+        # regardless of asset mode; a SELL candidate must never be bought
+        # as long shares. Computed as its own plan_automate_trades call,
+        # not derived by filtering a shared plan after the fact, so its
+        # to_evict stays correctly paired with its own to_buy (an eviction
+        # is only ever made to free room for a buy equity actually places).
+        equity_plan = plan_automate_trades(
+            candidates,
+            open_positions + automate_option_positions,
+            config.automate_agent_min_positions,
+            config.automate_agent_max_positions,
+            effective_min_confidence,
+            config.automate_agent_max_evictions_per_cycle,
+            False,
+            "equity",
+        )
+        # Options can act on both BUY (call) and SELL (put) -- ranked
+        # separately here since it has a different include_sell value than
+        # equity's plan above. Only its to_buy is ever used (see below);
+        # options never evicts anything today (that's still equity-only).
+        # asset_type="option" here (vs "equity" above) is what lets one
+        # symbol be held as *both* a share position and an option position
+        # at once -- without it, whichever leg's buy landed first would
+        # make plan_automate_trades treat the symbol as already-held for
+        # the other leg too, permanently blocking it for the rest of the
+        # day on a single-symbol watchlist.
         include_sell = config.automate_agent_asset_mode in {"options", "both"}
-
         plan = plan_automate_trades(
             candidates,
             open_positions + automate_option_positions,
@@ -6661,9 +6729,28 @@ async def _build_automate_agent_text() -> str:
             effective_min_confidence,
             config.automate_agent_max_evictions_per_cycle,
             include_sell,
+            "option",
         )
 
-        if not plan.to_buy:
+        # "options"-only mode skips equity entirely -- eviction's whole
+        # purpose is freeing a slot for a *new equity* pick, so it's gated
+        # the same way rather than evicting equity positions for no reason
+        # when the agent isn't buying equity this cycle.
+        equity_enabled = config.automate_agent_asset_mode in {"equity", "both"}
+        equity_to_evict = equity_plan.to_evict if equity_enabled else []
+        equity_to_buy = equity_plan.to_buy if equity_enabled else []
+
+        if not plan.to_buy and not equity_to_buy:
+            # Checked against both plans (equity_to_buy already respects
+            # equity_enabled), not just the options-oriented plan alone:
+            # they're ranked separately (different include_sell/
+            # asset_type), so a SELL candidate competing for the single
+            # per-cycle eviction slot in plan's combined ranking could in
+            # principle leave plan.to_buy empty while equity_plan.to_buy
+            # (a pure BUY-only ranking with no such competition) still has
+            # a genuine equity buy to make -- that buy must not be
+            # silently dropped by an early return keyed off the other
+            # plan alone.
             unmet_note = (
                 f" {trades_today}/{config.automate_agent_min_trades_per_window} of today's compulsory "
                 "minimum trades placed so far; no candidate cleared even the relaxed bar this cycle."
@@ -6684,14 +6771,6 @@ async def _build_automate_agent_text() -> str:
                 f"{config.automate_agent_exit_time_et} ET cutoff -- confidence bar relaxed to 0 for this cycle."
             )
 
-        # "options"-only mode skips equity entirely -- eviction's whole
-        # purpose is freeing a slot for a *new equity* pick, so it's gated
-        # the same way rather than evicting equity positions for no reason
-        # when the agent isn't buying equity this cycle.
-        equity_enabled = config.automate_agent_asset_mode in {"equity", "both"}
-        equity_to_evict = plan.to_evict if equity_enabled else []
-        equity_to_buy = plan.to_buy if equity_enabled else []
-
         for symbol in equity_to_evict:
             try:
                 position = next((p for p in open_positions if p.get("symbol") == symbol), None)
@@ -6704,7 +6783,10 @@ async def _build_automate_agent_text() -> str:
                     _client_order_id("automate_evict", f"{symbol}:{held_qty}"),
                 )
                 if order:
-                    await asyncio.to_thread(_record_order, symbol, "sell", held_qty, "submitted", str(order.get("id") or ""), "equity", "automate_agent_evict")
+                    await asyncio.to_thread(
+                        _record_order, symbol, "sell", held_qty, "submitted", str(order.get("id") or ""),
+                        "equity", "automate_agent_evict", AUTOMATE_AGENT_TAG,
+                    )
                     # Do NOT remove_position here -- that would delete local
                     # protection tracking (and skip recording a trade_outcomes
                     # P&L entry, which today_realized_pnl needs for the daily-
@@ -6764,7 +6846,10 @@ async def _build_automate_agent_text() -> str:
                 )
                 if order:
                     order_detail = "automate_agent_buy_relaxed" if relaxing else "automate_agent_buy"
-                    await asyncio.to_thread(_record_order, symbol, "buy", qty, "submitted", str(order.get("id") or ""), "equity", order_detail)
+                    await asyncio.to_thread(
+                        _record_order, symbol, "buy", qty, "submitted", str(order.get("id") or ""),
+                        "equity", order_detail, AUTOMATE_AGENT_TAG,
+                    )
                     await asyncio.to_thread(
                         upsert_position,
                         symbol, qty, price, str(order.get("id") or ""),
