@@ -248,6 +248,23 @@ class AgentConfig:
     automate_agent_scan_timeout_seconds: int = _int_env(
         "AUTOMATE_AGENT_SCAN_TIMEOUT_SECONDS", 400
     )
+    # A ceiling on the whole per-symbol *buy* attempt (equity or options),
+    # separate from automate_agent_scan_timeout_seconds above, which only
+    # bounds the watchlist scan. Every individual call inside a buy
+    # attempt already has its own timeout (Alpaca requests, the backtest
+    # validation gate), but nothing previously bounded the buy attempt as
+    # a whole -- the options path in particular chains several such calls
+    # (a live quote, up to automate_agent_option_expiry_fallback_days+1
+    # contract-listing calls, several concurrent premium fetches, the
+    # backtest gate), and a run of individually-bounded-but-slow calls
+    # could still add up to several minutes with nothing stopping it,
+    # holding _automate_agent_lock the whole time. Same class of problem
+    # as the scan timeout that caused 2026-08-31's zero-trade day, just
+    # one step later in the pipeline -- closing it before it's ever
+    # actually been hit live, rather than after.
+    automate_agent_buy_timeout_seconds: int = _int_env(
+        "AUTOMATE_AGENT_BUY_TIMEOUT_SECONDS", 120
+    )
     # "equity" | "options" | "both" (default). Controls whether automate_agent's
     # autonomous buys are shares, single-leg options, or both asset classes
     # competing for the same position cap. Per direction from the user's
@@ -275,6 +292,14 @@ class AgentConfig:
     # which is fine for a narrow, single-symbol watchlist but would not
     # have been for the prior full S&P 500 watchlist.
     automate_agent_strike_candidates: int = _int_env("AUTOMATE_AGENT_STRIKE_CANDIDATES", 5)
+    # A strike that scores well on the expected-payoff heuristic but is
+    # illiquid (a wide bid/ask spread relative to its mid-price) is likely
+    # to fill far worse than the quoted mid -- exactly what the ranking is
+    # trying to estimate accurately. 15% is a commonly-cited retail
+    # threshold for "still reasonably tradable"; a contract with no bid/
+    # ask data available at all is never dropped by this (unknown isn't
+    # the same as bad -- see automate_agent.rank_strikes).
+    automate_agent_max_spread_pct: float = _float_env("AUTOMATE_AGENT_MAX_SPREAD_PCT", 15.0)
     # Of those ranked strikes, how many of the top ones (best expected
     # payoff first) actually get run through the real backtest validation
     # gate (run_options_strategy_validation) before giving up. The payoff

@@ -120,7 +120,23 @@ def confidence_scaled_risk_multiplier(confidence: float, floor: float = 0.75, ca
 class StrikeQuote:
     occ_symbol: str
     strike: float
-    premium: float  # per-share option premium; one contract costs premium * 100
+    premium: float  # per-share option premium (mid-price); one contract costs premium * 100
+    # bid/ask default to 0.0 (== "unknown"), not None, so every existing
+    # positional StrikeQuote(occ, strike, premium) call site and test
+    # keeps working unchanged -- only rank_strikes' optional spread filter
+    # (see max_spread_pct) ever looks at these.
+    bid: float = 0.0
+    ask: float = 0.0
+
+
+def _spread_pct(q: StrikeQuote) -> Optional[float]:
+    """Bid/ask spread as a % of the mid-price (premium), or None when
+    bid/ask isn't available -- 0.0 is "unknown," not "a real zero-width
+    quote," matching StrikeQuote's own documented convention.
+    """
+    if q.bid <= 0 or q.ask <= 0 or q.ask <= q.bid or q.premium <= 0:
+        return None
+    return (q.ask - q.bid) / q.premium * 100.0
 
 
 def rank_strikes(
@@ -129,6 +145,7 @@ def rank_strikes(
     predicted_target_price: Optional[float],
     current_price: float,
     risk_budget: float,
+    max_spread_pct: Optional[float] = None,
 ) -> list[StrikeQuote]:
     """Ranks which listed strikes (from a handful of quoted candidates near
     the money) are actually the best trade, best first, instead of always
@@ -147,13 +164,21 @@ def rank_strikes(
 
     Strikes whose premium doesn't fit risk_budget are dropped before
     scoring -- a strike this trade literally can't afford isn't "the best
-    trade," it isn't a trade at all. Returns [] if nothing quoted fits.
+    trade," it isn't a trade at all. When max_spread_pct is given, a
+    strike whose bid/ask spread (as a % of its mid-price) exceeds it is
+    dropped too -- a strike that scores well on paper but is illiquid
+    (wide spread) is likely to fill far worse than the quoted mid, which
+    is exactly what this whole ranking is trying to estimate accurately.
+    A quote with no bid/ask data available is never dropped by this --
+    "unknown" isn't the same as "bad," and every existing caller that
+    doesn't pass bid/ask at all must keep working unchanged. Returns []
+    if nothing quoted survives both filters.
 
-    Falls back to ranking by nearest-the-money among what's affordable
-    when predicted_target_price isn't available (matches the prior,
-    simpler behavior); ties in expected payoff also break toward nearest-
-    the-money, so this converges to the old ATM-only ranking as the
-    model's own predicted move shrinks toward zero.
+    Falls back to ranking by nearest-the-money among what's left when
+    predicted_target_price isn't available (matches the prior, simpler
+    behavior); ties in expected payoff also break toward nearest-the-
+    money, so this converges to the old ATM-only ranking as the model's
+    own predicted move shrinks toward zero.
 
     The ranked (not just single-best) list exists because the payoff
     heuristic here is still just that -- a heuristic, not a guarantee. The
@@ -164,6 +189,8 @@ def rank_strikes(
     with no trade at all.
     """
     affordable = [q for q in quotes if q.premium > 0 and q.premium * 100.0 <= risk_budget]
+    if max_spread_pct is not None:
+        affordable = [q for q in affordable if (_spread_pct(q) or 0.0) <= max_spread_pct]
     if not affordable:
         return []
     if predicted_target_price is None or predicted_target_price <= 0:
@@ -191,13 +218,15 @@ def select_best_strike(
     predicted_target_price: Optional[float],
     current_price: float,
     risk_budget: float,
+    max_spread_pct: Optional[float] = None,
 ) -> Optional[StrikeQuote]:
     """The single top-ranked strike, or None if nothing quoted is
-    affordable. See rank_strikes for the actual ranking logic; kept as its
-    own function since most callers (and every existing test) only need
-    the single best pick, not the full ranking.
+    affordable (and, if max_spread_pct is given, liquid enough). See
+    rank_strikes for the actual ranking/filtering logic; kept as its own
+    function since most callers (and every existing test) only need the
+    single best pick, not the full ranking.
     """
-    ranked = rank_strikes(quotes, side, predicted_target_price, current_price, risk_budget)
+    ranked = rank_strikes(quotes, side, predicted_target_price, current_price, risk_budget, max_spread_pct)
     return ranked[0] if ranked else None
 
 

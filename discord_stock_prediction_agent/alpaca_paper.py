@@ -65,6 +65,26 @@ def _extract_option_snapshot_price(data: Dict[str, Any], occ_symbol: str) -> Opt
     return None
 
 
+def _extract_option_snapshot_quote(data: Dict[str, Any], occ_symbol: str) -> Optional[Dict[str, float]]:
+    """Like _extract_option_snapshot_price, but keeps bid and ask
+    separate instead of collapsing straight to a mid-price -- callers
+    that need to judge liquidity (a wide bid/ask spread on an illiquid
+    contract) need the two numbers, not just their midpoint. Alpaca's
+    snapshot response already carries both; this doesn't add a new
+    network call.
+    """
+    snapshot = _snapshot_for_symbol(data, occ_symbol)
+    if not snapshot:
+        return None
+    quote = snapshot.get("latestQuote") or snapshot.get("latest_quote") or {}
+    bid = _safe_float(quote.get("bp") or quote.get("bid_price"))
+    ask = _safe_float(quote.get("ap") or quote.get("ask_price"))
+    if bid is None and ask is None:
+        return None
+    mid = round((bid + ask) / 2, 6) if bid is not None and ask is not None else (bid or ask)
+    return {"bid": bid or 0.0, "ask": ask or 0.0, "mid": mid}
+
+
 class AlpacaPaperClient:
     def __init__(self) -> None:
         self.base_url = config.alpaca_base_url
@@ -147,6 +167,21 @@ class AlpacaPaperClient:
             if price is not None:
                 return price, ""
         return None, err or "Latest option market premium unavailable."
+
+    def get_option_quote(self, occ_symbol: str) -> Tuple[Optional[Dict[str, float]], str]:
+        """Return {"bid", "ask", "mid"} for an OCC option contract symbol,
+        so callers can judge liquidity (spread width), not just get a
+        single collapsed price. Same underlying snapshot endpoint as
+        get_latest_option_market_price -- this doesn't cost an extra
+        request when both are needed for the same symbol.
+        """
+        symbol = occ_symbol.upper()
+        data, err = self._get_data(f"/v1beta1/options/snapshots?symbols={symbol}")
+        if data:
+            quote = _extract_option_snapshot_quote(data, symbol)
+            if quote is not None:
+                return quote, ""
+        return None, err or "Latest option quote unavailable."
 
     def get_latest_option_price(self, occ_symbol: str) -> Tuple[Optional[float], str]:
         """Return the latest option premium for an OCC contract symbol.

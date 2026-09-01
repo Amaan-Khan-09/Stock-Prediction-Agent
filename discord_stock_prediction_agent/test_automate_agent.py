@@ -249,6 +249,36 @@ def test_rank_strikes_returns_empty_list_when_nothing_affordable() -> None:
     _assert(ranked == [], "empty list when the cheapest strike still exceeds the budget", ranked)
 
 
+def test_rank_strikes_ignores_spread_when_max_spread_pct_not_given() -> None:
+    print("\nTest: rank_strikes never filters on spread unless max_spread_pct is explicitly passed")
+    wide_spread = StrikeQuote("Wide", 100.0, premium=4.0, bid=2.0, ask=6.0)  # 100% spread
+    ranked = rank_strikes([wide_spread], "CALL", None, current_price=100.0, risk_budget=1000.0)
+    _assert(ranked == [wide_spread], "no liquidity filter applied -- max_spread_pct wasn't passed", ranked)
+
+
+def test_rank_strikes_drops_a_wide_spread_strike_when_max_spread_pct_is_given() -> None:
+    print("\nTest: rank_strikes drops an illiquid (wide bid/ask spread) strike when max_spread_pct is given")
+    tight = StrikeQuote("Tight", 100.0, premium=4.0, bid=3.9, ask=4.1)   # 5% spread -- fine
+    wide = StrikeQuote("Wide", 105.0, premium=1.0, bid=0.5, ask=1.5)    # 100% spread -- illiquid
+    ranked = rank_strikes([tight, wide], "CALL", None, current_price=100.0, risk_budget=1000.0, max_spread_pct=15.0)
+    _assert([q.occ_symbol for q in ranked] == ["Tight"], "the wide-spread strike is excluded, not just ranked lower", ranked)
+
+
+def test_rank_strikes_never_drops_a_quote_with_no_bid_ask_data() -> None:
+    print("\nTest: a quote with bid/ask == 0 (unknown, not a real zero-width market) is never dropped by the spread filter")
+    unknown_spread = StrikeQuote("NoQuoteData", 100.0, premium=4.0)  # bid/ask default to 0.0
+    ranked = rank_strikes([unknown_spread], "CALL", None, current_price=100.0, risk_budget=1000.0, max_spread_pct=1.0)
+    _assert(ranked == [unknown_spread], "unknown spread must not be treated as a bad (wide) spread", ranked)
+
+
+def test_select_best_strike_threads_max_spread_pct_through_to_rank_strikes() -> None:
+    print("\nTest: select_best_strike's optional max_spread_pct reaches the same filter rank_strikes uses")
+    tight = StrikeQuote("Tight", 100.0, premium=4.0, bid=3.9, ask=4.1)
+    wide = StrikeQuote("Wide", 105.0, premium=1.0, bid=0.5, ask=1.5)
+    chosen = select_best_strike([tight, wide], "CALL", None, current_price=100.0, risk_budget=1000.0, max_spread_pct=15.0)
+    _assert(chosen is not None and chosen.occ_symbol == "Tight", "the illiquid strike must be excluded here too", chosen)
+
+
 def test_select_best_strike_picks_highest_expected_payoff_for_a_put() -> None:
     print("\nTest: select_best_strike mirrors the same logic for PUTs")
     quotes = [
@@ -487,6 +517,10 @@ def run_all() -> None:
     test_rank_strikes_returns_the_full_order_not_just_the_winner()
     test_rank_strikes_drops_unaffordable_strikes_from_the_ranking()
     test_rank_strikes_returns_empty_list_when_nothing_affordable()
+    test_rank_strikes_ignores_spread_when_max_spread_pct_not_given()
+    test_rank_strikes_drops_a_wide_spread_strike_when_max_spread_pct_is_given()
+    test_rank_strikes_never_drops_a_quote_with_no_bid_ask_data()
+    test_select_best_strike_threads_max_spread_pct_through_to_rank_strikes()
     test_oldest_automate_position_ignores_user_trades()
     test_oldest_automate_position_none_when_all_user_owned()
     test_count_automate_positions()

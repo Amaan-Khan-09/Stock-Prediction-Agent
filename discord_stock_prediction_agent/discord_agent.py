@@ -6266,18 +6266,28 @@ async def _automate_agent_pick_option_contracts(
         # _automate_agent_lock, so a serial fetch here would directly
         # extend how long one cycle (and everything waiting on it) is
         # blocked, for no benefit -- these strikes don't depend on each
-        # other's quotes.
-        premiums = await asyncio.gather(
-            *(asyncio.to_thread(alpaca.get_latest_option_price, occ) for occ, _ in valid_candidates)
+        # other's quotes. get_option_quote (not get_latest_option_price)
+        # so rank_strikes' liquidity filter has real bid/ask to judge
+        # spread with, not just a pre-collapsed mid.
+        option_quotes = await asyncio.gather(
+            *(asyncio.to_thread(alpaca.get_option_quote, occ) for occ, _ in valid_candidates)
         )
         quotes = [
-            StrikeQuote(occ_symbol=occ, strike=strike, premium=_as_float(premium))
-            for (occ, strike), (premium, _err) in zip(valid_candidates, premiums)
-            if _as_float(premium) > 0
+            StrikeQuote(
+                occ_symbol=occ, strike=strike,
+                premium=_as_float((quote or {}).get("mid")),
+                bid=_as_float((quote or {}).get("bid")),
+                ask=_as_float((quote or {}).get("ask")),
+            )
+            for (occ, strike), (quote, _err) in zip(valid_candidates, option_quotes)
+            if _as_float((quote or {}).get("mid")) > 0
         ]
         if not quotes:
             continue
-        ranked = rank_strikes(quotes, normalized_side, predicted_target_price, price, risk_budget)
+        ranked = rank_strikes(
+            quotes, normalized_side, predicted_target_price, price, risk_budget,
+            config.automate_agent_max_spread_pct,
+        )
         if not ranked:
             continue
         top_k = ranked[: max(1, config.automate_agent_backtest_candidates)]
@@ -6910,67 +6920,82 @@ async def _build_automate_agent_text() -> str:
         bought: list[str] = []
         for symbol in equity_to_buy:
             try:
-                price, price_err = await asyncio.to_thread(alpaca.get_latest_price, symbol)
-                if not price or price <= 0:
-                    lines.append(f"- Skipped {symbol}: could not get a live price ({_public_error(price_err)}).")
-                    continue
-                # Fixed-fractional sizing: a constant % of *current* equity,
-                # not a hardcoded dollar figure, so sizing scales with the
-                # account and automatically shrinks after a drawdown. equity
-                # is guaranteed > 0 here -- the whole cycle already bailed
-                # out above if it couldn't be verified. On top of that, tilt
-                # the size (+/-25%) by the candidate's own confidence score,
-                # so a 95-confidence pick and a barely-cleared-the-bar pick
-                # don't get identical risk.
-                picked = candidates_by_symbol.get(symbol.upper())
-                size_multiplier = confidence_scaled_risk_multiplier(picked.confidence) if picked is not None else 1.0
-                risk_budget = equity * config.automate_agent_risk_pct_per_trade / 100.0 * size_multiplier
-                if price > risk_budget:
-                    # Whole shares only below -- max(1, ...) would otherwise
-                    # force a 1-share buy that blows straight past the
-                    # intended risk-based budget for any stock pricier than
-                    # the budget itself, silently defeating fixed-fractional
-                    # sizing for that symbol instead of just sizing down.
-                    lines.append(
-                        f"- Skipped {symbol}: share price ${price:.2f} exceeds the "
-                        f"${risk_budget:.2f} risk budget for this trade; buying even 1 "
-                        "share would oversize the position."
+                async def _buy_equity(symbol: str = symbol) -> None:
+                    price, price_err = await asyncio.to_thread(alpaca.get_latest_price, symbol)
+                    if not price or price <= 0:
+                        lines.append(f"- Skipped {symbol}: could not get a live price ({_public_error(price_err)}).")
+                        return
+                    # Fixed-fractional sizing: a constant % of *current* equity,
+                    # not a hardcoded dollar figure, so sizing scales with the
+                    # account and automatically shrinks after a drawdown. equity
+                    # is guaranteed > 0 here -- the whole cycle already bailed
+                    # out above if it couldn't be verified. On top of that, tilt
+                    # the size (+/-25%) by the candidate's own confidence score,
+                    # so a 95-confidence pick and a barely-cleared-the-bar pick
+                    # don't get identical risk.
+                    picked = candidates_by_symbol.get(symbol.upper())
+                    size_multiplier = confidence_scaled_risk_multiplier(picked.confidence) if picked is not None else 1.0
+                    risk_budget = equity * config.automate_agent_risk_pct_per_trade / 100.0 * size_multiplier
+                    if price > risk_budget:
+                        # Whole shares only below -- max(1, ...) would otherwise
+                        # force a 1-share buy that blows straight past the
+                        # intended risk-based budget for any stock pricier than
+                        # the budget itself, silently defeating fixed-fractional
+                        # sizing for that symbol instead of just sizing down.
+                        lines.append(
+                            f"- Skipped {symbol}: share price ${price:.2f} exceeds the "
+                            f"${risk_budget:.2f} risk budget for this trade; buying even 1 "
+                            "share would oversize the position."
+                        )
+                        return
+                    qty = max(1, int(risk_budget // price))
+                    order, err = await asyncio.to_thread(
+                        alpaca.submit_market_order,
+                        symbol, "buy", qty,
+                        _client_order_id("automate_buy", f"{symbol}:{qty}:{price}"),
                     )
-                    continue
-                qty = max(1, int(risk_budget // price))
-                order, err = await asyncio.to_thread(
-                    alpaca.submit_market_order,
-                    symbol, "buy", qty,
-                    _client_order_id("automate_buy", f"{symbol}:{qty}:{price}"),
+                    if order:
+                        order_detail = "automate_agent_buy_relaxed" if relaxing else "automate_agent_buy"
+                        await asyncio.to_thread(
+                            _record_order, symbol, "buy", qty, "submitted", str(order.get("id") or ""),
+                            "equity", order_detail, AUTOMATE_AGENT_TAG,
+                        )
+                        await asyncio.to_thread(
+                            upsert_position,
+                            symbol, qty, price, str(order.get("id") or ""),
+                            config.equity_stop_loss_pct, config.equity_take_profit_pct, "long",
+                            AUTOMATE_AGENT_TAG, True,
+                        )
+                        bought.append(symbol)
+                        conviction = (
+                            f" [confidence {picked.confidence:.0f}, predicted return {picked.predicted_return_pct:+.2f}%, "
+                            f"size x{size_multiplier:.2f}]"
+                            if picked is not None
+                            else ""
+                        )
+                        lines.append(
+                            f"- Bought {symbol}: {qty:g} sh @ ~${price:.2f} "
+                            f"(stop {config.equity_stop_loss_pct:g}%, target {config.equity_take_profit_pct:g}%, "
+                            f"auto-closes by {config.automate_agent_exit_time_et} ET if neither is hit first)."
+                            f"{conviction}"
+                            f"{' [compulsory minimum-trades fill]' if relaxing else ''}"
+                        )
+                    else:
+                        lines.append(f"- Tried to buy {symbol} but the order was not placed: {_public_error(err)}")
+
+                # Bounded so a slow-but-not-literally-failing call anywhere
+                # in this sequence can't hold _automate_agent_lock (and so
+                # delay every later cycle) indefinitely -- see
+                # automate_agent_buy_timeout_seconds.
+                await asyncio.wait_for(_buy_equity(), timeout=config.automate_agent_buy_timeout_seconds)
+            except asyncio.TimeoutError:
+                logging.getLogger("discord_stock_prediction_agent").warning(
+                    "automate_agent: equity buy timed out for %s after %ss", symbol, config.automate_agent_buy_timeout_seconds
                 )
-                if order:
-                    order_detail = "automate_agent_buy_relaxed" if relaxing else "automate_agent_buy"
-                    await asyncio.to_thread(
-                        _record_order, symbol, "buy", qty, "submitted", str(order.get("id") or ""),
-                        "equity", order_detail, AUTOMATE_AGENT_TAG,
-                    )
-                    await asyncio.to_thread(
-                        upsert_position,
-                        symbol, qty, price, str(order.get("id") or ""),
-                        config.equity_stop_loss_pct, config.equity_take_profit_pct, "long",
-                        AUTOMATE_AGENT_TAG, True,
-                    )
-                    bought.append(symbol)
-                    conviction = (
-                        f" [confidence {picked.confidence:.0f}, predicted return {picked.predicted_return_pct:+.2f}%, "
-                        f"size x{size_multiplier:.2f}]"
-                        if picked is not None
-                        else ""
-                    )
-                    lines.append(
-                        f"- Bought {symbol}: {qty:g} sh @ ~${price:.2f} "
-                        f"(stop {config.equity_stop_loss_pct:g}%, target {config.equity_take_profit_pct:g}%, "
-                        f"auto-closes by {config.automate_agent_exit_time_et} ET if neither is hit first)."
-                        f"{conviction}"
-                        f"{' [compulsory minimum-trades fill]' if relaxing else ''}"
-                    )
-                else:
-                    lines.append(f"- Tried to buy {symbol} but the order was not placed: {_public_error(err)}")
+                lines.append(
+                    f"- Tried to buy {symbol} but it took longer than "
+                    f"{config.automate_agent_buy_timeout_seconds}s; skipped this cycle."
+                )
             except Exception as exc:  # noqa: BLE001 -- one symbol's failure must not abort the cycle
                 logging.getLogger("discord_stock_prediction_agent").error(
                     "automate_agent: buy failed for %s: %s", symbol, exc
@@ -6992,7 +7017,25 @@ async def _build_automate_agent_text() -> str:
             remaining_slots = max(0, config.automate_agent_max_positions - projected_combined_count)
             for symbol in plan.to_buy[:remaining_slots]:
                 try:
-                    lines.append(await _automate_agent_buy_option(symbol, candidates_by_symbol.get(symbol.upper()), equity, relaxing, forcing))
+                    # Bounded for the same reason as the equity buy above --
+                    # this chains a live quote, several contract-listing
+                    # calls (one per expiry fallback offset), concurrent
+                    # premium fetches, and the backtest gate; nothing
+                    # previously stopped a run of individually-bounded-but-
+                    # slow calls here from adding up to several minutes.
+                    result = await asyncio.wait_for(
+                        _automate_agent_buy_option(symbol, candidates_by_symbol.get(symbol.upper()), equity, relaxing, forcing),
+                        timeout=config.automate_agent_buy_timeout_seconds,
+                    )
+                    lines.append(result)
+                except asyncio.TimeoutError:
+                    logging.getLogger("discord_stock_prediction_agent").warning(
+                        "automate_agent: option buy timed out for %s after %ss", symbol, config.automate_agent_buy_timeout_seconds
+                    )
+                    lines.append(
+                        f"- Tried to buy an option on {symbol} but it took longer than "
+                        f"{config.automate_agent_buy_timeout_seconds}s; skipped this cycle."
+                    )
                 except Exception as exc:  # noqa: BLE001 -- one symbol's failure must not abort the cycle
                     logging.getLogger("discord_stock_prediction_agent").error(
                         "automate_agent: option buy failed for %s: %s", symbol, exc

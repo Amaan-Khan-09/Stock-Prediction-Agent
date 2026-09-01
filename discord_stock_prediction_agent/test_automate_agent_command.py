@@ -82,6 +82,12 @@ class FakeAutomateAlpaca:
         # get_option_contracts's ATM-nearest-strike selection to work.
         self.option_contracts_by_expiry: dict[str, list[dict]] = {}
         self.option_premiums: dict[str, float] = {}
+        # Optional per-symbol (bid, ask) override for tests exercising the
+        # liquidity/spread filter -- symbols not listed here get a
+        # zero-spread synthetic quote (bid == ask == mid) derived from
+        # option_premiums, so every existing test that only ever sets
+        # option_premiums is unaffected by the filter.
+        self.option_spreads: dict[str, tuple[float, float]] = {}
         self.options_trading_enabled = True
 
     def ready(self):
@@ -146,6 +152,13 @@ class FakeAutomateAlpaca:
         self.submissions.append(order)
         self.orders[order["id"]] = order
         return dict(order), ""
+
+    def get_option_quote(self, occ_symbol: str):
+        mid = self.option_premiums.get(occ_symbol, 0.0)
+        if not mid:
+            return None, "no quote"
+        bid, ask = self.option_spreads.get(occ_symbol, (mid, mid))
+        return {"bid": bid, "ask": ask, "mid": mid}, ""
 
     def get_latest_option_price(self, occ_symbol: str):
         price = self.option_premiums.get(occ_symbol, 0.0)
@@ -570,6 +583,47 @@ def test_open_market_buys_a_boom_candidate_and_tags_it() -> None:
     asyncio.run(_with_runtime(scenario, predictions=predictions))
 
 
+def test_equity_buy_times_out_instead_of_freezing_the_cycle() -> None:
+    """Regression: nothing previously bounded the whole per-symbol buy
+    attempt, only its individual sub-calls (each Alpaca request has its
+    own timeout, but nothing wrapped the sequence as a whole) -- a slow-
+    but-not-literally-failing call anywhere in that sequence could hold
+    _automate_agent_lock, and so delay every later cycle, far longer than
+    intended. automate_agent_buy_timeout_seconds bounds the whole
+    attempt, not just its parts."""
+    import time
+
+    def scenario_factory():
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            fake.prices[symbol] = 100.0
+            original_get_latest_price = fake.get_latest_price
+
+            def slow_get_latest_price(sym: str):
+                if sym == symbol:
+                    time.sleep(2)  # far longer than the 1s timeout below
+                return original_get_latest_price(sym)
+
+            fake.get_latest_price = slow_get_latest_price
+            original_timeout = discord_agent.config.automate_agent_buy_timeout_seconds
+            object.__setattr__(discord_agent.config, "automate_agent_buy_timeout_seconds", 1)
+            try:
+                started = time.monotonic()
+                text = await discord_agent._build_automate_agent_text()
+                elapsed = time.monotonic() - started
+            finally:
+                object.__setattr__(discord_agent.config, "automate_agent_buy_timeout_seconds", original_timeout)
+
+            assert elapsed < 4, f"the buy attempt should time out quickly, took {elapsed:.1f}s"
+            assert "took longer than 1s" in text, text
+            assert not fake.submissions, "no order should have been submitted once the attempt timed out"
+
+        return scenario
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+    asyncio.run(_with_runtime(scenario_factory(), predictions=predictions))
+
+
 def _with_extra_watchlist_symbol(test_fn) -> None:
     """max_positions defaults to the same size as the real watchlist, so
     "at the cap" tests need one extra candidate symbol beyond the cap to
@@ -977,6 +1031,50 @@ def _with_asset_mode(mode: str, test_fn) -> None:
         object.__setattr__(discord_agent.config, "automate_agent_asset_mode", original)
 
 
+def test_options_buy_times_out_instead_of_freezing_the_cycle() -> None:
+    """Same protection as test_equity_buy_times_out_instead_of_freezing_
+    the_cycle, for the options path -- which chains more calls (a live
+    quote, contract-listing per expiry-fallback offset, concurrent
+    premium fetches, the backtest gate) and so has more places a slow-
+    but-not-literally-failing call could hide."""
+    import time
+
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            fake.prices[symbol] = 100.0
+            today = date.today().isoformat()
+            occ_symbol = f"{symbol}260101C00100000"
+            fake.option_contracts_by_expiry[today] = [{"symbol": occ_symbol, "strike_price": "100"}]
+            fake.option_premiums[occ_symbol] = 2.0
+
+            original_get_option_contracts = fake.get_option_contracts
+
+            def slow_get_option_contracts(underlying, expiration_date=None, strike=None, option_type=None):
+                time.sleep(2)  # far longer than the 1s timeout below
+                return original_get_option_contracts(underlying, expiration_date, strike, option_type)
+
+            fake.get_option_contracts = slow_get_option_contracts
+            original_timeout = discord_agent.config.automate_agent_buy_timeout_seconds
+            object.__setattr__(discord_agent.config, "automate_agent_buy_timeout_seconds", 1)
+            try:
+                started = time.monotonic()
+                text = await discord_agent._build_automate_agent_text()
+                elapsed = time.monotonic() - started
+            finally:
+                object.__setattr__(discord_agent.config, "automate_agent_buy_timeout_seconds", original_timeout)
+
+            assert elapsed < 4, f"the buy attempt should time out quickly, took {elapsed:.1f}s"
+            assert "took longer than 1s" in text, text
+            assert not fake.submissions, "no order should have been submitted once the attempt timed out"
+            assert not state_store.list_option_positions()
+
+        predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("options", run)
+
+
 def test_options_mode_buys_an_atm_call_when_backtest_confirms_buy() -> None:
     def run() -> None:
         async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
@@ -1282,6 +1380,54 @@ def test_options_mode_tries_the_next_ranked_strike_when_the_backtest_rejects_the
             bought_100 = [o for o in fake.submissions if o["symbol"] == occ_100]
             assert len(bought_95) == 1, "must fall through to the #2-ranked strike once #1 is rejected"
             assert not bought_100, "the backtest-rejected top pick must never be bought"
+
+        predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("options", run)
+
+
+def test_options_mode_skips_an_illiquid_strike_in_favor_of_a_tighter_spread() -> None:
+    """A strike that scores well on the expected-payoff heuristic but has
+    a wide bid/ask spread is likely to fill far worse than its quoted
+    mid -- it must never even be offered to the backtest when a tighter,
+    still-affordable alternative is available."""
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            fake.prices[symbol] = 100.0
+            today = date.today().isoformat()
+            occ_100 = f"{symbol}260101C00100000"  # ATM -- would rank #1, but illiquid
+            occ_95 = f"{symbol}260101C00095000"   # ranked #2, tight spread
+            fake.option_contracts_by_expiry[today] = [
+                {"symbol": occ_100, "strike_price": "100"},
+                {"symbol": occ_95, "strike_price": "95"},
+            ]
+            fake.option_premiums[occ_100] = 4.0
+            fake.option_premiums[occ_95] = 7.0
+            fake.option_spreads[occ_100] = (2.0, 6.0)   # 100% spread -- illiquid
+            fake.option_spreads[occ_95] = (6.9, 7.1)    # ~2.9% spread -- fine
+
+            original_validate = discord_agent.run_options_strategy_validation
+            validated_symbols: list[str] = []
+
+            def fake_validate(option):
+                validated_symbols.append(f"{symbol}{option.strike:g}")
+                return {"status": "SUCCESS_POLYGON_STRIKE", "decision": "BUY"}
+
+            discord_agent.run_options_strategy_validation = fake_validate
+            try:
+                await discord_agent._build_automate_agent_text()
+            finally:
+                discord_agent.run_options_strategy_validation = original_validate
+
+            assert f"{symbol}100" not in validated_symbols, (
+                "the illiquid ATM strike must be filtered out before the backtest ever sees it"
+            )
+            bought_95 = [o for o in fake.submissions if o["symbol"] == occ_95 and o["side"] == "buy"]
+            bought_100 = [o for o in fake.submissions if o["symbol"] == occ_100]
+            assert len(bought_95) == 1, "the liquid alternative must still be bought"
+            assert not bought_100, "the illiquid strike must never be bought regardless of its payoff score"
 
         predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
         asyncio.run(_with_runtime(scenario, predictions=predictions))
