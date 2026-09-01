@@ -966,8 +966,9 @@ def test_default_asset_mode_is_both_on_tsla() -> None:
     fresh = AgentConfig()
     assert fresh.automate_agent_asset_mode == "both"
     assert fresh.automate_agent_watchlist == ("TSLA",)
-    assert fresh.automate_agent_min_options_trades_per_window == 5
-    assert fresh.automate_agent_min_total_trades_per_window == 10
+    assert fresh.automate_agent_exit_time_et == "12:00"
+    assert fresh.automate_agent_min_options_trades_per_window == 3
+    assert fresh.automate_agent_min_total_trades_per_window == 5
     assert fresh.automate_agent_max_trades_per_window == 40
 
 
@@ -1243,8 +1244,8 @@ def test_options_mode_skips_when_backtest_does_not_confirm_buy() -> None:
                 "status": "REVIEW", "decision": "HOLD",
             }
             # Pinned outside both the relax and force windows of the
-            # default 12:30 cutoff -- without this, running the suite
-            # during the real force window (12:15-12:30 ET) would make
+            # default 12:00 cutoff -- without this, running the suite
+            # during the real force window (11:45-12:00 ET) would make
             # forcing True unexpectedly and this test flaky.
             original_now_et = discord_agent._now_et
             discord_agent._now_et = lambda: datetime(2026, 8, 24, 10, 0, tzinfo=ZoneInfo("America/New_York"))
@@ -1281,7 +1282,7 @@ def test_options_mode_still_skips_backtest_veto_within_relax_window_but_outside_
                 "status": "REVIEW", "decision": "HOLD",
             }
             original_now_et = discord_agent._now_et
-            discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+            discord_agent._now_et = lambda: datetime(2026, 8, 24, 11, 30, tzinfo=ZoneInfo("America/New_York"))
             try:
                 await discord_agent._build_automate_agent_text()
             finally:
@@ -1316,10 +1317,10 @@ def test_options_mode_forces_a_trade_past_backtest_veto_within_force_window() ->
             discord_agent.run_options_strategy_validation = lambda option: {
                 "status": "SUCCESS_POLYGON_STRIKE", "decision": "HOLD",
             }
-            # 12:20 ET, 10 min before the default 12:30 cutoff -- inside
+            # 11:50 ET, 10 min before the default 12:00 cutoff -- inside
             # both the relax window (60 min) and the force window (15 min).
             original_now_et = discord_agent._now_et
-            discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 20, tzinfo=ZoneInfo("America/New_York"))
+            discord_agent._now_et = lambda: datetime(2026, 8, 24, 11, 50, tzinfo=ZoneInfo("America/New_York"))
             try:
                 text = await discord_agent._build_automate_agent_text()
             finally:
@@ -1459,7 +1460,7 @@ def test_options_mode_forces_the_top_ranked_candidate_when_none_of_several_pass(
                 "status": "SUCCESS_POLYGON_STRIKE", "decision": "HOLD",
             }
             original_now_et = discord_agent._now_et
-            discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 20, tzinfo=ZoneInfo("America/New_York"))
+            discord_agent._now_et = lambda: datetime(2026, 8, 24, 11, 50, tzinfo=ZoneInfo("America/New_York"))
             try:
                 text = await discord_agent._build_automate_agent_text()
             finally:
@@ -1845,7 +1846,7 @@ def test_compulsory_minimum_relaxes_confidence_bar_within_relax_window() -> None
         symbol = discord_agent.config.automate_agent_watchlist[0]
         fake.prices[symbol] = 100.0
         original_now_et = discord_agent._now_et
-        discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 11, 30, tzinfo=ZoneInfo("America/New_York"))
         try:
             text = await discord_agent._build_automate_agent_text()
         finally:
@@ -1899,7 +1900,7 @@ def test_compulsory_minimum_does_not_relax_once_quota_already_met() -> None:
         symbol = discord_agent.config.automate_agent_watchlist[0]
         fake.prices[symbol] = 100.0
         original_now_et = discord_agent._now_et
-        discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 11, 30, tzinfo=ZoneInfo("America/New_York"))
         try:
             text = await discord_agent._build_automate_agent_text()
         finally:
@@ -1923,7 +1924,7 @@ def test_compulsory_total_minimum_still_relaxes_when_options_minimum_is_already_
         symbol = discord_agent.config.automate_agent_watchlist[0]
         fake.prices[symbol] = 100.0
         original_now_et = discord_agent._now_et
-        discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 11, 30, tzinfo=ZoneInfo("America/New_York"))
         try:
             text = await discord_agent._build_automate_agent_text()
         finally:
@@ -1952,7 +1953,7 @@ def test_compulsory_options_minimum_ignores_equity_trades() -> None:
         symbol = discord_agent.config.automate_agent_watchlist[0]
         fake.prices[symbol] = 100.0
         original_now_et = discord_agent._now_et
-        discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 11, 30, tzinfo=ZoneInfo("America/New_York"))
         try:
             text = await discord_agent._build_automate_agent_text()
         finally:
@@ -2014,7 +2015,7 @@ def test_compulsory_minimum_never_overrides_the_daily_loss_circuit_breaker() -> 
         symbol = discord_agent.config.automate_agent_watchlist[0]
         fake.prices[symbol] = 100.0
         original_now_et = discord_agent._now_et
-        discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 11, 30, tzinfo=ZoneInfo("America/New_York"))
         try:
             text = await discord_agent._build_automate_agent_text()
         finally:

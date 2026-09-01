@@ -136,7 +136,7 @@ class AgentConfig:
     # daily-loss circuit breaker is never overridden by this -- capital
     # protection always wins over a trade-count quota.
     automate_agent_min_options_trades_per_window: int = _int_env(
-        "AUTOMATE_AGENT_MIN_OPTIONS_TRADES_PER_WINDOW", 5
+        "AUTOMATE_AGENT_MIN_OPTIONS_TRADES_PER_WINDOW", 3
     )
     # Compulsory floor on *total* orders (equity + option buys combined) --
     # same relax mechanism as the options-specific floor above (either one
@@ -144,7 +144,7 @@ class AgentConfig:
     # one asset type. An equity buy counts toward this one; it doesn't
     # count toward automate_agent_min_options_trades_per_window.
     automate_agent_min_total_trades_per_window: int = _int_env(
-        "AUTOMATE_AGENT_MIN_TOTAL_TRADES_PER_WINDOW", 10
+        "AUTOMATE_AGENT_MIN_TOTAL_TRADES_PER_WINDOW", 5
     )
     # Hard ceiling on the flip side -- total orders (equity + option buys
     # combined) placed during the whole trading window, regardless of how
@@ -189,7 +189,7 @@ class AgentConfig:
     # cutoff every day regardless of early-close days. Equity positions not
     # opened by automate_agent are unaffected -- they still use the
     # relative automate_agent_exit_minutes_before_close fallback above.
-    automate_agent_exit_time_et: str = os.getenv("AUTOMATE_AGENT_EXIT_TIME_ET", "12:30").strip()
+    automate_agent_exit_time_et: str = os.getenv("AUTOMATE_AGENT_EXIT_TIME_ET", "12:00").strip()
     # Fixed-fractional position sizing: risk a small, constant % of current
     # account equity per trade rather than a fixed dollar amount, so sizing
     # naturally scales with account growth and shrinks during drawdowns.
