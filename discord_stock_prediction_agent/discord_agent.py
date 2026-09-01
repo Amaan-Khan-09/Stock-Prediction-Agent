@@ -54,7 +54,7 @@ from .automate_agent import (
     confidence_scaled_risk_multiplier,
     count_automate_positions,
     plan_automate_trades,
-    select_best_strike,
+    rank_strikes,
 )
 from .prediction_bridge import run_project_prediction
 from .protection_policy import build_protection_levels, evaluate_protection
@@ -6208,17 +6208,18 @@ async def agent_option_validation(ctx: commands.Context) -> None:
     await _send_context_output(ctx, await _build_agent_option_validation_text())
 
 
-async def _automate_agent_pick_option_contract(
+async def _automate_agent_pick_option_contracts(
     root: str, side: str, predicted_target_price: Optional[float], risk_budget: float
-) -> Optional[dict]:
-    """Pick a same-day (0DTE) CALL or PUT for `root`, falling back to the
-    nearest later listed expiry within
-    config.automate_agent_option_expiry_fallback_days if nothing is listed
-    today.
+) -> list[dict]:
+    """Pick up to config.automate_agent_backtest_candidates same-day
+    (0DTE) CALL or PUT candidates for `root`, ranked best expected payoff
+    first, falling back to the nearest later listed expiry within
+    config.automate_agent_option_expiry_fallback_days if nothing is
+    listed today.
 
-    Scores the config.automate_agent_strike_candidates listed strikes
+    Ranks the config.automate_agent_strike_candidates listed strikes
     nearest the current price by their expected payoff at
-    predicted_target_price (automate_agent.select_best_strike), rather than
+    predicted_target_price (automate_agent.rank_strikes), rather than
     blindly taking the nearest-the-money strike regardless of what the
     model itself expects. There is still no options-greeks/delta data
     source anywhere in this codebase (Alpaca's contract-listing endpoint
@@ -6228,11 +6229,17 @@ async def _automate_agent_pick_option_contract(
     "which strike is actually the best trade," rather than inventing an
     unvalidated greeks estimator for a no-human-review path. Falls back to
     nearest-the-money when there's no predicted target to score against
-    (see select_best_strike), matching the previous behavior.
+    (see rank_strikes), matching the previous behavior.
+
+    Returns more than the single top pick because that ranking is still
+    just a heuristic -- the real backtest gate the caller runs each of
+    these through can legitimately disagree with #1, and offering it #2
+    as well means that disagreement doesn't have to end the cycle with no
+    trade at all.
     """
     price, price_err = await asyncio.to_thread(alpaca.get_latest_price, root)
     if not price or price <= 0:
-        return None
+        return []
 
     normalized_side = "put" if str(side or "").lower().startswith("p") else "call"
     for offset in range(0, max(0, config.automate_agent_option_expiry_fallback_days) + 1):
@@ -6270,17 +6277,21 @@ async def _automate_agent_pick_option_contract(
         ]
         if not quotes:
             continue
-        chosen = select_best_strike(quotes, normalized_side, predicted_target_price, price, risk_budget)
-        if chosen is None:
+        ranked = rank_strikes(quotes, normalized_side, predicted_target_price, price, risk_budget)
+        if not ranked:
             continue
-        return {
-            "occ_symbol": chosen.occ_symbol,
-            "strike": chosen.strike,
-            "expiry_date": expiry,
-            "root": root,
-            "premium": chosen.premium,
-        }
-    return None
+        top_k = ranked[: max(1, config.automate_agent_backtest_candidates)]
+        return [
+            {
+                "occ_symbol": q.occ_symbol,
+                "strike": q.strike,
+                "expiry_date": expiry,
+                "root": root,
+                "premium": q.premium,
+            }
+            for q in top_k
+        ]
+    return []
 
 
 async def _automate_agent_buy_option(
@@ -6327,45 +6338,72 @@ async def _automate_agent_buy_option(
     size_multiplier = confidence_scaled_risk_multiplier(picked.confidence) if picked is not None else 1.0
     risk_budget = equity * config.automate_agent_risk_pct_per_trade / 100.0 * size_multiplier
     predicted_target_price = picked.predicted_target_price if picked is not None else None
-    contract = await _automate_agent_pick_option_contract(root, side, predicted_target_price, risk_budget)
-    if not contract:
+    candidates = await _automate_agent_pick_option_contracts(root, side, predicted_target_price, risk_budget)
+    if not candidates:
         return (
             f"- {root} (option): no listed {side} contract found within "
             f"{config.automate_agent_option_expiry_fallback_days} day(s) affordable within the "
             f"${risk_budget:.2f} risk budget, skipped."
         )
+
+    def _synthetic_for(candidate: dict) -> ParsedOptionSignal:
+        candidate_premium = _as_float(candidate["premium"])
+        return ParsedOptionSignal(
+            valid=True,
+            root=root,
+            strike=candidate["strike"],
+            side=side,
+            expiry_date=candidate["expiry_date"],
+            expiry_mode="explicit",
+            fill_price=candidate_premium if candidate_premium > 0 else None,
+            quantity=1.0,
+            order_action="open_long",
+            tense="new_order",
+            raw_text=(
+                f"automate_agent synthetic BUY {root} {candidate['strike']}{side_letter} "
+                f"{candidate['expiry_date']}"
+            ),
+        )
+
+    # Validate every ranked candidate against the real backtest gate
+    # concurrently, not one at a time -- offering it more than its single
+    # top pick shouldn't multiply this cycle's latency by however many
+    # candidates that is.
+    validations = await asyncio.gather(
+        *(asyncio.to_thread(run_options_strategy_validation, _synthetic_for(c)) for c in candidates)
+    )
+
+    contract: Optional[dict] = None
+    strategy_validation: dict = {}
+    for candidate, validation in zip(candidates, validations):
+        if str(validation.get("decision") or "").upper() == "BUY":
+            contract, strategy_validation = candidate, validation
+            break
+    backtest_confirmed_buy = contract is not None
+
+    if contract is None:
+        if not forcing:
+            tried = ", ".join(f"{c['strike']:g}{side_letter}" for c in candidates)
+            return (
+                f"- {root} (option): strategy validation did not confirm BUY for any of "
+                f"{len(candidates)} candidate strike(s) tried ({tried}), skipped."
+            )
+        # Forced: fall back to the single best-ranked candidate (highest
+        # expected payoff) even though the backtest didn't confirm any of
+        # them -- see the compulsory-minimum note further down.
+        contract, strategy_validation = candidates[0], validations[0]
+
     occ_symbol = contract["occ_symbol"]
     premium = _as_float(contract["premium"])
-
-    synthetic = ParsedOptionSignal(
-        valid=True,
-        root=root,
-        strike=contract["strike"],
-        side=side,
-        expiry_date=contract["expiry_date"],
-        expiry_mode="explicit",
-        fill_price=premium if premium > 0 else None,
-        quantity=1.0,
-        order_action="open_long",
-        tense="new_order",
-        raw_text=f"automate_agent synthetic BUY {root} {contract['strike']}{side_letter} {contract['expiry_date']}",
-    )
-    strategy_validation = await asyncio.to_thread(run_options_strategy_validation, synthetic)
-    backtest_confirmed_buy = str(strategy_validation.get("decision") or "").upper() == "BUY"
-    if not backtest_confirmed_buy and not forcing:
-        return (
-            f"- {occ_symbol}: strategy validation did not confirm BUY "
-            f"({strategy_validation.get('status')}), skipped."
-        )
 
     enabled, options_err = await asyncio.to_thread(alpaca.has_options_trading)
     if not enabled:
         return f"- {occ_symbol}: {_public_error(options_err)}"
 
-    # premium/affordability were already checked by select_best_strike inside
-    # _automate_agent_pick_option_contract (it never returns a strike whose
-    # premium is <= 0 or exceeds risk_budget) -- contract["premium"] is
-    # guaranteed sane here.
+    # premium/affordability were already checked by rank_strikes inside
+    # _automate_agent_pick_option_contracts (it never returns a strike
+    # whose premium is <= 0 or exceeds risk_budget) -- contract["premium"]
+    # is guaranteed sane here.
     per_contract_cost = premium * 100.0
     contracts = max(1, int(risk_budget // per_contract_cost))
 

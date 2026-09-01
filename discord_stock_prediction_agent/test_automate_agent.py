@@ -19,6 +19,7 @@ from .automate_agent import (
     oldest_automate_position,
     plan_automate_trades,
     rank_boom_candidates,
+    rank_strikes,
     select_best_strike,
 )
 
@@ -210,6 +211,42 @@ def test_select_best_strike_picks_highest_expected_payoff_for_a_call() -> None:
         "the cheap OTM call has the best expected payoff, not the ATM one",
         chosen,
     )
+
+
+def test_rank_strikes_returns_the_full_order_not_just_the_winner() -> None:
+    print("\nTest: rank_strikes returns every affordable strike ranked best-to-worst, not only the top pick")
+    quotes = [
+        StrikeQuote("A95", 95.0, premium=7.0),    # ratio=1.14 -- 3rd
+        StrikeQuote("A100", 100.0, premium=4.0),  # ratio=1.5  -- 2nd
+        StrikeQuote("A105", 105.0, premium=1.0),  # ratio=4.0  -- 1st
+    ]
+    ranked = rank_strikes(quotes, "CALL", 110.0, current_price=100.0, risk_budget=1000.0)
+    _assert(
+        [q.strike for q in ranked] == [105.0, 100.0, 95.0],
+        "full ranking, best expected payoff first",
+        [q.strike for q in ranked],
+    )
+    _assert(
+        select_best_strike(quotes, "CALL", 110.0, current_price=100.0, risk_budget=1000.0) is ranked[0],
+        "select_best_strike is just rank_strikes()[0]",
+    )
+
+
+def test_rank_strikes_drops_unaffordable_strikes_from_the_ranking() -> None:
+    print("\nTest: rank_strikes excludes strikes the risk budget can't afford, same as select_best_strike")
+    quotes = [
+        StrikeQuote("Cheap", 105.0, premium=1.0),   # cost $100, affordable
+        StrikeQuote("Pricey", 90.0, premium=12.0),  # cost $1200, not affordable at $500 budget
+    ]
+    ranked = rank_strikes(quotes, "CALL", 110.0, current_price=100.0, risk_budget=500.0)
+    _assert([q.strike for q in ranked] == [105.0], "only the affordable strike survives", ranked)
+
+
+def test_rank_strikes_returns_empty_list_when_nothing_affordable() -> None:
+    print("\nTest: rank_strikes returns [] (not None, not a crash) when nothing quoted is affordable")
+    quotes = [StrikeQuote("A100", 100.0, premium=10.0)]
+    ranked = rank_strikes(quotes, "CALL", 110.0, current_price=100.0, risk_budget=500.0)
+    _assert(ranked == [], "empty list when the cheapest strike still exceeds the budget", ranked)
 
 
 def test_select_best_strike_picks_highest_expected_payoff_for_a_put() -> None:
@@ -447,6 +484,9 @@ def run_all() -> None:
     test_select_best_strike_picks_highest_expected_payoff_for_a_put()
     test_select_best_strike_drops_strikes_the_risk_budget_cannot_afford()
     test_select_best_strike_returns_none_when_nothing_affordable()
+    test_rank_strikes_returns_the_full_order_not_just_the_winner()
+    test_rank_strikes_drops_unaffordable_strikes_from_the_ranking()
+    test_rank_strikes_returns_empty_list_when_nothing_affordable()
     test_oldest_automate_position_ignores_user_trades()
     test_oldest_automate_position_none_when_all_user_owned()
     test_count_automate_positions()

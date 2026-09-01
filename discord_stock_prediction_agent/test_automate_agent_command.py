@@ -1244,6 +1244,94 @@ def test_options_mode_forces_a_trade_past_backtest_veto_within_force_window() ->
     _with_asset_mode("options", run)
 
 
+def test_options_mode_tries_the_next_ranked_strike_when_the_backtest_rejects_the_top_one() -> None:
+    """The payoff-ranking heuristic can legitimately disagree with the
+    real backtest -- exactly what happened live on 2026-08-31. Rather
+    than giving up (or needing to force past the veto) the moment its #1
+    pick is rejected, automate_agent now offers the backtest more than
+    one real candidate and uses whichever one it actually confirms."""
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            fake.prices[symbol] = 100.0
+            today = date.today().isoformat()
+            occ_100 = f"{symbol}260101C00100000"  # ATM -- ranked #1 (no predicted target -> nearest-the-money)
+            occ_95 = f"{symbol}260101C00095000"   # ranked #2
+            fake.option_contracts_by_expiry[today] = [
+                {"symbol": occ_100, "strike_price": "100"},
+                {"symbol": occ_95, "strike_price": "95"},
+            ]
+            fake.option_premiums[occ_100] = 4.0
+            fake.option_premiums[occ_95] = 7.0
+
+            original_validate = discord_agent.run_options_strategy_validation
+
+            def fake_validate(option):
+                if option.strike == 100.0:
+                    return {"status": "SUCCESS_POLYGON_STRIKE", "decision": "HOLD"}
+                return {"status": "SUCCESS_POLYGON_STRIKE", "decision": "BUY"}
+
+            discord_agent.run_options_strategy_validation = fake_validate
+            try:
+                text = await discord_agent._build_automate_agent_text()
+            finally:
+                discord_agent.run_options_strategy_validation = original_validate
+
+            assert "FORCED" not in text, "must not need forcing -- the #2 candidate genuinely passed on its own"
+            bought_95 = [o for o in fake.submissions if o["symbol"] == occ_95 and o["side"] == "buy"]
+            bought_100 = [o for o in fake.submissions if o["symbol"] == occ_100]
+            assert len(bought_95) == 1, "must fall through to the #2-ranked strike once #1 is rejected"
+            assert not bought_100, "the backtest-rejected top pick must never be bought"
+
+        predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("options", run)
+
+
+def test_options_mode_forces_the_top_ranked_candidate_when_none_of_several_pass() -> None:
+    """When forcing kicks in and multiple candidates were offered to the
+    backtest but every one of them was rejected, the forced fallback must
+    still use the single best-ranked one (highest expected payoff), not
+    an arbitrary one from the list."""
+    def run() -> None:
+        async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+            symbol = discord_agent.config.automate_agent_watchlist[0]
+            fake.prices[symbol] = 100.0
+            today = date.today().isoformat()
+            occ_100 = f"{symbol}260101C00100000"  # ATM -- ranked #1
+            occ_95 = f"{symbol}260101C00095000"   # ranked #2
+            fake.option_contracts_by_expiry[today] = [
+                {"symbol": occ_100, "strike_price": "100"},
+                {"symbol": occ_95, "strike_price": "95"},
+            ]
+            fake.option_premiums[occ_100] = 4.0
+            fake.option_premiums[occ_95] = 7.0
+
+            original_validate = discord_agent.run_options_strategy_validation
+            discord_agent.run_options_strategy_validation = lambda option: {
+                "status": "SUCCESS_POLYGON_STRIKE", "decision": "HOLD",
+            }
+            original_now_et = discord_agent._now_et
+            discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 20, tzinfo=ZoneInfo("America/New_York"))
+            try:
+                text = await discord_agent._build_automate_agent_text()
+            finally:
+                discord_agent.run_options_strategy_validation = original_validate
+                discord_agent._now_et = original_now_et
+
+            assert "FORCED past backtest veto" in text, text
+            bought_100 = [o for o in fake.submissions if o["symbol"] == occ_100 and o["side"] == "buy"]
+            bought_95 = [o for o in fake.submissions if o["symbol"] == occ_95]
+            assert len(bought_100) == 1, "forced fallback must use the top-ranked (ATM) candidate"
+            assert not bought_95, "must not force a lower-ranked candidate when the top one is available to force"
+
+        predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+        asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+    _with_asset_mode("options", run)
+
+
 def test_options_mode_skips_symbol_with_no_listed_contract_within_fallback_window() -> None:
     def run() -> None:
         async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:

@@ -123,16 +123,17 @@ class StrikeQuote:
     premium: float  # per-share option premium; one contract costs premium * 100
 
 
-def select_best_strike(
+def rank_strikes(
     quotes: list[StrikeQuote],
     side: str,
     predicted_target_price: Optional[float],
     current_price: float,
     risk_budget: float,
-) -> Optional[StrikeQuote]:
-    """Picks which listed strike (from a handful of quoted candidates near
-    the money) is actually the best trade, instead of always taking the
-    nearest-the-money strike regardless of what the model itself expects.
+) -> list[StrikeQuote]:
+    """Ranks which listed strikes (from a handful of quoted candidates near
+    the money) are actually the best trade, best first, instead of always
+    taking the nearest-the-money strike regardless of what the model
+    itself expects.
 
     There is still no options-greeks/delta data source anywhere in this
     codebase, so this can't rank by real delta/theta. What IS already
@@ -146,19 +147,27 @@ def select_best_strike(
 
     Strikes whose premium doesn't fit risk_budget are dropped before
     scoring -- a strike this trade literally can't afford isn't "the best
-    trade," it isn't a trade at all. Returns None if nothing quoted fits.
+    trade," it isn't a trade at all. Returns [] if nothing quoted fits.
 
-    Falls back to nearest-the-money among what's affordable when
-    predicted_target_price isn't available (matches the prior, simpler
-    behavior); ties in expected payoff also break toward nearest-the-money,
-    so this converges to the old ATM-only behavior as the model's own
-    predicted move shrinks toward zero.
+    Falls back to ranking by nearest-the-money among what's affordable
+    when predicted_target_price isn't available (matches the prior,
+    simpler behavior); ties in expected payoff also break toward nearest-
+    the-money, so this converges to the old ATM-only ranking as the
+    model's own predicted move shrinks toward zero.
+
+    The ranked (not just single-best) list exists because the payoff
+    heuristic here is still just that -- a heuristic, not a guarantee. The
+    real backtest gate (run_options_strategy_validation) can legitimately
+    disagree with strike #1; giving it #2 and #3 to consider too, instead
+    of only ever offering its single top pick, means a real disagreement
+    between the heuristic and the backtest doesn't have to end the cycle
+    with no trade at all.
     """
     affordable = [q for q in quotes if q.premium > 0 and q.premium * 100.0 <= risk_budget]
     if not affordable:
-        return None
+        return []
     if predicted_target_price is None or predicted_target_price <= 0:
-        return min(affordable, key=lambda q: abs(q.strike - current_price))
+        return sorted(affordable, key=lambda q: abs(q.strike - current_price))
 
     is_call = side.upper() == "CALL"
 
@@ -169,10 +178,27 @@ def select_best_strike(
         )
         return (intrinsic_at_target - q.premium) / q.premium
 
-    return max(
+    return sorted(
         affordable,
         key=lambda q: (expected_profit_ratio(q), -abs(q.strike - current_price)),
+        reverse=True,
     )
+
+
+def select_best_strike(
+    quotes: list[StrikeQuote],
+    side: str,
+    predicted_target_price: Optional[float],
+    current_price: float,
+    risk_budget: float,
+) -> Optional[StrikeQuote]:
+    """The single top-ranked strike, or None if nothing quoted is
+    affordable. See rank_strikes for the actual ranking logic; kept as its
+    own function since most callers (and every existing test) only need
+    the single best pick, not the full ranking.
+    """
+    ranked = rank_strikes(quotes, side, predicted_target_price, current_price, risk_budget)
+    return ranked[0] if ranked else None
 
 
 def oldest_automate_position(open_positions: list[dict]) -> Optional[str]:

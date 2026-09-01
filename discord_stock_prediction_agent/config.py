@@ -275,6 +275,18 @@ class AgentConfig:
     # which is fine for a narrow, single-symbol watchlist but would not
     # have been for the prior full S&P 500 watchlist.
     automate_agent_strike_candidates: int = _int_env("AUTOMATE_AGENT_STRIKE_CANDIDATES", 5)
+    # Of those ranked strikes, how many of the top ones (best expected
+    # payoff first) actually get run through the real backtest validation
+    # gate (run_options_strategy_validation) before giving up. The payoff
+    # ranking is still just a heuristic -- the real backtest can
+    # legitimately disagree with its #1 pick; offering it #2 as well
+    # means that disagreement doesn't have to end the cycle with no trade.
+    # Run concurrently, not sequentially, so this doesn't multiply cycle
+    # latency by the count. Kept small (default 2): each one is a real
+    # network call to a real backtest/historical-data service, and this
+    # project just learned the hard way (2026-08-31) how expensive an
+    # unbounded external-API fallback chain can get.
+    automate_agent_backtest_candidates: int = _int_env("AUTOMATE_AGENT_BACKTEST_CANDIDATES", 2)
     # A BUY the model itself didn't flag as needing review can still be a
     # thin, barely-cleared-the-bar call. This drops anything below the
     # threshold from consideration entirely, on top of the existing
