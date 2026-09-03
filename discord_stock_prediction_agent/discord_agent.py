@@ -6640,6 +6640,23 @@ async def _build_automate_agent_text() -> str:
             return f"automate_agent: cooling down, try again in {wait_left}s."
         _automate_agent_last_run = now
 
+        # Once the daily cutoff has passed, no new position should be opened
+        # regardless of what the scan would find -- existing positions are
+        # already independently force-closed by stop_loss_monitor's own fast
+        # (15-60s) loop, not by this function. Checked before the expensive
+        # watchlist scan (a real AI prediction call per symbol, ~1.5-3 min)
+        # rather than after it: live on 2026-09-01 the autoscan kept running
+        # full-length scan cycles well past cutoff (e.g. one at 12:06 for a
+        # 12:00 cutoff) that could only ever end in "too late to buy" -- pure
+        # wasted time that could have gone to one more cycle earlier in the
+        # window instead.
+        if _automate_agent_eod_cutoff_reached(_now_et(), config.automate_agent_exit_time_et):
+            return (
+                f"automate_agent: {config.automate_agent_exit_time_et} ET cutoff already passed "
+                "for today. No new positions will be opened; skipping the scan. Existing "
+                "positions are closed independently by the stop-loss/take-profit monitor."
+            )
+
         account, account_err = await asyncio.to_thread(alpaca.get_account)
         equity = _as_float((account or {}).get("equity"))
         if equity <= 0:

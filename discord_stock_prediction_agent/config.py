@@ -136,7 +136,7 @@ class AgentConfig:
     # daily-loss circuit breaker is never overridden by this -- capital
     # protection always wins over a trade-count quota.
     automate_agent_min_options_trades_per_window: int = _int_env(
-        "AUTOMATE_AGENT_MIN_OPTIONS_TRADES_PER_WINDOW", 3
+        "AUTOMATE_AGENT_MIN_OPTIONS_TRADES_PER_WINDOW", 5
     )
     # Compulsory floor on *total* orders (equity + option buys combined) --
     # same relax mechanism as the options-specific floor above (either one
@@ -144,7 +144,7 @@ class AgentConfig:
     # one asset type. An equity buy counts toward this one; it doesn't
     # count toward automate_agent_min_options_trades_per_window.
     automate_agent_min_total_trades_per_window: int = _int_env(
-        "AUTOMATE_AGENT_MIN_TOTAL_TRADES_PER_WINDOW", 5
+        "AUTOMATE_AGENT_MIN_TOTAL_TRADES_PER_WINDOW", 10
     )
     # Hard ceiling on the flip side -- total orders (equity + option buys
     # combined) placed during the whole trading window, regardless of how
@@ -220,33 +220,36 @@ class AgentConfig:
     # proportionally larger value here, since every symbol shares the same
     # bounded thread pool.
     #
-    # The real, measured bottleneck is historical_price_service.py's
-    # fetch_price_history(): it cascades through ~25 sequential RapidAPI
+    # The original, measured bottleneck was historical_price_service.py's
+    # fetch_price_history(): it cascaded through ~25 sequential RapidAPI
     # endpoint/exchange/path combinations (10 and 6 second timeouts each)
-    # before falling back to an external provider, and that fallback is
-    # apparently the only one that actually works on the current RapidAPI
-    # subscription ("historical endpoints not available on your current
-    # plan"). Directly timed on 2026-08-31: fetch_price_history('TSLA')
-    # took 263s on its own, before Gemini is even called. Worse, its
-    # 10-minute price cache (_CACHE_TTL) never helps automate_agent
-    # specifically, because the default autoscan interval (15 min) is
-    # longer than that cache TTL -- every single cycle is a guaranteed
-    # cache miss, paying the full ~260s cascade every time. (This wasn't
-    # obvious with the old wide S&P 500 watchlist, where many symbols ran
-    # concurrently and one slow one didn't dominate; a single-symbol
-    # watchlist has nothing to hide behind.)
+    # before falling back to an external (NASDAQ) provider -- and that
+    # fallback was the only one that ever actually worked on the current
+    # RapidAPI subscription ("historical endpoints not available on your
+    # current plan"). Directly timed on 2026-08-31: fetch_price_history
+    # ('TSLA') took 263s on its own, before Gemini is even called; live
+    # runs on 2026-09-01 hit this again at 400s+, twice.
+    #
+    # Root-caused and fixed on 2026-09-03: HISTORICAL_PRICE_PROVIDER=
+    # external_historical is now set in the project .env, so
+    # fetch_price_history skips the doomed RapidAPI cascade entirely and
+    # goes straight to the NASDAQ provider that always ends up serving the
+    # data anyway. Re-measured after the fix: fetch_price_history('TSLA')
+    # now takes 2-17s (was 263-400s+), and the full per-symbol pipeline
+    # (price fetch + Gemini prediction call) takes 91-177s across three
+    # back-to-back runs -- the AI call itself, not price data, is now the
+    # dominant and only remaining source of latency here, and that's real
+    # work rather than a doomed network cascade.
     #
     # A previous attempt to tighten this to 120s (reasoning "one symbol
-    # should be fast", without measuring) meant every cycle timed out here
-    # before the fetch could ever finish, so automate_agent placed zero
-    # trades for an entire trading day. This value must stay comfortably
-    # above the measured ~263s; the real fix (raising the price cache TTL,
-    # or reducing fetch_price_history's fallback cascade) lives in
-    # historical_price_service.py, a shared module used well beyond
-    # automate_agent -- flagged for the user to decide on rather than
-    # changed here.
+    # should be fast", without measuring) meant every cycle timed out
+    # before the old price-fetch cascade could ever finish, so
+    # automate_agent placed zero trades for an entire trading day -- kept
+    # here as a cautionary note against guessing at this number again.
+    # This value is set with ~1.7x margin over the observed 177s worst
+    # case for the AI call.
     automate_agent_scan_timeout_seconds: int = _int_env(
-        "AUTOMATE_AGENT_SCAN_TIMEOUT_SECONDS", 400
+        "AUTOMATE_AGENT_SCAN_TIMEOUT_SECONDS", 300
     )
     # A ceiling on the whole per-symbol *buy* attempt (equity or options),
     # separate from automate_agent_scan_timeout_seconds above, which only

@@ -967,8 +967,8 @@ def test_default_asset_mode_is_both_on_tsla() -> None:
     assert fresh.automate_agent_asset_mode == "both"
     assert fresh.automate_agent_watchlist == ("TSLA",)
     assert fresh.automate_agent_exit_time_et == "12:00"
-    assert fresh.automate_agent_min_options_trades_per_window == 3
-    assert fresh.automate_agent_min_total_trades_per_window == 5
+    assert fresh.automate_agent_min_options_trades_per_window == 5
+    assert fresh.automate_agent_min_total_trades_per_window == 10
     assert fresh.automate_agent_max_trades_per_window == 40
 
 
@@ -1341,6 +1341,37 @@ def test_options_mode_forces_a_trade_past_backtest_veto_within_force_window() ->
         asyncio.run(_with_runtime(scenario, predictions=predictions))
 
     _with_asset_mode("options", run)
+
+
+def test_scan_is_skipped_entirely_once_the_cutoff_has_passed() -> None:
+    """Regression for the live 2026-09-01 incident: the autoscan kept
+    running full-length watchlist scans (a real AI prediction call per
+    symbol, minutes long) well after the daily cutoff, even though nothing
+    bought that late could ever be anything but wasted work -- existing
+    positions are force-closed independently by stop_loss_monitor's own
+    fast loop. Once the cutoff has passed, _build_automate_agent_text must
+    return immediately without ever calling the watchlist scan."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        def _boom(*_args, **_kwargs):
+            raise AssertionError("the watchlist scan must not run once the cutoff has passed")
+
+        original_scan = discord_agent._scan_automate_agent_watchlist
+        discord_agent._scan_automate_agent_watchlist = _boom
+        original_now_et = discord_agent._now_et
+        # 5 minutes past the default 12:00 ET cutoff.
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 12, 5, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            text = await discord_agent._build_automate_agent_text()
+        finally:
+            discord_agent._scan_automate_agent_watchlist = original_scan
+            discord_agent._now_et = original_now_et
+
+        assert "cutoff already passed" in text, text
+        assert not fake.submissions
+        assert not state_store.list_positions()
+        assert not state_store.list_option_positions()
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
 
 
 def test_options_mode_tries_the_next_ranked_strike_when_the_backtest_rejects_the_top_one() -> None:
