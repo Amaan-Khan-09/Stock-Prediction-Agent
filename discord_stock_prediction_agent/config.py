@@ -190,6 +190,24 @@ class AgentConfig:
     # opened by automate_agent are unaffected -- they still use the
     # relative automate_agent_exit_minutes_before_close fallback above.
     automate_agent_exit_time_et: str = os.getenv("AUTOMATE_AGENT_EXIT_TIME_ET", "12:00").strip()
+    # On-demand afternoon window: if a human runs !automate_agent (not the
+    # background autoscan loop -- see manual_trigger in
+    # _build_automate_agent_text) after the fixed morning cutoff above has
+    # already passed but the market is still open, that invocation starts
+    # a brand-new bounded trading window right then instead of doing
+    # nothing for the rest of the day. The window's cutoff is whichever
+    # comes first: automate_agent_on_demand_window_minutes after the
+    # invocation, or automate_agent_on_demand_close_buffer_minutes before
+    # the real market close (from Alpaca's own clock, so early-close days
+    # are handled correctly without a hardcoded "16:00"). Once started,
+    # the autoscan loop picks the window up automatically for its
+    # duration -- only *starting* a new window requires a manual trigger.
+    automate_agent_on_demand_window_minutes: int = _int_env(
+        "AUTOMATE_AGENT_ON_DEMAND_WINDOW_MINUTES", 150
+    )
+    automate_agent_on_demand_close_buffer_minutes: int = _int_env(
+        "AUTOMATE_AGENT_ON_DEMAND_CLOSE_BUFFER_MINUTES", 5
+    )
     # Fixed-fractional position sizing: risk a small, constant % of current
     # account equity per trade rather than a fixed dollar amount, so sizing
     # naturally scales with account growth and shrinks during drawdowns.

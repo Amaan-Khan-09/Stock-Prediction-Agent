@@ -113,6 +113,8 @@ from .state_store import (
     set_automate_agent_mode,
     get_automate_agent_report_date,
     set_automate_agent_report_date,
+    get_automate_agent_window,
+    set_automate_agent_window,
     list_trade_outcomes,
     get_daily_summary,
     get_learning_profile,
@@ -2687,6 +2689,58 @@ def _automate_agent_eod_cutoff_reached(now_et: datetime, cutoff: str) -> bool:
     return (now_et.hour, now_et.minute) >= (hour, minute)
 
 
+async def _automate_agent_resolve_cutoff(now_et: datetime, *, allow_new_window: bool) -> str:
+    """Returns today's effective automate_agent cutoff, "HH:MM" ET.
+
+    Normally just the fixed automate_agent_exit_time_et (the 9:30-ish-to-
+    12:00 morning window). But if a human runs !automate_agent again after
+    that fixed cutoff has already passed (allow_new_window=True -- the
+    autoscan loop never sets this, so it can never do this on its own),
+    this starts and persists a brand-new on-demand window running for
+    automate_agent_on_demand_window_minutes, capped at
+    automate_agent_on_demand_close_buffer_minutes before the real market
+    close. Once persisted, every subsequent call today (manual or
+    autoscan) picks the same window back up until its own cutoff passes.
+
+    Returns "" only when allow_new_window=True but there isn't enough time
+    left before close to start anything meaningful -- callers must treat
+    that as "nothing to do", not as a malformed/never-reached cutoff.
+    """
+    today_label = now_et.date().isoformat()
+    window = await asyncio.to_thread(get_automate_agent_window)
+    if window.get("date") == today_label:
+        stored_cutoff = str(window.get("cutoff_et") or "")
+        if stored_cutoff and not _automate_agent_eod_cutoff_reached(now_et, stored_cutoff):
+            return stored_cutoff
+        # Today's on-demand window (if any) already ended -- fall through
+        # to either the fixed cutoff or starting a fresh on-demand window.
+
+    fixed_cutoff = config.automate_agent_exit_time_et
+    if not _automate_agent_eod_cutoff_reached(now_et, fixed_cutoff):
+        return fixed_cutoff
+
+    if not allow_new_window:
+        return fixed_cutoff
+
+    clock, _ = await asyncio.to_thread(alpaca.get_clock)
+    try:
+        close_dt = datetime.fromisoformat(str((clock or {}).get("next_close") or "").replace("Z", "+00:00"))
+        close_et = close_dt.astimezone(ZoneInfo("America/New_York"))
+    except (TypeError, ValueError):
+        return fixed_cutoff
+
+    candidate_close = now_et + timedelta(minutes=config.automate_agent_on_demand_window_minutes)
+    latest_close = close_et - timedelta(minutes=config.automate_agent_on_demand_close_buffer_minutes)
+    window_close = min(candidate_close, latest_close)
+    if window_close <= now_et:
+        return ""
+
+    cutoff_str = window_close.strftime("%H:%M")
+    start_utc = now_et.astimezone(ZoneInfo("UTC")).isoformat(timespec="seconds").replace("+00:00", "Z")
+    await asyncio.to_thread(set_automate_agent_window, today_label, start_utc, cutoff_str)
+    return cutoff_str
+
+
 def _automate_agent_in_min_trades_relax_window(now_et: datetime, cutoff: str, relax_minutes: int) -> bool:
     """True once now_et is within relax_minutes of the fixed daily cutoff
     but hasn't reached it yet -- the window where a still-unmet compulsory
@@ -4052,6 +4106,12 @@ async def stop_loss_monitor() -> None:
         await _process_pending_option_orders()
         await _reconcile_pending_option_entry_orders()
         await _reconcile_pending_multi_leg_entry_orders()
+    # Resolved once per tick, not per-position (it's a disk read) -- normally
+    # just the fixed morning cutoff, but if a human started an on-demand
+    # afternoon window via !automate_agent (see _automate_agent_resolve_
+    # cutoff), this correctly force-closes automate_agent positions at that
+    # window's own cutoff instead of the fixed one.
+    automate_agent_cutoff = await _automate_agent_resolve_cutoff(_now_et(), allow_new_window=False)
     equity_clock = None
     for position in list_positions():
         # Regression: nothing isolated one position's failure here, unlike
@@ -4100,11 +4160,13 @@ async def stop_loss_monitor() -> None:
                 if bool(position.get("exit_before_market_close")) and market_open:
                     if str(position.get("opened_by") or "").lower() == AUTOMATE_AGENT_TAG:
                         # automate_agent trades a fixed, shorter window (e.g.
-                        # activated ~9:30 ET, force-closed 12:30 ET) rather than
+                        # activated ~9:30 ET, force-closed 12:00 ET) rather than
                         # "close near end of day" -- a predictable daily cutoff
-                        # instead of one relative to market close.
+                        # instead of one relative to market close. Or, if a
+                        # human started an on-demand afternoon window, that
+                        # window's own cutoff (resolved once above the loop).
                         eod_forced = _automate_agent_eod_cutoff_reached(
-                            _now_et(), config.automate_agent_exit_time_et
+                            _now_et(), automate_agent_cutoff
                         )
                     else:
                         if equity_clock is None:
@@ -6305,7 +6367,8 @@ async def _automate_agent_pick_option_contracts(
 
 
 async def _automate_agent_buy_option(
-    root: str, picked: Optional[BoomCandidate], equity: float, relaxing: bool = False, forcing: bool = False
+    root: str, picked: Optional[BoomCandidate], equity: float, relaxing: bool = False, forcing: bool = False,
+    exit_cutoff_et: str = "",
 ) -> str:
     """Autonomously validate and place a single-leg CALL (on a BUY signal)
     or PUT (on a SELL signal) for `root`, reusing the same tastytrade
@@ -6458,7 +6521,7 @@ async def _automate_agent_buy_option(
         f"- Bought {occ_symbol}: {contracts:g} {side.lower()} contract(s) @ ~${premium:.2f} "
         f"(stop {config.automate_agent_option_stop_loss_pct:g}% of premium, "
         f"target {config.automate_agent_option_take_profit_pct:g}% of premium, "
-        f"auto-closes by {config.automate_agent_exit_time_et} ET if neither is hit first)."
+        f"auto-closes by {exit_cutoff_et or config.automate_agent_exit_time_et} ET if neither is hit first)."
         f"{conviction}"
         f"{' [compulsory minimum-trades fill]' if relaxing and not forced_past_backtest else ''}"
         f"{forced_note}"
@@ -6534,13 +6597,21 @@ _automate_agent_lock = asyncio.Lock()
 _automate_agent_last_run: float = 0.0
 
 
-def _build_automate_agent_daily_report_text(date_label: str = "") -> str:
+def _build_automate_agent_daily_report_text(date_label: str = "", since_utc: str = "") -> str:
     """Every field this needs (symbol, qty, entry/exit price, pnl) is
     already recorded by close_position_with_outcome at the moment a
     position actually closes -- this just formats today's automate_agent-
     tagged records into a report, it doesn't compute anything new.
+
+    since_utc (a closed_at-format UTC ISO timestamp), when given, scopes
+    the report to trades closed at or after that moment -- used for a
+    same-day on-demand window's report so it covers only that window's
+    own trades instead of repeating whatever the morning window already
+    reported.
     """
     outcomes = list_trade_outcomes(opened_by=AUTOMATE_AGENT_TAG, today_only=True)
+    if since_utc:
+        outcomes = [o for o in outcomes if str(o.get("closed_at") or "") >= since_utc]
     header = f"automate_agent daily report ({date_label})" if date_label else "automate_agent daily report"
     if not outcomes:
         return f"{header}: no trades were closed today."
@@ -6575,20 +6646,44 @@ def _build_automate_agent_daily_report_text(date_label: str = "") -> str:
 
 
 async def _maybe_post_automate_agent_daily_report() -> None:
-    """Fires once per ET calendar day, only after every automate_agent
-    position from today -- equity AND option, now that automate_agent
-    trades both -- has actually settled (confirmed exit fill, not just
-    "the cutoff time passed") -- posting before that would report an
-    incomplete/still-changing total. If a position is somehow still open
-    past the cutoff, this just keeps checking next cycle instead of posting
-    a premature or duplicate report.
+    """Fires once per effective cutoff (the fixed morning one, or an
+    on-demand afternoon window started via !automate_agent -- see
+    _automate_agent_resolve_cutoff), only after every automate_agent
+    position open at that point -- equity AND option, now that
+    automate_agent trades both -- has actually settled (confirmed exit
+    fill, not just "the cutoff time passed") -- posting before that would
+    report an incomplete/still-changing total. If a position is somehow
+    still open past the cutoff, this just keeps checking next cycle
+    instead of posting a premature or duplicate report.
+
+    Deliberately does not use _automate_agent_resolve_cutoff here: once an
+    on-demand window's own cutoff has passed, that helper falls back to
+    treating the fixed morning cutoff as "effective" again (correct for
+    "should scanning/force-close happen", since by then the fixed cutoff
+    has certainly passed too either way) -- but that fallback would give
+    the fixed cutoff's report key a second, spurious go on a day that
+    never actually had a morning window. This looks at today's persisted
+    window directly instead, so each real window (the fixed morning one,
+    or at most one on-demand afternoon one) gets exactly one report.
     """
     now_et = _now_et()
-    if not _automate_agent_eod_cutoff_reached(now_et, config.automate_agent_exit_time_et):
-        return
     today_label = now_et.date().isoformat()
+    window = await asyncio.to_thread(get_automate_agent_window)
+    if window.get("date") == today_label and window.get("cutoff_et"):
+        effective_cutoff = str(window["cutoff_et"])
+        since_utc = str(window.get("start_utc") or "")
+    else:
+        effective_cutoff = config.automate_agent_exit_time_et
+        since_utc = ""
+    if not _automate_agent_eod_cutoff_reached(now_et, effective_cutoff):
+        return
+    # Scoped to the specific cutoff, not just the date -- so a same-day
+    # on-demand afternoon window (a different cutoff than the morning's
+    # fixed one) still gets its own report instead of being silently
+    # skipped as "already reported today".
+    report_key = f"{today_label}|{effective_cutoff}"
     already_reported = await asyncio.to_thread(get_automate_agent_report_date)
-    if already_reported == today_label:
+    if already_reported == report_key:
         return
     equity_positions, option_positions = await asyncio.gather(
         asyncio.to_thread(list_positions), asyncio.to_thread(list_option_positions)
@@ -6602,12 +6697,21 @@ async def _maybe_post_automate_agent_daily_report() -> None:
     )
     if still_open:
         return
-    report = _build_automate_agent_daily_report_text(today_label)
+    report = _build_automate_agent_daily_report_text(today_label, since_utc=since_utc)
     await _send_channel(config.discord_review_channel_id, report)
-    await asyncio.to_thread(set_automate_agent_report_date, today_label)
+    await asyncio.to_thread(set_automate_agent_report_date, report_key)
 
 
-async def _build_automate_agent_text() -> str:
+async def _build_automate_agent_text(manual_trigger: bool = False) -> str:
+    """manual_trigger is True only for a human directly typing
+    !automate_agent (see the bot.command handler below), never for the
+    background autoscan loop. It is the sole thing allowed to start a new
+    on-demand afternoon window (see _automate_agent_resolve_cutoff) once
+    the fixed morning cutoff has already passed -- autoscan can pick an
+    already-started window up and run it, but can never start one itself,
+    or it would spin up a fresh 150-minute window on its own every time it
+    happens to tick past the previous one's cutoff with no human involved.
+    """
     if not alpaca.ready():
         return "automate_agent: Alpaca paper trading is not configured."
 
@@ -6640,19 +6744,32 @@ async def _build_automate_agent_text() -> str:
             return f"automate_agent: cooling down, try again in {wait_left}s."
         _automate_agent_last_run = now
 
-        # Once the daily cutoff has passed, no new position should be opened
-        # regardless of what the scan would find -- existing positions are
-        # already independently force-closed by stop_loss_monitor's own fast
-        # (15-60s) loop, not by this function. Checked before the expensive
-        # watchlist scan (a real AI prediction call per symbol, ~1.5-3 min)
-        # rather than after it: live on 2026-09-01 the autoscan kept running
-        # full-length scan cycles well past cutoff (e.g. one at 12:06 for a
-        # 12:00 cutoff) that could only ever end in "too late to buy" -- pure
-        # wasted time that could have gone to one more cycle earlier in the
-        # window instead.
-        if _automate_agent_eod_cutoff_reached(_now_et(), config.automate_agent_exit_time_et):
+        # Once today's effective cutoff has passed, no new position should
+        # be opened regardless of what the scan would find -- existing
+        # positions are already independently force-closed by
+        # stop_loss_monitor's own fast (15-60s) loop, not by this function.
+        # Checked before the expensive watchlist scan (a real AI prediction
+        # call per symbol, ~1.5-3 min) rather than after it: live on
+        # 2026-09-01 the autoscan kept running full-length scan cycles well
+        # past cutoff (e.g. one at 12:06 for a 12:00 cutoff) that could only
+        # ever end in "too late to buy" -- pure wasted time that could have
+        # gone to one more cycle earlier in the window instead.
+        #
+        # "Today's effective cutoff" is normally just the fixed morning one
+        # (automate_agent_exit_time_et), but manual_trigger=True (a human
+        # typing !automate_agent, not autoscan) between that cutoff and
+        # market close starts a brand-new on-demand window right then --
+        # see _automate_agent_resolve_cutoff for the full rule.
+        effective_cutoff = await _automate_agent_resolve_cutoff(_now_et(), allow_new_window=manual_trigger)
+        if not effective_cutoff:
             return (
-                f"automate_agent: {config.automate_agent_exit_time_et} ET cutoff already passed "
+                "automate_agent: too close to market close to start a new on-demand window "
+                f"(need at least a few minutes free before the "
+                f"{config.automate_agent_on_demand_close_buffer_minutes}-minute close buffer). No action taken."
+            )
+        if _automate_agent_eod_cutoff_reached(_now_et(), effective_cutoff):
+            return (
+                f"automate_agent: {effective_cutoff} ET cutoff already passed "
                 "for today. No new positions will be opened; skipping the scan. Existing "
                 "positions are closed independently by the stop-loss/take-profit monitor."
             )
@@ -6786,9 +6903,9 @@ async def _build_automate_agent_text() -> str:
         )
         relaxing = (
             min_trades_unmet
-            and not _automate_agent_eod_cutoff_reached(now_et, config.automate_agent_exit_time_et)
+            and not _automate_agent_eod_cutoff_reached(now_et, effective_cutoff)
             and _automate_agent_in_min_trades_relax_window(
-                now_et, config.automate_agent_exit_time_et, config.automate_agent_min_trades_relax_minutes
+                now_et, effective_cutoff, config.automate_agent_min_trades_relax_minutes
             )
         )
         # Deeper into the same window: relaxing the confidence bar alone
@@ -6804,9 +6921,9 @@ async def _build_automate_agent_text() -> str:
         # compulsory minimum.
         forcing = (
             min_trades_unmet
-            and not _automate_agent_eod_cutoff_reached(now_et, config.automate_agent_exit_time_et)
+            and not _automate_agent_eod_cutoff_reached(now_et, effective_cutoff)
             and _automate_agent_in_min_trades_relax_window(
-                now_et, config.automate_agent_exit_time_et, config.automate_agent_force_trade_minutes
+                now_et, effective_cutoff, config.automate_agent_force_trade_minutes
             )
         )
         effective_min_confidence = 0.0 if relaxing else config.automate_agent_min_confidence
@@ -6889,7 +7006,7 @@ async def _build_automate_agent_text() -> str:
                 f"{config.automate_agent_min_total_trades_per_window}, options {options_trades_today}/"
                 f"{config.automate_agent_min_options_trades_per_window}) with "
                 f"{config.automate_agent_min_trades_relax_minutes} min left before the "
-                f"{config.automate_agent_exit_time_et} ET cutoff -- confidence bar relaxed to 0 for this cycle."
+                f"{effective_cutoff} ET cutoff -- confidence bar relaxed to 0 for this cycle."
             )
         if forcing:
             lines.append(
@@ -6993,7 +7110,7 @@ async def _build_automate_agent_text() -> str:
                         lines.append(
                             f"- Bought {symbol}: {qty:g} sh @ ~${price:.2f} "
                             f"(stop {config.equity_stop_loss_pct:g}%, target {config.equity_take_profit_pct:g}%, "
-                            f"auto-closes by {config.automate_agent_exit_time_et} ET if neither is hit first)."
+                            f"auto-closes by {effective_cutoff} ET if neither is hit first)."
                             f"{conviction}"
                             f"{' [compulsory minimum-trades fill]' if relaxing else ''}"
                         )
@@ -7041,7 +7158,10 @@ async def _build_automate_agent_text() -> str:
                     # previously stopped a run of individually-bounded-but-
                     # slow calls here from adding up to several minutes.
                     result = await asyncio.wait_for(
-                        _automate_agent_buy_option(symbol, candidates_by_symbol.get(symbol.upper()), equity, relaxing, forcing),
+                        _automate_agent_buy_option(
+                            symbol, candidates_by_symbol.get(symbol.upper()), equity, relaxing, forcing,
+                            exit_cutoff_et=effective_cutoff,
+                        ),
                         timeout=config.automate_agent_buy_timeout_seconds,
                     )
                     lines.append(result)
@@ -7077,7 +7197,7 @@ async def automate_agent(ctx: commands.Context) -> None:
             "-- it places real trades autonomously.",
         )
         return
-    await _send_context_output(ctx, await _build_automate_agent_text())
+    await _send_context_output(ctx, await _build_automate_agent_text(manual_trigger=True))
 
 
 @tasks.loop(seconds=max(60, config.automate_agent_autoscan_interval_seconds))

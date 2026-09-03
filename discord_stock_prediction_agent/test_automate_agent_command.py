@@ -8,7 +8,7 @@ touches a real network, Gemini, or broker call.
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
@@ -89,12 +89,21 @@ class FakeAutomateAlpaca:
         # option_premiums is unaffected by the filter.
         self.option_spreads: dict[str, tuple[float, float]] = {}
         self.options_trading_enabled = True
+        # ISO8601 next_close for get_clock, matching Alpaca's real /v2/clock
+        # shape -- used by _automate_agent_resolve_cutoff to cap an on-demand
+        # afternoon window at N minutes before the real market close. Tests
+        # that exercise that path set this explicitly; the default (far in
+        # the future) means it never binds unless a test cares about it.
+        self.next_close_iso = "2026-08-24T20:00:00Z"
 
     def ready(self):
         return True
 
     def is_market_open(self):
         return self.market_open, ""
+
+    def get_clock(self):
+        return {"is_open": self.market_open, "next_close": self.next_close_iso}, ""
 
     def get_account(self):
         if not self.account_ok:
@@ -1832,7 +1841,10 @@ def test_auto_report_waits_for_open_positions_then_posts_exactly_once() -> None:
             state_store.close_position_with_outcome("AAPL", 5, 220.0, "protection_take_profit")
             await discord_agent._maybe_post_automate_agent_daily_report()
             assert any("automate_agent daily report" in content for _, content in sent)
-            assert state_store.get_automate_agent_report_date() == "2026-08-24"
+            # Scoped to the specific cutoff (date|HH:MM), not just the date --
+            # so a same-day on-demand afternoon window gets its own report
+            # instead of being silently skipped as "already reported today".
+            assert state_store.get_automate_agent_report_date() == "2026-08-24|12:00"
 
             sent.clear()
             await discord_agent._maybe_post_automate_agent_daily_report()
@@ -1853,6 +1865,187 @@ def test_auto_report_does_not_fire_before_the_cutoff() -> None:
             await discord_agent._maybe_post_automate_agent_daily_report()
             assert not sent
             assert state_store.get_automate_agent_report_date() == ""
+        finally:
+            discord_agent._now_et = original_now_et
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_autoscan_never_starts_an_on_demand_window_past_the_fixed_cutoff() -> None:
+    """allow_new_window=False (the autoscan loop's call, and every
+    non-manual caller) must never spin up a new afternoon window on its
+    own -- only a human typing !automate_agent (manual_trigger=True) can.
+    Otherwise autoscan would start a fresh 150-minute window on its own
+    every time it happened to tick past the previous one's cutoff, with no
+    human involved at all."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        now_et = datetime(2026, 8, 24, 13, 0, tzinfo=ZoneInfo("America/New_York"))
+        cutoff = await discord_agent._automate_agent_resolve_cutoff(now_et, allow_new_window=False)
+        assert cutoff == discord_agent.config.automate_agent_exit_time_et
+        assert state_store.get_automate_agent_window() == {}
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_manual_trigger_starts_an_on_demand_window_after_the_fixed_cutoff() -> None:
+    """The core new behavior: !automate_agent typed between the fixed
+    morning cutoff and market close starts a bounded on-demand window
+    running for automate_agent_on_demand_window_minutes (150), capped at
+    automate_agent_on_demand_close_buffer_minutes (5) before the real
+    close. Once persisted, autoscan (allow_new_window=False) picks the
+    same window back up on its own for the rest of its duration."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        fake.next_close_iso = "2026-08-24T20:00:00Z"  # 16:00 ET (EDT, UTC-4)
+        now_et = datetime(2026, 8, 24, 13, 0, tzinfo=ZoneInfo("America/New_York"))
+        cutoff = await discord_agent._automate_agent_resolve_cutoff(now_et, allow_new_window=True)
+        assert cutoff == "15:30", cutoff  # min(13:00+150min, 16:00-5min) = min(15:30, 15:55)
+
+        window = state_store.get_automate_agent_window()
+        assert window["date"] == "2026-08-24"
+        assert window["cutoff_et"] == "15:30"
+        assert window["start_utc"] == "2026-08-24T17:00:00Z"  # 13:00 EDT -> 17:00 UTC
+
+        later_et = datetime(2026, 8, 24, 14, 0, tzinfo=ZoneInfo("America/New_York"))
+        cutoff_again = await discord_agent._automate_agent_resolve_cutoff(later_et, allow_new_window=False)
+        assert cutoff_again == "15:30", "autoscan must pick up the already-started window, not the fixed cutoff"
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_on_demand_window_is_capped_by_the_close_buffer() -> None:
+    """Started close enough to market close that the full 150 minutes
+    would run past it -- the window must be capped at the close buffer,
+    not extend the default duration into a closed market."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        fake.next_close_iso = "2026-08-24T20:00:00Z"  # 16:00 ET
+        now_et = datetime(2026, 8, 24, 15, 50, tzinfo=ZoneInfo("America/New_York"))
+        cutoff = await discord_agent._automate_agent_resolve_cutoff(now_et, allow_new_window=True)
+        assert cutoff == "15:55", cutoff  # min(15:50+150min=18:20, 16:00-5min=15:55)
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_on_demand_window_refuses_to_start_too_close_to_close() -> None:
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        fake.next_close_iso = "2026-08-24T20:00:00Z"  # 16:00 ET
+        now_et = datetime(2026, 8, 24, 15, 57, tzinfo=ZoneInfo("America/New_York"))
+        cutoff = await discord_agent._automate_agent_resolve_cutoff(now_et, allow_new_window=True)
+        assert cutoff == ""
+        assert state_store.get_automate_agent_window() == {}
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_manual_trigger_too_close_to_close_returns_a_clear_message_and_skips_the_scan() -> None:
+    def _boom(*_a, **_k):
+        raise AssertionError("must not scan when there isn't enough time left to start a window")
+
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        fake.next_close_iso = "2026-08-24T20:00:00Z"
+        original_scan = discord_agent._scan_automate_agent_watchlist
+        discord_agent._scan_automate_agent_watchlist = _boom
+        original_now_et = discord_agent._now_et
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 15, 57, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            text = await discord_agent._build_automate_agent_text(manual_trigger=True)
+        finally:
+            discord_agent._scan_automate_agent_watchlist = original_scan
+            discord_agent._now_et = original_now_et
+        assert "too close to market close" in text, text
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_manual_trigger_after_the_fixed_cutoff_actually_scans_and_can_buy() -> None:
+    """End-to-end: a human running !automate_agent between the fixed
+    morning cutoff and market close must not be met with "cutoff already
+    passed" -- it should start a fresh on-demand window and actually run
+    the scan-and-trade cycle, same as any other cycle."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        fake.next_close_iso = "2026-08-24T20:00:00Z"  # 16:00 ET
+        symbol = discord_agent.config.automate_agent_watchlist[0]
+        fake.prices[symbol] = 60.0
+        original_now_et = discord_agent._now_et
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 13, 0, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            text = await discord_agent._build_automate_agent_text(manual_trigger=True)
+        finally:
+            discord_agent._now_et = original_now_et
+
+        assert "cutoff already passed" not in text, text
+        assert symbol in {p["symbol"] for p in state_store.list_positions()}
+        window = state_store.get_automate_agent_window()
+        assert window.get("cutoff_et") == "15:30"
+
+    predictions = {discord_agent.config.automate_agent_watchlist[0]: {"decision": "BUY", "confidence_score": 75}}
+    asyncio.run(_with_runtime(scenario, predictions=predictions))
+
+
+def test_on_demand_window_report_only_covers_trades_since_the_window_started() -> None:
+    """A same-day on-demand window's report must not repeat trades the
+    morning window already reported -- it should cover only trades closed
+    since this window's own start (start_utc), not the whole day."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        # Stands in for a trade the morning window already reported. Backdated
+        # by a minute (close_position_with_outcome always stamps real
+        # wall-clock time, with only second precision) so it's unambiguously
+        # before window_start_utc below rather than racing it within the
+        # same second.
+        state_store.upsert_position("AAPL", 5, 200.0, "buy-1", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+        state_store.close_position_with_outcome("AAPL", 5, 220.0, "protection_take_profit")
+        backdated_state = state_store.load_state()
+        backdated_state["trade_outcomes"][-1]["closed_at"] = (
+            datetime.utcnow() - timedelta(minutes=1)
+        ).isoformat(timespec="seconds") + "Z"
+        state_store.save_state(backdated_state)
+
+        window_start_utc = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        state_store.set_automate_agent_window("2026-08-24", window_start_utc, "15:30")
+
+        # A trade closed after the on-demand window started.
+        state_store.upsert_position("MSFT", 3, 300.0, "buy-2", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+        state_store.close_position_with_outcome("MSFT", 3, 330.0, "protection_take_profit")
+
+        original_now_et = discord_agent._now_et
+        discord_agent._now_et = lambda: datetime(2026, 8, 24, 15, 35, tzinfo=ZoneInfo("America/New_York"))
+        try:
+            await discord_agent._maybe_post_automate_agent_daily_report()
+        finally:
+            discord_agent._now_et = original_now_et
+
+        reports = [content for _, content in sent if "automate_agent daily report" in content]
+        assert len(reports) == 1, reports
+        assert "MSFT" in reports[0]
+        assert "AAPL" not in reports[0]
+        assert state_store.get_automate_agent_report_date() == "2026-08-24|15:30"
+
+    asyncio.run(_with_runtime(scenario, predictions={}))
+
+
+def test_no_spurious_second_report_on_a_day_with_only_an_afternoon_window() -> None:
+    """Regression for a bug caught in review: _maybe_post_automate_agent_
+    daily_report must not fall back to treating the fixed morning cutoff
+    as a second, separate report key once the afternoon window's own
+    cutoff has passed -- a day with only an on-demand afternoon window (no
+    morning session at all) must get exactly one report, not two."""
+    async def scenario(fake: FakeAutomateAlpaca, sent: list) -> None:
+        state_store.upsert_position("MSFT", 3, 300.0, "buy-1", 1.0, 10.0, "long", AUTOMATE_AGENT_TAG, True)
+        state_store.close_position_with_outcome("MSFT", 3, 330.0, "protection_take_profit")
+        window_start_utc = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        state_store.set_automate_agent_window("2026-08-24", window_start_utc, "13:15")
+
+        original_now_et = discord_agent._now_et
+        try:
+            discord_agent._now_et = lambda: datetime(2026, 8, 24, 13, 20, tzinfo=ZoneInfo("America/New_York"))
+            await discord_agent._maybe_post_automate_agent_daily_report()
+            assert len(sent) == 1, sent
+
+            # Later the same day, well after both the window's own cutoff
+            # AND the fixed 12:00 cutoff (which was never actually a real
+            # window today) -- must not report a second time.
+            discord_agent._now_et = lambda: datetime(2026, 8, 24, 14, 0, tzinfo=ZoneInfo("America/New_York"))
+            await discord_agent._maybe_post_automate_agent_daily_report()
+            assert len(sent) == 1, sent
         finally:
             discord_agent._now_et = original_now_et
 

@@ -881,6 +881,34 @@ def set_automate_agent_report_date(date_label: str) -> None:
     save_state(state)
 
 
+def get_automate_agent_window() -> dict:
+    """Today's on-demand automate_agent trading window, if a manual
+    !automate_agent invocation after the default morning cutoff has
+    started one (see _automate_agent_resolve_cutoff in discord_agent.py).
+    {} if none has been started -- the default fixed morning-window
+    cutoff (automate_agent_exit_time_et) applies instead. Persisted (not
+    just in-memory) so a bot restart mid-window still remembers it.
+    """
+    window = load_state().get("automate_agent_window") or {}
+    return dict(window) if isinstance(window, dict) else {}
+
+
+@_state_mutation
+def set_automate_agent_window(date_label: str, start_utc: str, cutoff_et: str) -> None:
+    """start_utc is a full UTC ISO timestamp (same format as trade_outcomes'
+    closed_at), not just an HH:MM -- it's used to scope the eventual
+    on-demand-window report to trades closed during *this* window only,
+    not repeat whatever the morning window already reported.
+    """
+    state = load_state()
+    state["automate_agent_window"] = {
+        "date": str(date_label or ""),
+        "start_utc": str(start_utc or ""),
+        "cutoff_et": str(cutoff_et or ""),
+    }
+    save_state(state)
+
+
 @_state_mutation
 def remove_position(symbol: str) -> None:
     state = load_state()
